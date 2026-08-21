@@ -144,6 +144,47 @@ class StubRoboCommand:
 
 
 # --------------------------------------------------------------------------
+# what the vehicles hear
+# --------------------------------------------------------------------------
+
+class CommandTap:
+    """Everything the OCS sends onto the team command namespace.
+
+    This is what a vehicle's reporter would subscribe to, split out into its
+    own client for one reason: it must be connected and subscribed BEFORE the
+    retained RxCourse is published. amqtt hands a newly-subscribed client that
+    retained message even when the topic does not match, and that delivery
+    leaves the subscription dead -- so a tap created later silently receives
+    nothing. Mosquitto does not do this; the ordering costs nothing and makes
+    the bench independent of which broker it is run against.
+    """
+
+    def __init__(self) -> None:
+        self.commands: list[rx_commands_pb2.RxCommand] = []
+        self.c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="cmd-tap")
+        self.c.on_message = self._on_message
+        self.c.connect(HOST, PORT, 15)
+        self.c.loop_start()
+        settle(0.8)
+        self.c.subscribe("team/robotx/%s/+/command" % TEAM, 0)
+        settle(0.5)
+
+    def _on_message(self, _c, _u, msg) -> None:
+        if not msg.topic.endswith("/command"):
+            return
+        cmd = rx_commands_pb2.RxCommand()
+        try:
+            cmd.ParseFromString(msg.payload)
+        except Exception:  # noqa: BLE001
+            return
+        self.commands.append((msg.topic, cmd))
+
+    def run_starts(self):
+        return [(t, c) for t, c in self.commands
+                if c.WhichOneof("body") == "run_start"]
+
+
+# --------------------------------------------------------------------------
 # a stand-in USV
 # --------------------------------------------------------------------------
 
@@ -239,6 +280,7 @@ def main() -> int:
     start_broker()
     print("broker up on %s:%d\n" % (HOST, PORT))
 
+    tap = CommandTap()          # before the retained course; see CommandTap
     rc = StubRoboCommand()
     cfg = load(cfg_path)
     logs: list[str] = []
@@ -314,12 +356,33 @@ def main() -> int:
     check("A11", bridge.machine.state is RunState.DECLARED
           and bridge.machine.run_id is None,
           "mismatched declaration_seq refused; state=%s" % bridge.machine.state.name)
+    check("A11b", tap.run_starts() == [],
+          "a RunStart answering someone else's declaration is NOT relayed "
+          "(%d seen by the vehicle)" % len(tap.run_starts()))
 
     rc.send_run_start(ours, 42)
     settle(1.5)
     check("A10", bridge.machine.state is RunState.RUNNING
           and bridge.machine.run_id == 42,
           "state=%s run_id=%s" % (bridge.machine.state.name, bridge.machine.run_id))
+
+    # The whole point of the OCS from the vehicle's side. The fleet is
+    # position-holding in autonomous mode and cannot reach RoboCommand; if this
+    # relay does not happen, nothing on the water ever learns the run began.
+    relayed = tap.run_starts()
+    # The counter is reported alongside the receipt on purpose: it separates
+    # "the OCS never published" from "the vehicle never received", which are
+    # different faults with different fixes and look identical from the
+    # vehicle's end.
+    check("A10b", len(relayed) == 1
+          and relayed[0][0] == "team/robotx/%s/%s/command" % (TEAM, VEHICLE)
+          and relayed[0][1].run_start.run_id == 42
+          and relayed[0][1].run_start.declaration_seq == ours,
+          "RunStart relayed to the vehicle: %d received (bridge routed %d), "
+          "run_id=%s decl_seq=%s"
+          % (len(relayed), bridge.counters.commands_routed,
+             relayed[0][1].run_start.run_id if relayed else None,
+             relayed[0][1].run_start.declaration_seq if relayed else None))
 
     print("\nA12-A13  durability")
     seq_before = bridge.seqs.snapshot()["reports"].get(VEHICLE, 0)

@@ -26,7 +26,10 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
+
+from google.protobuf import json_format
 
 import paho.mqtt.client as mqtt
 
@@ -61,6 +64,14 @@ class Bridge:
         self.seqs = SeqStore(cfg.seq_store)
         self.counters = Counters()
         self.wire = WireLog(cfg.wire_log, run_tag=cfg.team_id)
+
+        # What the web page reads. Decoded with protobuf's own MessageToDict
+        # rather than a hand-written field list, so every field the handbook
+        # defines shows up and a new one from RoboNation appears on its own.
+        self.latest: dict[str, dict] = {}       # vehicle_id -> last report
+        self.recent: deque[dict] = deque(maxlen=50)   # commands in, newest first
+        self.course: dict = {}
+        self.links = {"robocommand": False, "team": False}
 
         # Pick the run back up if we are a restart rather than a cold start.
         # Durable counters without a durable run leave us with correct sequence
@@ -143,12 +154,14 @@ class Bridge:
         )
         with self._lock:
             v = self.machine.on_connect()
+        self.links["robocommand"] = True
         self.log("RoboCommand: " + v.reason)
         self.wire.event("connect", v.reason)
 
     def _on_rc_disconnect(self, _client, _ud, _flags, reason, _props=None) -> None:
         with self._lock:
             v = self.machine.on_disconnect()
+        self.links["robocommand"] = False
         self.log("RoboCommand lost (%s): %s" % (reason, v.reason))
         self.wire.event("disconnect", "%s: %s" % (reason, v.reason))
 
@@ -172,6 +185,7 @@ class Bridge:
             "course %s: pinger %d Hz, %d corners -- %s"
             % (course.course_id, course.pinger_freq_hz, len(course.corners), v.reason)
         )
+        self.course = _decode(course)
 
     def _handle_command(self, payload: bytes) -> None:
         cmd = rx_commands_pb2.RxCommand()
@@ -195,6 +209,17 @@ class Bridge:
             # RoboCommand answered a declaration that is not the one we hold.
             self.log(("RUN START: " if v.ok else "RUN START REFUSED: ") + v.reason)
             self.wire.event("run_start", v.reason)
+
+            # The vehicles are position-holding in autonomous mode and cannot
+            # reach RoboCommand themselves, so RunStart is the only way they
+            # learn the run began -- relay it, or three vehicles hold station
+            # through the whole window.
+            #
+            # Only when v.ok. A refused RunStart answers somebody else's
+            # declaration; relaying it would start our fleet on a run we were
+            # never granted.
+            if v.ok:
+                self._route_command(cmd, which)
         else:
             # Task 4 lands here, and the handbook requires the OCS to route it
             # to the vehicle it names. It is advisory input for the mission
@@ -226,6 +251,12 @@ class Bridge:
                 self.wire.event(
                     "command_undeliverable", "%s -> %s" % (which, cmd.vehicle_id)
                 )
+                self.recent.appendleft({"at": time.time(), "which": which,
+                                        "seq": cmd.seq, "targets": [],
+                                        "delivered": False,
+                                        "detail": "%s is not in the fleet"
+                                                  % cmd.vehicle_id,
+                                        "body": _decode(cmd)})
                 return
             targets = (cmd.vehicle_id,)
         else:
@@ -244,6 +275,9 @@ class Bridge:
         with self._lock:
             self.counters.commands_routed += 1
             self.counters.last_command = "%s -> %s" % (which, ", ".join(targets))
+            self.recent.appendleft({"at": time.time(), "which": which,
+                                    "seq": cmd.seq, "targets": list(targets),
+                                    "delivered": True, "body": _decode(cmd)})
         self.log("COMMAND %s (seq=%d) -> %s" % (which, cmd.seq, ", ".join(targets)))
 
     # ---- vehicle side, the hot path --------------------------------------
@@ -252,6 +286,7 @@ class Bridge:
         if reason != 0:
             self.log("team broker refused the connection: %s" % reason)
             return
+        self.links["team"] = True
         client.subscribe(self.cfg.team_report_sub(), 0)
         self.log("team broker: subscribed " + self.cfg.team_report_sub())
 
@@ -278,6 +313,11 @@ class Bridge:
         now = time.time()
         self.counters.last_seen[vehicle] = now
         body = report.WhichOneof("body")
+        # Before the gate below: the bridge is correctly silent toward
+        # RoboCommand until we declare, but the operator still needs to see the
+        # fleet then -- that is the window in which a sick vehicle can still be
+        # fixed.
+        self.latest[vehicle] = _decode(report)
 
         with self._lock:
             if not self.machine.may_report():
@@ -400,6 +440,37 @@ class Bridge:
                                    self.machine.declaration_seq, self.machine.run_id)
             return v.reason
 
+    def snapshot(self) -> dict:
+        """Everything the web page shows, in one read."""
+        now = time.time()
+        with self._lock:
+            c, m = self.counters, self.machine
+            return {
+                "now": now,
+                "team_id": self.cfg.team_id,
+                "links": dict(self.links),
+                "run": {"state": m.state.name,
+                        "declaration_seq": m.declaration_seq,
+                        "run_id": m.run_id},
+                "course": self.course,
+                "vehicles": [
+                    {"id": v.id, "type": v.type, "relay_via": v.relay_via,
+                     "stale_ms": self.cfg.stale_ms_for(v.id),
+                     "silent_s": (None if v.id not in c.last_seen
+                                  else now - c.last_seen[v.id]),
+                     "report": self.latest.get(v.id, {})}
+                    for v in self.cfg.vehicles
+                ],
+                "commands": list(self.recent),
+                "counters": {"forwarded": c.forwarded,
+                             "dropped_rate": c.dropped_rate,
+                             "dropped_invalid": c.dropped_invalid,
+                             "dropped_mistyped": c.dropped_mistyped,
+                             "stale": c.stale,
+                             "commands_routed": c.commands_routed,
+                             "commands_undeliverable": c.commands_undeliverable},
+            }
+
     def status(self) -> str:
         with self._lock:
             c, m = self.counters, self.machine
@@ -438,6 +509,15 @@ class Bridge:
                 "wire log   %s" % self.wire.path,
             ]
             return "\n".join(lines)
+
+
+def _decode(msg) -> dict:
+    """Protobuf -> dict, keeping the handbook's own field names so the page and
+    the spec can be read side by side."""
+    return json_format.MessageToDict(
+        msg, always_print_fields_with_no_presence=True,
+        preserving_proto_field_name=True,
+    )
 
 
 def _vehicle_from_topic(topic: str) -> str:
