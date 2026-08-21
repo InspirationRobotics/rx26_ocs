@@ -234,12 +234,39 @@ Replace `.venv\Scripts\python.exe` with `.venv/bin/python` throughout. Then:
 
 ---
 
-## What is not tested yet
+## Run against the real sim box — 2026-08-20
 
-- **Nothing has run against Eclipse Mosquitto.** The verification so far used
-  RoboNation's `test_server.py` against a Python broker, because Docker is not
-  installed on the dev laptop. Their server code and protobuf were exercised;
-  the real broker was not. Do 4a before believing it.
+Level 4 done, over Ethernet, against Eclipse Mosquitto on the sim box. All of
+it passed:
+
+| | Result |
+|---|---|
+| DHCP lease on the course subnet | `192.168.65.191/24`, `PrefixOrigin: Dhcp` — not static |
+| IP forwarding | `Disabled` on every interface |
+| TCP to `192.168.65.2:1883` | succeeds (ICMP is filtered — ping fails, which is fine) |
+| Retained `RxCourse` | ALPHA, 25000 Hz, 5 corners, corner[0] `1.280329, 103.8556869` |
+| RunDeclaration | accepted, `seq=1` |
+| Their auto-start | RunStart within 1 s of all three vehicles reaching `STATE_AUTO` |
+| Run state | `RUNNING run_id=1` |
+| RunStart relay | routed to USV1, UUV1, UAV1 |
+| Heartbeats | 24 forwarded, 0 dropped, 0 stale |
+| Fault nets | 4 fired, 4 refused, 0 reached RoboCommand |
+| Restart durability | run restored as RUNNING, seq 8 → 14, no rewind, no re-declaration |
+
+Evidence on the OCS side is in `run/wire/*.jsonl` (every frame both directions)
+and `run/seq.json`. Evidence on RoboNation's side is the `./logs/` directory of
+their docker stack — **that is the half that counts for the Proof of Readiness,
+and it lives on the sim box, not here.**
+
+## What is still not tested
+
+- **The cable has never been pulled.** The handbook requires the OCS to
+  reconnect and restore its subscriptions. Restarting the process is proven;
+  losing the link underneath a running process is not. Ten-second test: with
+  the OCS running and streaming, unplug the Ethernet, watch the RoboCommand
+  pill go red, plug it back in, and confirm it goes green and reports
+  `reconnected into RUNNING; NOT re-declaring` without minting a new
+  declaration.
 - **No real vehicle has ever published to this OCS.** Every heartbeat so far
   came from the inject buttons.
 - The UUV's submerged heartbeat is unresolved — see

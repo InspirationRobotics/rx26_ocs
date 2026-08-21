@@ -1,3 +1,8 @@
 .venv/
 run/
 __pycache__/
+
+# Run artefacts: sequence store and wire logs. Per-machine, per-run, and the
+# seq store is durable state that must never be shared between machines --
+# committing it would let two OCS instances think they own the same counters.
+run/
