@@ -1,24 +1,38 @@
-"""fake_vehicle — a USV heartbeat source, so step 1 needs no boat.
+"""fake_vehicle — a heartbeat source for any of the three, so step 1 needs no boat.
 
 Publishes RxReport heartbeats at 2 Hz to the TEAM broker on the topic a real
 robocommand_reporter will use. That is the whole point: the bridge cannot tell
 this apart from the Jetson, so everything downstream of the radio can be
 rehearsed, broken and fixed on a desk.
 
-It also carries the two faults that are otherwise impossible to provoke on
-purpose, because both of them come from hardware states you cannot ask for:
+`--type` picks which craft it pretends to be, and the differences are not
+cosmetic -- a UUV fills depth and a UAV fills altitude and flight phase, which
+is exactly the axis along which the bridge's validation policy now varies.
+Run three of these at once to rehearse the whole fleet:
 
-  --nan      heading goes NaN, the way telemetry_bridge.py:210 emits it when
-             GPS yaw is unresolved (msg.hdg == 65535)
-  --unknown  current_task left at TASK_UNKNOWN, the proto3 zero value that any
-             forgotten field produces
+    python fake_vehicle.py --vehicle USV1 --type TYPE_USV
+    python fake_vehicle.py --vehicle UUV1 --type TYPE_UUV
+    python fake_vehicle.py --vehicle UAV1 --type TYPE_UAV
 
-Run either and watch the bridge refuse the frame. A safety net you have never
+It also carries the faults that are otherwise impossible to provoke on purpose,
+because they come from hardware or software states you cannot ask for:
+
+  --nan       heading goes NaN, the way telemetry_bridge.py:210 emits it when
+              GPS yaw is unresolved (msg.hdg == 65535)
+  --unknown   current_task left at TASK_UNKNOWN, the proto3 zero value that any
+              forgotten field produces
+  --no-phase  flight_phase left UNKNOWN. Harmless from a boat and refused from
+              an aircraft, which is the per-type policy in one flag.
+  --mistype   report a vehicle_type that contradicts the config, the signature
+              of a reporter copy-pasted from one vehicle to another
+
+Run each and watch the bridge refuse the frame. A safety net you have never
 seen catch anything is a safety net you are guessing about.
 
-    python fake_vehicle.py --host 127.0.0.1 --vehicle USV1
-    python fake_vehicle.py --nan          # expect: DROP ... heading_deg: NaN
-    python fake_vehicle.py --unknown      # expect: DROP ... current_task: UNKNOWN
+    python fake_vehicle.py --nan                            # DROP heading_deg: NaN
+    python fake_vehicle.py --unknown                        # DROP current_task
+    python fake_vehicle.py --vehicle UAV1 --type TYPE_UAV --no-phase
+    python fake_vehicle.py --mistype                        # DROP ... mistyped
 """
 from __future__ import annotations
 
@@ -41,11 +55,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=1883)
-    ap.add_argument("--team", default="INSPIRATION")
+    ap.add_argument("--team", default="ASTA")
     ap.add_argument("--vehicle", default="USV1")
+    ap.add_argument("--type", dest="vtype", default="TYPE_USV",
+                    choices=["TYPE_USV", "TYPE_UUV", "TYPE_UAV"])
     ap.add_argument("--rate", type=float, default=2.0, help="Hz; the handbook says 2")
     ap.add_argument("--nan", action="store_true", help="emit a NaN heading")
     ap.add_argument("--unknown", action="store_true", help="leave current_task UNKNOWN")
+    ap.add_argument("--no-phase", dest="no_phase", action="store_true",
+                    help="leave flight_phase UNKNOWN -- legal from a boat, "
+                         "refused from an aircraft")
+    ap.add_argument("--mistype", action="store_true",
+                    help="report a vehicle_type that contradicts --type, the "
+                         "signature of a copy-pasted reporter")
     ap.add_argument("--state", default="STATE_AUTO",
                     choices=["STATE_KILLED", "STATE_MANUAL", "STATE_AUTO"])
     args = ap.parse_args()
@@ -83,13 +105,38 @@ def main() -> int:
             hb.heading_deg = float("nan") if args.nan else (math.degrees(theta) % 360.0)
             hb.roll_deg = 3.0 * math.sin(theta * 7.0)
             hb.pitch_deg = 1.5 * math.sin(theta * 5.0)
-            hb.altitude_hae_m = -24.6          # geoid separation; see the README
-            hb.depth_m = 0.0
-            hb.vehicle_type = rx_common_pb2.VehicleType.TYPE_USV
+            # The three craft differ here, and the differences are the point.
+            # A boat sits at the geoid separation with no depth; a UUV has real
+            # depth and no meaningful height above ellipsoid; an aircraft has
+            # real altitude and a flight phase it must not omit.
+            if args.vtype == "TYPE_UUV":
+                hb.altitude_hae_m = 0.0
+                hb.depth_m = 4.5 + 0.5 * math.sin(theta * 3.0)
+            elif args.vtype == "TYPE_UAV":
+                hb.altitude_hae_m = 42.0 + 3.0 * math.sin(theta * 2.0)
+                hb.depth_m = 0.0
+            else:
+                hb.altitude_hae_m = -24.6      # geoid separation; see the README
+                hb.depth_m = 0.0
+
+            claimed = args.vtype
+            if args.mistype:
+                # Claim to be something else entirely. TYPE_USV is the value a
+                # reporter copied off Crusader would carry, so a boat claims to
+                # be an aircraft and everything else claims to be the boat.
+                claimed = "TYPE_UAV" if args.vtype == "TYPE_USV" else "TYPE_USV"
+            hb.vehicle_type = rx_common_pb2.VehicleType.Value(claimed)
+
             if not args.unknown:
                 hb.current_task = rx_common_pb2.RxTask.TASK_NONE
-            # flight_phase deliberately left UNKNOWN: a surface vehicle has no
-            # honest value for it, and the bridge's allow_unknown covers it.
+
+            # flight_phase is left UNKNOWN for a surface or submerged vehicle:
+            # neither has an honest value, and the bridge's per-type allowance
+            # covers them. An aircraft gets a real one unless --no-phase asks
+            # for the failure, because for a UAV that field is relayed onward
+            # for Singapore's Network Remote ID.
+            if args.vtype == "TYPE_UAV" and not args.no_phase:
+                hb.flight_phase = rx_common_pb2.FlightPhase.FLIGHT_PHASE_AIRBORNE
 
             client.publish(topic, report.SerializeToString(), qos=0)
             if n % 20 == 0:

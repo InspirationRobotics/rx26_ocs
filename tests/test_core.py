@@ -260,8 +260,32 @@ class TestSeqStore(unittest.TestCase):
 
 class TestConfig(unittest.TestCase):
     BASE = """
-team_id = "INSPIRATION"
-vehicle_ids = ["USV1"]
+team_id = "ASTA"
+[[vehicle]]
+id = "USV1"
+type = "TYPE_USV"
+[team]
+host = "127.0.0.1"
+[robocommand]
+host = "192.168.65.2"
+"""
+
+    #: The full three-vehicle fleet, as bridge.toml ships it. Bare keys first:
+    #: see _with_fence for why that ordering is load-bearing.
+    FLEET = """
+team_id = "ASTA"
+uav_geofence = [[1.0,2.0],[1.0,3.0],[2.0,3.0],[1.0,2.0]]
+[[vehicle]]
+id = "USV1"
+type = "TYPE_USV"
+[[vehicle]]
+id = "UUV1"
+type = "TYPE_UUV"
+relay_via = "USV1"
+stale_ms = 10000.0
+[[vehicle]]
+id = "UAV1"
+type = "TYPE_UAV"
 [team]
 host = "127.0.0.1"
 [robocommand]
@@ -276,12 +300,90 @@ host = "192.168.65.2"
 
     def test_minimal_config_and_topics(self):
         cfg = self._load(self.BASE)
-        self.assertEqual(cfg.team_id, "INSPIRATION")
+        self.assertEqual(cfg.team_id, "ASTA")
         self.assertEqual(cfg.rc_report_topic("USV1"),
-                         "robocommand/robotx/INSPIRATION/USV1/report")
-        self.assertEqual(cfg.team_report_sub(), "team/robotx/INSPIRATION/+/report")
+                         "robocommand/robotx/ASTA/USV1/report")
+        self.assertEqual(cfg.team_report_sub(), "team/robotx/ASTA/+/report")
         self.assertEqual(cfg.rc_course_sub(), "robocommand/robotx/course")
         self.assertEqual(cfg.tiers, ("TIER_NONE",) * 4)
+
+    def test_the_command_topic_mirrors_the_report_topic(self):
+        cfg = self._load(self.BASE)
+        self.assertEqual(cfg.team_command_topic("USV1"),
+                         "team/robotx/ASTA/USV1/command")
+
+    # ---- the typed fleet ---------------------------------------------------
+
+    def test_the_fleet_loads_in_declaration_order(self):
+        cfg = self._load(self.FLEET)
+        self.assertEqual(cfg.vehicle_ids, ("USV1", "UUV1", "UAV1"))
+        self.assertTrue(cfg.has_uav())
+
+    def test_a_uav_may_not_leave_flight_phase_unknown(self):
+        """The whole reason the fleet had to become typed.
+
+        A global allow_unknown containing flight_phase would hand the aircraft
+        the surface vehicles' exemption, and that field is relayed onward for
+        Singapore's Network Remote ID.
+        """
+        cfg = self._load(self.FLEET)
+        self.assertEqual(cfg.vehicle("UAV1").allow_unknown, ())
+        self.assertIn("flight_phase", cfg.vehicle("USV1").allow_unknown)
+        self.assertIn("flight_phase", cfg.vehicle("UUV1").allow_unknown)
+
+    def test_an_unknown_vehicle_type_fails_on_the_trailer(self):
+        bad = self.BASE.replace('type = "TYPE_USV"', 'type = "TYPE_BOAT"')
+        with self.assertRaises(ConfigError) as cm:
+            self._load(bad)
+        self.assertIn("TYPE_BOAT", str(cm.exception))
+
+    def test_type_unknown_is_not_configurable(self):
+        bad = self.BASE.replace('type = "TYPE_USV"', 'type = "TYPE_UNKNOWN"')
+        with self.assertRaises(ConfigError):
+            self._load(bad)
+
+    def test_staleness_is_per_vehicle_with_a_global_fallback(self):
+        cfg = self._load(self.FLEET)
+        self.assertEqual(cfg.stale_ms_for("UUV1"), 10000.0)   # acoustic hop
+        self.assertEqual(cfg.stale_ms_for("USV1"), cfg.stale_ms)
+        self.assertEqual(cfg.stale_ms_for("nobody"), cfg.stale_ms)
+
+    def test_relay_via_must_name_a_configured_vehicle(self):
+        bad = self.FLEET.replace('relay_via = "USV1"', 'relay_via = "USV9"')
+        with self.assertRaises(ConfigError) as cm:
+            self._load(bad)
+        self.assertIn("USV9", str(cm.exception))
+
+    def test_relay_via_may_not_point_at_itself(self):
+        bad = self.FLEET.replace('relay_via = "USV1"', 'relay_via = "UUV1"')
+        with self.assertRaises(ConfigError) as cm:
+            self._load(bad)
+        self.assertIn("itself", str(cm.exception))
+
+    def test_a_uav_without_a_geofence_will_not_load(self):
+        """Catch it here, not in a rejected RunDeclaration."""
+        bad = self.FLEET.replace(
+            "uav_geofence = [[1.0,2.0],[1.0,3.0],[2.0,3.0],[1.0,2.0]]", ""
+        )
+        with self.assertRaises(ConfigError) as cm:
+            self._load(bad)
+        self.assertIn("geofence", str(cm.exception))
+
+    def test_a_fleet_with_no_uav_needs_no_geofence(self):
+        cfg = self._load(self.BASE)
+        self.assertFalse(cfg.has_uav())
+        self.assertEqual(cfg.uav_geofence, ())
+
+    def test_a_copy_pasted_vehicle_block_is_caught(self):
+        bad = self.BASE + '\n[[vehicle]]\nid = "USV2"\ntype = "TYPE_USV"\n'
+        with self.assertRaises(ConfigError) as cm:
+            self._load(bad)
+        self.assertIn("share a type", str(cm.exception))
+
+    def test_a_fleet_with_no_vehicles_says_so(self):
+        with self.assertRaises(ConfigError) as cm:
+            self._load('team_id = "ASTA"\n[team]\nhost="x"\n[robocommand]\nhost="y"\n')
+        self.assertIn("vehicle", str(cm.exception))
 
     def test_a_misspelled_tier_fails_on_the_trailer(self):
         with self.assertRaises(ConfigError) as cm:
@@ -300,8 +402,8 @@ host = "192.168.65.2"
         bridge.toml, where uav_geofence sat under [tiers] and was ignored.
         """
         return self.BASE.replace(
-            'vehicle_ids = ["USV1"]',
-            'vehicle_ids = ["USV1"]\nuav_geofence = %s' % fence,
+            'team_id = "ASTA"',
+            'team_id = "ASTA"\nuav_geofence = %s' % fence,
         )
 
     def test_an_open_geofence_is_rejected(self):
@@ -315,13 +417,15 @@ host = "192.168.65.2"
         self.assertEqual(cfg.uav_geofence[0], cfg.uav_geofence[-1])
 
     def test_duplicate_vehicle_ids_are_rejected(self):
-        bad = self.BASE.replace('["USV1"]', '["USV1", "USV1"]')
-        with self.assertRaises(ConfigError):
+        bad = self.BASE + '\n[[vehicle]]\nid = "USV1"\ntype = "TYPE_UUV"\n'
+        with self.assertRaises(ConfigError) as cm:
             self._load(bad)
+        self.assertIn("unique", str(cm.exception))
 
     def test_missing_broker_section_names_itself(self):
         with self.assertRaises(ConfigError) as cm:
-            self._load('team_id = "T"\nvehicle_ids = ["USV1"]\n[team]\nhost = "x"\n')
+            self._load('team_id = "T"\n[[vehicle]]\nid = "USV1"\n'
+                       'type = "TYPE_USV"\n[team]\nhost = "x"\n')
         self.assertIn("robocommand", str(cm.exception))
 
 

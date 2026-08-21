@@ -33,7 +33,7 @@ import paho.mqtt.client as mqtt
 from . import validate
 from .config import Config
 from .governor import Governor
-from .proto import common_pb2, rx_commands_pb2, rx_course_pb2
+from .proto import common_pb2, rx_commands_pb2, rx_common_pb2, rx_course_pb2
 from .proto import rx_reports_pb2, rx_requests_pb2
 from .runstate import RunMachine
 from .seqstore import SeqStore
@@ -45,7 +45,11 @@ class Counters:
     forwarded: int = 0
     dropped_rate: int = 0
     dropped_invalid: int = 0
+    dropped_mistyped: int = 0
     stale: int = 0
+    commands_routed: int = 0
+    commands_undeliverable: int = 0
+    last_command: str = ""
     last_seen: dict[str, float] = field(default_factory=dict)
 
 
@@ -192,10 +196,55 @@ class Bridge:
             self.log(("RUN START: " if v.ok else "RUN START REFUSED: ") + v.reason)
             self.wire.event("run_start", v.reason)
         else:
-            # Task 4 lands here. It is advisory input for the mission executive
-            # and is NEVER allowed to actuate anything -- see the README.
-            self.log("command: %s (seq=%d) -- not yet handled" % (which, cmd.seq))
-            self.wire.event("command", "%s seq=%d" % (which, cmd.seq))
+            # Task 4 lands here, and the handbook requires the OCS to route it
+            # to the vehicle it names. It is advisory input for the mission
+            # executive and is NEVER allowed to actuate anything -- see the
+            # README. Routing it is not actuating it: the vehicle side decides
+            # what, if anything, to do, and the RC e-stop remains the only
+            # safety path.
+            self._route_command(cmd, which)
+
+    def _route_command(self, cmd, which: str) -> None:
+        """Hand an inbound RxCommand to the vehicle named in it.
+
+        RxCommand carries its own `vehicle_id`. An unaddressed command is a
+        broadcast to the whole fleet -- KeepOutZone and AllClear are the
+        obvious cases, and sending those to only one vehicle would be worse
+        than dropping them.
+        """
+        targets: tuple[str, ...]
+        if cmd.vehicle_id:
+            if self.cfg.vehicle(cmd.vehicle_id) is None:
+                # Do not invent a topic for a vehicle we do not fly. A typo on
+                # their side becoming a subscription nobody reads is exactly
+                # the kind of quiet that costs a task.
+                self.counters.commands_undeliverable += 1
+                self.log(
+                    "COMMAND UNDELIVERABLE: %s addressed to %s, which is not "
+                    "in the fleet" % (which, cmd.vehicle_id)
+                )
+                self.wire.event(
+                    "command_undeliverable", "%s -> %s" % (which, cmd.vehicle_id)
+                )
+                return
+            targets = (cmd.vehicle_id,)
+        else:
+            targets = self.cfg.vehicle_ids
+
+        payload = cmd.SerializeToString()
+        for vid in targets:
+            topic = self.cfg.team_command_topic(vid)
+            # QoS 1 without exception. Unlike a heartbeat, a command does not
+            # come round again in 500 ms -- if it is dropped it is simply gone,
+            # and the operator is left waiting on a response to something the
+            # vehicle never heard.
+            self.team.publish(topic, payload, qos=1)
+            self.wire.frame("tx", topic, payload, note="%s seq=%d" % (which, cmd.seq))
+
+        with self._lock:
+            self.counters.commands_routed += 1
+            self.counters.last_command = "%s -> %s" % (which, ", ".join(targets))
+        self.log("COMMAND %s (seq=%d) -> %s" % (which, cmd.seq, ", ".join(targets)))
 
     # ---- vehicle side, the hot path --------------------------------------
 
@@ -221,8 +270,9 @@ class Bridge:
             self.log("DROP: topic says %s, message says %s" % (topic_vehicle, vehicle))
             self.wire.event("mismatch", "%s vs %s" % (msg.topic, vehicle))
             return
-        if vehicle not in self._gov:
-            self.log("DROP: %s is not in vehicle_ids" % vehicle)
+        spec = self.cfg.vehicle(vehicle)
+        if spec is None:
+            self.log("DROP: %s is not a configured vehicle" % vehicle)
             return
 
         now = time.time()
@@ -237,7 +287,10 @@ class Bridge:
 
             if report.HasField("sent_at"):
                 age_ms = (now - report.sent_at.ToNanoseconds() / 1e9) * 1000.0
-                if age_ms > self.cfg.stale_ms:
+                # Per vehicle: an acoustic hop cannot meet a WiFi deadline, and
+                # a UUV warning twice a second would bury the USV warning that
+                # actually means something.
+                if age_ms > self.cfg.stale_ms_for(vehicle):
                     # Forward it anyway -- a late position beats no position --
                     # but never silently. Silence here would let a wedged
                     # vehicle look healthy all the way through a run.
@@ -249,7 +302,28 @@ class Bridge:
                 self.wire.event("rate_drop", "%s %s" % (vehicle, body))
                 return
 
-            findings = validate.check(report, allow_unknown=self.cfg.allow_unknown)
+            # A heartbeat that disagrees with the config about what kind of
+            # craft this is means a reporter was copy-pasted between vehicles.
+            # It serializes fine and scores as the wrong vehicle, so it has to
+            # die here -- and it must be checked BEFORE validate(), because the
+            # type is what selects the validation policy below. Trusting the
+            # message's own type to choose its own leniency would let a
+            # mislabelled UAV buy itself the surface-vehicle exemption.
+            if is_hb:
+                declared = rx_common_pb2.VehicleType.Value(spec.type)
+                if report.heartbeat.vehicle_type != declared:
+                    actual = rx_common_pb2.VehicleType.Name(
+                        report.heartbeat.vehicle_type
+                    )
+                    self.counters.dropped_mistyped += 1
+                    detail = "%s is configured %s but reported %s" % (
+                        vehicle, spec.type, actual,
+                    )
+                    self.log("DROP: " + detail)
+                    self.wire.event("mistyped", detail)
+                    return
+
+            findings = validate.check(report, allow_unknown=spec.allow_unknown)
             if findings:
                 self.counters.dropped_invalid += 1
                 detail = "; ".join(str(f) for f in findings)
@@ -297,7 +371,11 @@ class Bridge:
             for lat, lon in self.cfg.uav_geofence:
                 decl.uav_geofence.add(latitude=lat, longitude=lon)
 
-            findings = validate.check(req, allow_unknown=self.cfg.allow_unknown)
+            # Nothing in a declaration has an honest UNKNOWN: there are no
+            # per-vehicle exemptions to inherit here, only four tiers that must
+            # each be a real value. So the allowance is empty, deliberately,
+            # rather than borrowed from some vehicle's policy.
+            findings = validate.check(req, allow_unknown=())
             if findings:
                 return "declaration REFUSED: " + "; ".join(str(f) for f in findings)
 
@@ -326,19 +404,36 @@ class Bridge:
         with self._lock:
             c, m = self.counters, self.machine
             now = time.time()
-            seen = ", ".join(
-                "%s:%.1fs" % (v, now - t) for v, t in sorted(c.last_seen.items())
-            ) or "nothing heard"
             lines = ["state      " + m.state.name]
             if m.declaration_seq is not None:
                 lines[0] += "  (declaration_seq=%d)" % m.declaration_seq
             if m.run_id is not None:
                 lines[0] += "  run_id=%d" % m.run_id
+
+            # Every configured vehicle gets a line whether or not it has ever
+            # been heard from. A fleet view that lists only what is talking
+            # cannot show the one thing the operator most needs to notice --
+            # the vehicle that has said nothing at all.
+            for spec in self.cfg.vehicles:
+                seen = c.last_seen.get(spec.id)
+                age = "never heard" if seen is None else "%.1fs ago" % (now - seen)
+                relay = " via %s" % spec.relay_via if spec.relay_via else ""
+                lines.append(
+                    "  %-6s %-9s %s%s"
+                    % (spec.id, spec.type.removeprefix("TYPE_"), age, relay)
+                )
+
             lines += [
-                "vehicles   " + seen,
                 "forwarded  %d" % c.forwarded,
-                "dropped    %d rate, %d invalid" % (c.dropped_rate, c.dropped_invalid),
+                "dropped    %d rate, %d invalid, %d mistyped"
+                % (c.dropped_rate, c.dropped_invalid, c.dropped_mistyped),
                 "stale      %d" % c.stale,
+                "commands   %d routed, %d undeliverable%s"
+                % (
+                    c.commands_routed,
+                    c.commands_undeliverable,
+                    "  last: " + c.last_command if c.last_command else "",
+                ),
                 "seq        %s" % (self.seqs.snapshot(),),
                 "wire log   %s" % self.wire.path,
             ]

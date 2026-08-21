@@ -22,13 +22,16 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise unittest.SkipTest("generated protobuf unavailable: %s" % exc) from None
 
+#: The surface/submerged allowance. Mirrors config._ALLOW_UNKNOWN_BY_TYPE for
+#: TYPE_USV and TYPE_UUV; UAV_ALLOW is the aircraft's, which permits nothing.
 ALLOW = ("flight_phase",)
+UAV_ALLOW: tuple[str, ...] = ()
 
 
 def usv_heartbeat(*, nan: bool = False, unknown_task: bool = False):
     """What robocommand_reporter will build on the Jetson, field for field."""
     r = rx_reports_pb2.RxReport()
-    r.team_id = "INSPIRATION"
+    r.team_id = "ASTA"
     r.vehicle_id = "USV1"
     r.sent_at.FromNanoseconds(time.time_ns())
 
@@ -45,6 +48,61 @@ def usv_heartbeat(*, nan: bool = False, unknown_task: bool = False):
     hb.vehicle_type = rx_common_pb2.VehicleType.TYPE_USV
     if not unknown_task:
         hb.current_task = rx_common_pb2.RxTask.TASK_NONE
+    return r
+
+
+def uav_heartbeat(*, no_phase: bool = False):
+    """BabyDragon. Airborne, so altitude is real and depth is not.
+
+    `no_phase` is the failure this exists to catch: a reporter that filled in
+    every other field and left flight_phase at its zero value.
+    """
+    r = rx_reports_pb2.RxReport()
+    r.team_id = "ASTA"
+    r.vehicle_id = "UAV1"
+    r.sent_at.FromNanoseconds(time.time_ns())
+
+    hb = r.heartbeat
+    hb.state = common_pb2.RobotState.Value("STATE_AUTO")
+    hb.position.latitude = 27.3364
+    hb.position.longitude = -82.5307
+    hb.spd_mps = 9.0
+    hb.heading_deg = 180.0
+    hb.roll_deg = 4.0
+    hb.pitch_deg = -2.0
+    hb.altitude_hae_m = 42.0
+    hb.depth_m = 0.0
+    hb.vehicle_type = rx_common_pb2.VehicleType.TYPE_UAV
+    hb.current_task = rx_common_pb2.RxTask.TASK_NONE
+    if not no_phase:
+        hb.flight_phase = rx_common_pb2.FlightPhase.FLIGHT_PHASE_AIRBORNE
+    return r
+
+
+def uuv_heartbeat():
+    """Graey. Submerged, so depth is real and altitude_hae is not meaningful.
+
+    Attributed to UUV1 even though Crusader's radio is what carries it: the
+    relay is our network's business, and RoboCommand must see the vehicle that
+    took the measurement.
+    """
+    r = rx_reports_pb2.RxReport()
+    r.team_id = "ASTA"
+    r.vehicle_id = "UUV1"
+    r.sent_at.FromNanoseconds(time.time_ns())
+
+    hb = r.heartbeat
+    hb.state = common_pb2.RobotState.Value("STATE_AUTO")
+    hb.position.latitude = 27.3364
+    hb.position.longitude = -82.5307
+    hb.spd_mps = 0.6
+    hb.heading_deg = 275.0
+    hb.roll_deg = 1.0
+    hb.pitch_deg = -3.0
+    hb.altitude_hae_m = 0.0
+    hb.depth_m = 4.5
+    hb.vehicle_type = rx_common_pb2.VehicleType.TYPE_UUV
+    hb.current_task = rx_common_pb2.RxTask.TASK_INFRA_SURVEY_REPAIR
     return r
 
 
@@ -98,10 +156,46 @@ class TestValidator(unittest.TestCase):
         self.assertTrue(any(f.path == "heartbeat.position.latitude" for f in findings))
 
 
+class TestPerVehicleValidationPolicy(unittest.TestCase):
+    """The allowance is chosen by the CONFIGURED type, never by the message.
+
+    While the fleet was one boat, `allow_unknown` was a single global tuple
+    holding "flight_phase". Adding an aircraft to that arrangement hands the
+    aircraft the boats' exemption -- and the handbook has RoboNation relaying
+    UAV heartbeat telemetry to Garuda Robotics for Singapore's Network Remote
+    ID, so an UNKNOWN flight phase is a regulatory problem rather than a
+    scoring one.
+    """
+
+    def test_a_uav_that_forgot_its_flight_phase_is_caught(self):
+        r = uav_heartbeat(no_phase=True)
+        findings = validate.check(r, allow_unknown=UAV_ALLOW)
+        self.assertTrue(any("flight_phase" in f.path for f in findings))
+
+    def test_a_complete_uav_heartbeat_passes(self):
+        self.assertEqual(validate.check(uav_heartbeat(), allow_unknown=UAV_ALLOW), [])
+
+    def test_the_surface_allowance_would_have_hidden_it(self):
+        """The regression this whole change exists to prevent.
+
+        If this ever passes an empty finding list, the UAV has been handed the
+        surface-vehicle policy again and the Remote ID field is unguarded.
+        """
+        hidden = validate.check(uav_heartbeat(no_phase=True), allow_unknown=ALLOW)
+        self.assertEqual(hidden, [], "precondition: the old global policy hid this")
+
+        caught = validate.check(uav_heartbeat(no_phase=True), allow_unknown=UAV_ALLOW)
+        self.assertTrue(caught, "the UAV policy must catch what the global one hid")
+
+    def test_a_submerged_vehicle_keeps_the_exemption(self):
+        r = uuv_heartbeat()
+        self.assertEqual(validate.check(r, allow_unknown=ALLOW), [])
+
+
 class TestRunDeclaration(unittest.TestCase):
     def _decl(self, task1="TIER_CORE"):
         req = rx_requests_pb2.RxRequest()
-        req.team_id = "INSPIRATION"
+        req.team_id = "ASTA"
         req.seq = 1
         req.sent_at.FromNanoseconds(time.time_ns())
         d = req.run_declaration
@@ -127,7 +221,7 @@ class TestRunDeclaration(unittest.TestCase):
 class TestRunStartMatching(unittest.TestCase):
     def test_run_start_carries_the_declaration_seq_we_must_match(self):
         cmd = rx_commands_pb2.RxCommand()
-        cmd.team_id = "INSPIRATION"
+        cmd.team_id = "ASTA"
         cmd.seq = 5
         cmd.run_start.declaration_seq = 1
         cmd.run_start.run_id = 42

@@ -5,14 +5,51 @@
 # course's .2 address and the OCS takes its own address from DHCP -- never set
 # a static address on the RoboCommand-facing interface.
 
-team_id = "INSPIRATION"
-vehicle_ids = ["USV1"]
+team_id = "ASTA"
 
-# UAV geofence, closed (first point == last point). Empty while USV-only.
-# MUST stay above every [section] header -- a bare key after one belongs to
-# that table, so `uav_geofence` under [tiers] parses as tiers.uav_geofence
-# and is silently ignored.
-uav_geofence = []
+# UAV geofence, closed (first point == last point).
+#
+# MUST stay above every [section] and [[array]] header -- a bare key after one
+# belongs to that table, so `uav_geofence` under [tiers] parses as
+# tiers.uav_geofence and is silently ignored.
+#
+# PLACEHOLDER: a ~400 m box around the Sarasota bench coordinates that
+# fake_vehicle.py flies, present so the config loads and the bench runs. It is
+# NOT the competition geofence and must be replaced with the real one before
+# any run that declares UAV1 -- config.load() refuses to start a fleet
+# containing a TYPE_UAV with an empty fence, which is the net under forgetting,
+# but it cannot tell a wrong fence from a right one.
+uav_geofence = [
+    [27.3384, -82.5327],
+    [27.3384, -82.5287],
+    [27.3344, -82.5287],
+    [27.3344, -82.5327],
+    [27.3384, -82.5327],
+]
+
+# The fleet. Order here is declaration order, and the type is not decoration:
+# it selects the validation policy in config._ALLOW_UNKNOWN_BY_TYPE, and the
+# bridge drops any heartbeat whose own vehicle_type disagrees with it.
+
+[[vehicle]]
+id = "USV1"                 # Crusader
+type = "TYPE_USV"
+
+[[vehicle]]
+id = "UUV1"                 # Graey
+type = "TYPE_UUV"
+relay_via = "USV1"          # submerged; Crusader carries its reports
+# UNVALIDATED. Graey reaches Crusader over a 9600-baud acoustic modem, so a
+# 1 s threshold would fire on essentially every frame and bury the warnings
+# that matter. 10 s is a guess chosen to be quiet rather than a measurement --
+# replace it once the modem has been timed on the water, and see docs/ for the
+# open question to RoboNation about whether a submerged vehicle can miss the
+# 2 Hz obligation at all.
+stale_ms = 10000.0
+
+[[vehicle]]
+id = "UAV1"                 # BabyDragon
+type = "TYPE_UAV"
 
 [team]
 # Our broker. On the bench this is the OCS itself; the vehicles publish here.
@@ -20,7 +57,7 @@ host = "127.0.0.1"
 port = 1883
 
 [robocommand]
-# The simulated RoboNation server. See ocs/README.md for why this is on its own
+# The simulated RoboNation server. See README.md for why this is on its own
 # network segment and not a port on the team router.
 host = "192.168.65.2"
 port = 1883
@@ -33,11 +70,12 @@ task2 = "TIER_NONE"
 task3 = "TIER_NONE"
 task4 = "TIER_NONE"
 
-
 [limits]
-rate = 5.0                # messages/second, metered per vehicle
+rate = 5.0                # messages/second, metered per vehicle -- the
+                          # handbook says "per system", which settles the
+                          # question the USV repo left open
 heartbeat_reserve = 2.0   # tokens only heartbeats may spend
-stale_ms = 1000.0         # warn above this age, measured on the vehicle clock
+stale_ms = 1000.0         # default; per-vehicle overrides above win
 
 [paths]
 seq_store = "run/seq.json"

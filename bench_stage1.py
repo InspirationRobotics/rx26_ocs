@@ -40,7 +40,7 @@ from rx_bridge.proto import rx_reports_pb2, rx_requests_pb2          # noqa: E40
 from rx_bridge.runstate import RunState                              # noqa: E402
 
 HOST, PORT = "127.0.0.1", 11883
-TEAM, VEHICLE = "INSPIRATION", "USV1"
+TEAM, VEHICLE = "ASTA", "USV1"
 
 _results: list[tuple[str, bool, str]] = []
 
@@ -197,8 +197,11 @@ class FakeUSV:
 
 CONFIG = """
 team_id = "{team}"
-vehicle_ids = ["{vehicle}"]
 uav_geofence = []
+
+[[vehicle]]
+id = "{vehicle}"
+type = "TYPE_USV"
 
 [team]
 host = "{host}"
