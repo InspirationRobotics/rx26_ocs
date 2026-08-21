@@ -28,6 +28,7 @@ import math
 import sys
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -39,10 +40,12 @@ from rx_bridge.proto import common_pb2, rx_common_pb2, rx_reports_pb2
 
 HERE = Path(__file__).resolve().parent
 
-#: Sarasota, near enough for a bench. Injected vehicles crawl a slow circle so
-#: every field changes -- a stream of constants hides the frozen-cache and
-#: stale-forwarding bugs this is meant to surface.
-LAT0, LON0 = 27.3364, -82.5307
+#: The middle of RoboNation's own test course (rc_test/test_server.py corners,
+#: Singapore). Injected vehicles crawl a slow circle so every field changes --
+#: a stream of constants hides the frozen-cache and stale-forwarding bugs this
+#: is meant to surface -- and sitting inside the real course means the position
+#: on the page is sane rather than mid-Atlantic.
+LAT0, LON0 = 1.28060, 103.85570
 
 
 class Injector:
@@ -133,6 +136,47 @@ class Injector:
         self.c.disconnect()
 
 
+def _start_local_broker(host: str, port: int, log) -> None:
+    """An MQTT broker in this process, for the team side only.
+
+    So the page can be run on a laptop with nothing installed. It is the same
+    amqtt the bench uses, and it is NOT a substitute for Mosquitto on the day:
+    it binds wherever the config says, but real vehicles need a broker they can
+    route to, and this one dies with the page.
+    """
+    import asyncio
+
+    from amqtt.broker import Broker
+
+    conf = {
+        "listeners": {"default": {"type": "tcp", "bind": "%s:%d" % (host, port),
+                                  "max_connections": 50}},
+        "sys_interval": 0,
+        # amqtt 0.12 refuses every connection without this, and the refusal
+        # looks like a client that simply never connects.
+        "plugins": {
+            "amqtt.plugins.authentication.AnonymousAuthPlugin":
+                {"allow_anonymous": True},
+        },
+    }
+    ready = threading.Event()
+
+    def run():
+        async def main():
+            broker = Broker(conf)      # must be constructed inside the loop
+            await broker.start()
+            ready.set()
+            await asyncio.Event().wait()
+        asyncio.run(main())
+
+    threading.Thread(target=run, daemon=True).start()
+    if not ready.wait(20):
+        raise SystemExit("local broker never started")
+    time.sleep(0.6)
+    log("LOCAL BROKER on %s:%d -- dev only, real vehicles cannot reach it"
+        % (host, port))
+
+
 def make_handler(bridge: Bridge, injector: Injector | None, logs: list):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):            # quiet; the page is polling
@@ -204,6 +248,15 @@ def main(argv=None) -> int:
     ap.add_argument("--inject", action="store_true",
                     help="enable the fake-data buttons. Testing only -- the "
                          "page shows a banner while this is on.")
+    ap.add_argument("--local-broker", nargs="?", const=11883, type=int,
+                    default=None, metavar="PORT",
+                    help="run an in-process MQTT broker for the TEAM side on "
+                         "PORT (default 11883) and point the team client at "
+                         "it, so the page works on a laptop with no Mosquitto. "
+                         "Dev only -- real vehicles cannot reach it. It does "
+                         "NOT default to 1883 because Windows reserves that "
+                         "port in the Hyper-V range and the bind fails with "
+                         "WinError 10013.")
     args = ap.parse_args(argv)
 
     try:
@@ -218,6 +271,14 @@ def main(argv=None) -> int:
         line = time.strftime("%H:%M:%S ") + str(m)
         logs.append(line)
         print(line, flush=True)
+
+    if args.local_broker:
+        # Override the team broker in the loaded config. The RoboCommand side
+        # is untouched: this flag changes where OUR vehicles publish, never
+        # where we report.
+        cfg = replace(cfg, team=replace(cfg.team, host="127.0.0.1",
+                                        port=args.local_broker))
+        _start_local_broker(cfg.team.host, cfg.team.port, log)
 
     bridge = Bridge(cfg, log=log)
     bridge.start()

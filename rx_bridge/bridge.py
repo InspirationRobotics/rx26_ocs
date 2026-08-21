@@ -454,6 +454,14 @@ class Bridge:
                 "now": now,
                 "team_id": self.cfg.team_id,
                 "links": dict(self.links),
+                # The addresses, not just up/down. "DOWN" alone sends people
+                # hunting through config files; "DOWN 192.168.65.2:1883" tells
+                # them whether the OCS is even aiming at the right box.
+                "endpoints": {
+                    "robocommand": "%s:%d" % (self.cfg.robocommand.host,
+                                              self.cfg.robocommand.port),
+                    "team": "%s:%d" % (self.cfg.team.host, self.cfg.team.port),
+                },
                 "run": {"state": m.state.name,
                         "declaration_seq": m.declaration_seq,
                         "run_id": m.run_id},

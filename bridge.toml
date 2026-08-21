@@ -13,18 +13,21 @@ team_id = "ASTA"
 # belongs to that table, so `uav_geofence` under [tiers] parses as
 # tiers.uav_geofence and is silently ignored.
 #
-# PLACEHOLDER: a ~400 m box around the Sarasota bench coordinates that
-# fake_vehicle.py flies, present so the config loads and the bench runs. It is
-# NOT the competition geofence and must be replaced with the real one before
-# any run that declares UAV1 -- config.load() refuses to start a fleet
-# containing a TYPE_UAV with an empty fence, which is the net under forgetting,
-# but it cannot tell a wrong fence from a right one.
+# PLACEHOLDER, but at the right venue. RoboNation's test_server publishes a
+# course at Singapore (1.2803, 103.8557) -- an earlier draft of this file had a
+# box around Sarasota, which would have declared a geofence on the wrong
+# continent. This is a ~200 m box around their course corners so the bench is
+# realistic; it is still NOT the competition geofence and must be replaced.
+#
+# Their test_server rejects a declaration outright if any vehicle_id starts
+# with "UAV" and the fence has fewer than 4 points:
+#   rc_test/test_server.py:104  len(decl.uav_geofence) < 4  -> ValueError
 uav_geofence = [
-    [27.3384, -82.5327],
-    [27.3384, -82.5287],
-    [27.3344, -82.5287],
-    [27.3344, -82.5327],
-    [27.3384, -82.5327],
+    [1.28010, 103.85520],
+    [1.28010, 103.85625],
+    [1.28110, 103.85625],
+    [1.28110, 103.85520],
+    [1.28010, 103.85520],
 ]
 
 # The fleet. Order here is declaration order, and the type is not decoration:

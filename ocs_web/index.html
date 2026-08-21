@@ -136,8 +136,11 @@ async function refresh() {
   catch (e) { $('link-rc').innerHTML = pill('bad','OCS unreachable'); return; }
 
   $('team').textContent = s.team_id;
-  $('link-rc').innerHTML   = s.links.robocommand ? pill('ok','connected') : pill('bad','DOWN');
-  $('link-team').innerHTML = s.links.team        ? pill('ok','connected') : pill('bad','DOWN');
+  const ep = s.endpoints || {};
+  $('link-rc').innerHTML   = (s.links.robocommand ? pill('ok','connected') : pill('bad','DOWN'))
+    + ` <span class="muted">${ep.robocommand||''}</span>`;
+  $('link-team').innerHTML = (s.links.team ? pill('ok','connected') : pill('bad','DOWN'))
+    + ` <span class="muted">${ep.team||''}</span>`;
 
   const r = s.run;
   $('run').innerHTML = pill(r.state==='RUNNING'?'ok':(r.state==='DECLARED'?'warn':'idle'), r.state)
