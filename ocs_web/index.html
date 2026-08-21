@@ -1,0 +1,173 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OCS — ASTA</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#11141a; color:#dfe4ec; font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;
+         margin:0; padding:14px 18px; }
+  h1 { font-size:15px; margin:0 0 10px; letter-spacing:.08em; text-transform:uppercase; color:#8fa3bf }
+  h2 { font-size:12px; margin:18px 0 6px; letter-spacing:.08em; text-transform:uppercase; color:#7d8ba0 }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start }
+  .card { background:#171b23; border:1px solid #232936; border-radius:6px; padding:10px 12px; }
+  .grow { flex:1; min-width:320px }
+  table { border-collapse:collapse; width:100% }
+  td,th { text-align:left; padding:3px 10px 3px 0; vertical-align:top; white-space:nowrap }
+  th { color:#7d8ba0; font-weight:normal }
+  .pill { display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px }
+  .ok   { background:#173a24; color:#5fd18a }
+  .bad  { background:#3d1a1e; color:#ff8b93 }
+  .warn { background:#3b3117; color:#e8b757 }
+  .idle { background:#232936; color:#8b99ae }
+  button { background:#232b38; color:#dfe4ec; border:1px solid #33405a; border-radius:4px;
+           padding:4px 10px; font:inherit; cursor:pointer }
+  button:hover { background:#2c374a }
+  button.go { border-color:#2f6b45; background:#183a26; color:#7fe0a4 }
+  button.stop { border-color:#6b2f35; background:#3a1a1e; color:#ff9aa2 }
+  #banner { background:#4a2410; border:1px solid #8a4a1a; color:#ffb877;
+            padding:6px 12px; border-radius:5px; margin-bottom:12px; display:none }
+  pre { margin:0; max-height:150px; overflow:auto; color:#9fb0c7; font-size:12px }
+  .muted { color:#6d7a8d }
+  details summary { cursor:pointer; color:#7d8ba0 }
+  details pre { max-height:260px; margin-top:6px }
+</style>
+
+<div id="banner">⚠ FAKE DATA INJECTION IS ENABLED — this OCS can publish heartbeats no vehicle sent.</div>
+
+<h1>OCS · <span id="team">…</span></h1>
+
+<div class="row">
+  <div class="card">
+    <table>
+      <tr><th>RoboCommand</th><td id="link-rc">—</td></tr>
+      <tr><th>Team broker</th><td id="link-team">—</td></tr>
+      <tr><th>Run</th><td id="run">—</td></tr>
+      <tr><th>Course</th><td id="course">—</td></tr>
+    </table>
+    <div style="margin-top:10px; display:flex; gap:8px">
+      <button class="go" onclick="post('/api/declare')">Declare run</button>
+      <button class="stop" onclick="post('/api/end')">End run</button>
+    </div>
+    <div id="action" class="muted" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card grow">
+    <table>
+      <tr><th>forwarded</th><th>rate</th><th>invalid</th><th>mistyped</th>
+          <th>stale</th><th>cmds</th><th>undeliv.</th></tr>
+      <tr id="counters"><td colspan="7" class="muted">—</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>Fleet</h2>
+<div id="fleet" class="row"></div>
+
+<h2>Commands from RoboCommand</h2>
+<div class="card"><table id="cmds"><tr><td class="muted">nothing yet</td></tr></table></div>
+
+<h2>Log</h2>
+<div class="card"><pre id="log"></pre></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function pill(cls, text) { return `<span class="pill ${cls}">${text}</span>`; }
+
+async function post(url, body) {
+  const r = await fetch(url, {method:'POST', body: JSON.stringify(body||{})});
+  const j = await r.json().catch(()=>({result:'(no response)'}));
+  $('action').textContent = j.result || '';
+  refresh();
+}
+
+function inject(vid, mode, on, fault) {
+  post('/api/inject', {vehicle: vid, mode: mode, on: on, fault: fault || ''});
+}
+
+function vehicleCard(v, streaming, injectOn) {
+  const hb = (v.report && v.report.heartbeat) || {};
+  const silent = v.silent_s;
+  let health = pill('idle','never heard');
+  if (silent !== null && silent !== undefined) {
+    const budget = Math.max(1.5, v.stale_ms/1000);
+    health = silent > budget ? pill('bad', silent.toFixed(1)+'s silent')
+                             : pill('ok', silent.toFixed(1)+'s ago');
+  }
+  const pos = hb.position ? `${(hb.position.latitude||0).toFixed(5)}, ${(hb.position.longitude||0).toFixed(5)}` : '—';
+  const streamOn = streaming.includes(v.id);
+
+  const buttons = injectOn ? `
+    <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap">
+      <button onclick="inject('${v.id}','once')">Inject 1</button>
+      <button class="${streamOn?'stop':'go'}" onclick="inject('${v.id}','stream',${!streamOn})">
+        ${streamOn ? 'Stop 2 Hz' : 'Stream 2 Hz'}</button>
+    </div>
+    <div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap">
+      <button onclick="inject('${v.id}','once','nan')">NaN hdg</button>
+      <button onclick="inject('${v.id}','once','unknown_task')">no task</button>
+      <button onclick="inject('${v.id}','once','mistype')">wrong type</button>
+      ${v.type==='TYPE_UAV' ? `<button onclick="inject('${v.id}','once','no_phase')">no phase</button>`:''}
+    </div>` : '';
+
+  return `<div class="card grow">
+    <div><b>${v.id}</b> <span class="muted">${v.type.replace('TYPE_','')}</span>
+         ${v.relay_via ? `<span class="muted">via ${v.relay_via}</span>`:''} ${health}</div>
+    <table style="margin-top:6px">
+      <tr><th>state</th><td>${hb.state || '—'}</td></tr>
+      <tr><th>task</th><td>${hb.current_task || '—'}</td></tr>
+      <tr><th>position</th><td>${pos}</td></tr>
+      <tr><th>hdg / spd</th><td>${fmt(hb.heading_deg)}° / ${fmt(hb.spd_mps)} m/s</td></tr>
+      ${v.type==='TYPE_UUV' ? `<tr><th>depth</th><td>${fmt(hb.depth_m)} m</td></tr>`
+                            : `<tr><th>alt (HAE)</th><td>${fmt(hb.altitude_hae_m)} m</td></tr>`}
+      ${v.type==='TYPE_UAV' ? `<tr><th>phase</th><td>${hb.flight_phase||'—'}</td></tr>`:''}
+      <tr><th>seq</th><td>${(v.report && v.report.seq) || '—'}</td></tr>
+    </table>
+    <details style="margin-top:6px"><summary>all fields</summary>
+      <pre>${JSON.stringify(v.report||{}, null, 1)}</pre></details>
+    ${buttons}
+  </div>`;
+}
+
+function fmt(x) { return (x === undefined || x === null) ? '—' : Number(x).toFixed(1); }
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/api/state')).json(); }
+  catch (e) { $('link-rc').innerHTML = pill('bad','OCS unreachable'); return; }
+
+  $('team').textContent = s.team_id;
+  $('link-rc').innerHTML   = s.links.robocommand ? pill('ok','connected') : pill('bad','DOWN');
+  $('link-team').innerHTML = s.links.team        ? pill('ok','connected') : pill('bad','DOWN');
+
+  const r = s.run;
+  $('run').innerHTML = pill(r.state==='RUNNING'?'ok':(r.state==='DECLARED'?'warn':'idle'), r.state)
+    + (r.declaration_seq!=null ? ` <span class="muted">decl_seq=${r.declaration_seq}</span>`:'')
+    + (r.run_id!=null ? ` <span class="muted">run_id=${r.run_id}</span>`:'');
+
+  $('course').innerHTML = s.course && s.course.course_id
+    ? `${s.course.course_id} <span class="muted">pinger ${s.course.pinger_freq_hz||'?'} Hz</span>`
+    : pill('idle','not received');
+
+  const c = s.counters;
+  $('counters').innerHTML = `<td>${c.forwarded}</td><td>${c.dropped_rate}</td>
+    <td>${c.dropped_invalid}</td><td>${c.dropped_mistyped}</td><td>${c.stale}</td>
+    <td>${c.commands_routed}</td><td>${c.commands_undeliverable}</td>`;
+
+  $('banner').style.display = s.inject.enabled ? 'block' : 'none';
+  $('fleet').innerHTML = s.vehicles
+    .map(v => vehicleCard(v, s.inject.streaming, s.inject.enabled)).join('');
+
+  $('cmds').innerHTML = s.commands.length ? s.commands.map(k => `<tr>
+      <td>${new Date(k.at*1000).toLocaleTimeString()}</td>
+      <td><b>${k.which}</b></td><td>seq=${k.seq}</td>
+      <td>${k.delivered ? pill('ok','→ '+(k.targets.join(', ')||'—'))
+                        : pill('bad','undeliverable: '+(k.detail||''))}</td>
+    </tr>`).join('') : '<tr><td class="muted">nothing yet</td></tr>';
+
+  $('log').textContent = (s.log||[]).join('\n');
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+refresh();
+setInterval(refresh, 500);
+</script>

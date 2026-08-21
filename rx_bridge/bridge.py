@@ -378,6 +378,11 @@ class Bridge:
             payload = report.SerializeToString()
             seq = report.seq
             self.counters.forwarded += 1
+            # Record it again now that seq and sent_at are ours, so the page
+            # shows the frame RoboCommand actually received rather than the
+            # vehicle's draft of it. The earlier write above is what keeps a
+            # dropped or pre-declaration frame visible at all.
+            self.latest[vehicle] = _decode(report)
 
         topic = self.cfg.rc_report_topic(vehicle)
         self.rc.publish(topic, payload, qos=0 if is_hb else 1)
