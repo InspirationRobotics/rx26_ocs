@@ -1,0 +1,30 @@
+# Pinned, because the OCS is a laptop at a dock and "it worked last week" is not
+# a diagnosis. Recreate with:
+#
+#     python -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
+#     (on Linux/macOS: .venv/bin/python)
+#
+# paho 2.x is REQUIRED: bridge.py uses the VERSION2 callback signatures, which
+# do not exist in 1.x.
+paho-mqtt==2.1.0
+
+# protobuf 6.x+ is REQUIRED, and this is not a preference. RoboNation's schemas
+# declare `edition = "2024"`, which a 5.x runtime cannot load at all -- the
+# import fails outright rather than degrading. An earlier draft of this file
+# pinned 5.28.3 and could not read a single message.
+protobuf==7.36.0
+
+# Ships protoc as a wheel, so make_protos.sh needs nothing installed system-wide
+# -- which matters most on the Windows laptop that ends up being the OCS.
+# Edition 2024 needs libprotoc >= 30ish; grpcio-tools 1.83.0 carries 35.1.
+# grpcio-tools 1.71.x carries libprotoc 29.0 and FAILS with
+#   "Edition 2024 is later than the maximum supported edition 2023".
+grpcio-tools==1.83.0
+
+# Bench only -- bench_stage1.py runs an MQTT broker in-process so Gate G3 Part A
+# needs no docker and no mosquitto, which matters on the Windows laptop that
+# ends up being the OCS. The bridge itself never imports it.
+# NOTE amqtt 0.12 refuses every connection unless anonymous auth is declared
+# explicitly in the `plugins` config; the refusal looks like a client that just
+# never connects. See bench_stage1.start_broker().
+amqtt==0.12.0

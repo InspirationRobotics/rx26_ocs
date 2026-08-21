@@ -1,0 +1,44 @@
+# rx_bridge configuration. Copy per machine; do not commit course-specific edits.
+#
+# The addresses below are the BENCH setup: a laptop talking to the RoboNation
+# stub on another machine. At the competition, `robocommand.host` becomes the
+# course's .2 address and the OCS takes its own address from DHCP -- never set
+# a static address on the RoboCommand-facing interface.
+
+team_id = "INSPIRATION"
+vehicle_ids = ["USV1"]
+
+# UAV geofence, closed (first point == last point). Empty while USV-only.
+# MUST stay above every [section] header -- a bare key after one belongs to
+# that table, so `uav_geofence` under [tiers] parses as tiers.uav_geofence
+# and is silently ignored.
+uav_geofence = []
+
+[team]
+# Our broker. On the bench this is the OCS itself; the vehicles publish here.
+host = "127.0.0.1"
+port = 1883
+
+[robocommand]
+# The simulated RoboNation server. See ocs/README.md for why this is on its own
+# network segment and not a port on the team router.
+host = "192.168.65.2"
+port = 1883
+
+[tiers]
+# What we are declaring. TIER_NONE for anything not attempted this run --
+# TIER_UNKNOWN is the proto3 zero value and is never legal to send.
+task1 = "TIER_CORE"
+task2 = "TIER_NONE"
+task3 = "TIER_NONE"
+task4 = "TIER_NONE"
+
+
+[limits]
+rate = 5.0                # messages/second, metered per vehicle
+heartbeat_reserve = 2.0   # tokens only heartbeats may spend
+stale_ms = 1000.0         # warn above this age, measured on the vehicle clock
+
+[paths]
+seq_store = "run/seq.json"
+wire_log  = "run/wire"
