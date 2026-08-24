@@ -59,6 +59,28 @@ type = "TYPE_UAV"
 host = "127.0.0.1"
 port = 1883
 
+[tcp]
+# Where the vehicles dial IN. This is the vehicle link that replaces the team
+# broker: one connection per vehicle, telemetry up and commands down on the same
+# socket, no broker process in between.
+#
+# 0.0.0.0, never 127.0.0.1 -- the OCS is dual-homed and a loopback bind is
+# reachable from nothing but the laptop itself. That failure looks exactly like
+# a vehicle that will not connect.
+#
+# The vehicle needs THIS machine's address on the team subnet; there is no
+# discovery. Give the OCS a static address on the team NIC or a DHCP reservation
+# on the team router, and set ocs_host to match in the boat's
+# crusader_bringup/config/crusader_params.yaml. (The handbook's ban on static
+# addressing applies only to the RoboCommand-facing interface, not to our own
+# team network.)
+#
+# 37564 is clear of the Jetson's own ports: 8090 ground_station, 8080/8081 the
+# viewers it embeds.
+host = "0.0.0.0"
+port = 37564
+enabled = true
+
 [robocommand]
 # The simulated RoboNation server. See README.md for why this is on its own
 # network segment and not a port on the team router.

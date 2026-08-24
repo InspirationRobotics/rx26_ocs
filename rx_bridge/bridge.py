@@ -24,6 +24,7 @@ vehicle's own timestamp survives only as the staleness measurement.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import deque
@@ -40,6 +41,7 @@ from .proto import common_pb2, rx_commands_pb2, rx_common_pb2, rx_course_pb2
 from .proto import rx_reports_pb2, rx_requests_pb2
 from .runstate import RunMachine
 from .seqstore import SeqStore
+from .tcpserver import TcpServer
 from .wirelog import WireLog
 
 
@@ -54,6 +56,9 @@ class Counters:
     commands_undeliverable: int = 0
     last_command: str = ""
     last_seen: dict[str, float] = field(default_factory=dict)
+    #: vehicle_id -> "tcp" | "mqtt". Which link a vehicle last spoke on, so
+    #: the page can say so while both transports are wired up.
+    last_via: dict[str, str] = field(default_factory=dict)
 
 
 class Bridge:
@@ -118,9 +123,20 @@ class Bridge:
         self.team.on_connect = self._on_team_connect
         self.team.on_message = self._on_team_message
 
+        # The vehicle link. MQTT above stays wired up alongside it: both feed
+        # the same _ingest_report, so the bench and the inject buttons keep
+        # working as a regression gate while TCP is still unproven on hardware.
+        self.tcp = (
+            TcpServer(cfg.tcp_host, cfg.tcp_port,
+                      on_frame=self._on_tcp_frame, log=self.log)
+            if cfg.tcp_enabled else None
+        )
+
     # ---- lifecycle --------------------------------------------------------
 
     def start(self) -> None:
+        if self.tcp is not None:
+            self.tcp.start()
         self.team.connect_async(
             self.cfg.team.host, self.cfg.team.port, self.cfg.team.keepalive
         )
@@ -137,6 +153,8 @@ class Bridge:
         )
 
     def stop(self) -> None:
+        if self.tcp is not None:
+            self.tcp.stop()
         for c in (self.rc, self.team):
             c.loop_stop()
             c.disconnect()
@@ -263,22 +281,35 @@ class Bridge:
             targets = self.cfg.vehicle_ids
 
         payload = cmd.SerializeToString()
+        as_json = _to_json(cmd)
+        routes: list[str] = []
         for vid in targets:
+            # The vehicle link first: a vehicle holding a TCP connection is
+            # listening on that socket, and it is the one that will still
+            # exist once the broker is gone. MQTT below is the fallback while
+            # both transports are wired up.
+            if self.tcp is not None and self.tcp.send(vid, as_json):
+                routes.append("%s/tcp" % vid)
+                self.wire.frame("tx", "tcp://%s" % vid, as_json,
+                                note="%s seq=%d" % (which, cmd.seq))
+                continue
             topic = self.cfg.team_command_topic(vid)
             # QoS 1 without exception. Unlike a heartbeat, a command does not
             # come round again in 500 ms -- if it is dropped it is simply gone,
             # and the operator is left waiting on a response to something the
             # vehicle never heard.
             self.team.publish(topic, payload, qos=1)
+            routes.append("%s/mqtt" % vid)
             self.wire.frame("tx", topic, payload, note="%s seq=%d" % (which, cmd.seq))
 
         with self._lock:
             self.counters.commands_routed += 1
-            self.counters.last_command = "%s -> %s" % (which, ", ".join(targets))
+            self.counters.last_command = "%s -> %s" % (which, ", ".join(routes))
             self.recent.appendleft({"at": time.time(), "which": which,
                                     "seq": cmd.seq, "targets": list(targets),
+                                    "routes": routes,
                                     "delivered": True, "body": _decode(cmd)})
-        self.log("COMMAND %s (seq=%d) -> %s" % (which, cmd.seq, ", ".join(targets)))
+        self.log("COMMAND %s (seq=%d) -> %s" % (which, cmd.seq, ", ".join(routes)))
 
     # ---- vehicle side, the hot path --------------------------------------
 
@@ -298,13 +329,58 @@ class Bridge:
             self.log("undecodable RxReport on %s: %s" % (msg.topic, exc))
             return
 
-        vehicle = report.vehicle_id
         topic_vehicle = _vehicle_from_topic(msg.topic)
-        if topic_vehicle and topic_vehicle != vehicle:
+        if topic_vehicle and topic_vehicle != report.vehicle_id:
             # The handbook requires the topic's vehicle_id to match the message's.
-            self.log("DROP: topic says %s, message says %s" % (topic_vehicle, vehicle))
-            self.wire.event("mismatch", "%s vs %s" % (msg.topic, vehicle))
+            self.log("DROP: topic says %s, message says %s"
+                     % (topic_vehicle, report.vehicle_id))
+            self.wire.event("mismatch",
+                            "%s vs %s" % (msg.topic, report.vehicle_id))
             return
+        self._ingest_report(report, via="mqtt")
+
+    def _on_tcp_frame(self, payload: bytes) -> str | None:
+        """One framed JSON RxReport off the vehicle link.
+
+        Returns the vehicle_id, which is what tcpserver files the connection
+        under. Returning None for a frame we could not read leaves that socket
+        anonymous -- correct, because we have not learned who is on it, and
+        guessing would route somebody else's commands down it.
+
+        JSON in, protobuf out. The bridge re-stamps seq and sent_at and
+        re-serializes every report regardless, so the format arriving from a
+        vehicle was never coupled to the one RoboCommand receives. That is what
+        lets the boat carry no protobuf at all.
+        """
+        self.wire.frame("veh", "tcp://in", payload)
+        report = rx_reports_pb2.RxReport()
+        try:
+            json_format.ParseDict(json.loads(payload.decode("utf-8")), report)
+        except (UnicodeDecodeError, json.JSONDecodeError,
+                json_format.ParseError) as exc:
+            # ParseError names the offending field, which is most of what goes
+            # wrong while a reporter is being written: a misspelled key, or an
+            # enum spelled as something that is not one of its values.
+            #
+            # NOTE a bare NaN lands here too -- protobuf's JSON mapping requires
+            # non-finite floats as the quoted string "NaN". The vehicle sends
+            # them that way; see ocs_link.py in rx26_asv.
+            self.log("undecodable RxReport on the vehicle link: %s" % exc)
+            self.wire.event("undecodable", str(exc))
+            return None
+        self._ingest_report(report, via="tcp")
+        return report.vehicle_id or None
+
+    def _ingest_report(self, report, *, via: str) -> None:
+        """The hot path, from either transport.
+
+        Everything from here down is deliberately transport-agnostic: staleness,
+        the governor, validation, sequencing and the re-stamp are rules about the
+        message, not about the socket it arrived on. That separation is the
+        reason adding TCP did not require touching governor.py, seqstore.py or
+        validate.py at all.
+        """
+        vehicle = report.vehicle_id
         spec = self.cfg.vehicle(vehicle)
         if spec is None:
             self.log("DROP: %s is not a configured vehicle" % vehicle)
@@ -312,6 +388,7 @@ class Bridge:
 
         now = time.time()
         self.counters.last_seen[vehicle] = now
+        self.counters.last_via[vehicle] = via
         body = report.WhichOneof("body")
         # Before the gate below: the bridge is correctly silent toward
         # RoboCommand until we declare, but the operator still needs to see the
@@ -448,6 +525,10 @@ class Bridge:
     def snapshot(self) -> dict:
         """Everything the web page shows, in one read."""
         now = time.time()
+        # Read outside the bridge lock. tcpserver holds its own, and always
+        # taking them bridge-then-tcp is cheaper to keep true than an
+        # argument about why no inversion can happen.
+        peers = self.tcp.peers() if self.tcp is not None else {}
         with self._lock:
             c, m = self.counters, self.machine
             return {
@@ -461,7 +542,10 @@ class Bridge:
                     "robocommand": "%s:%d" % (self.cfg.robocommand.host,
                                               self.cfg.robocommand.port),
                     "team": "%s:%d" % (self.cfg.team.host, self.cfg.team.port),
+                    "tcp": ("%s:%d" % (self.cfg.tcp_host, self.cfg.tcp_port)
+                            if self.tcp is not None else "off"),
                 },
+                "tcp_peers": peers,
                 "run": {"state": m.state.name,
                         "declaration_seq": m.declaration_seq,
                         "run_id": m.run_id},
@@ -471,6 +555,12 @@ class Bridge:
                      "stale_ms": self.cfg.stale_ms_for(v.id),
                      "silent_s": (None if v.id not in c.last_seen
                                   else now - c.last_seen[v.id]),
+                     # "tcp" only while the socket is actually up; last_via
+                     # is what it last spoke on, which is the more useful
+                     # thing to show once it has gone quiet.
+                     "link": ("tcp" if v.id in peers
+                              else c.last_via.get(v.id, "")),
+                     "peer": peers.get(v.id, ""),
                      "report": self.latest.get(v.id, {})}
                     for v in self.cfg.vehicles
                 ],
@@ -485,6 +575,7 @@ class Bridge:
             }
 
     def status(self) -> str:
+        peers = self.tcp.peers() if self.tcp is not None else {}
         with self._lock:
             c, m = self.counters, self.machine
             now = time.time()
@@ -502,9 +593,10 @@ class Bridge:
                 seen = c.last_seen.get(spec.id)
                 age = "never heard" if seen is None else "%.1fs ago" % (now - seen)
                 relay = " via %s" % spec.relay_via if spec.relay_via else ""
+                link = peers.get(spec.id) or c.last_via.get(spec.id, "-")
                 lines.append(
-                    "  %-6s %-9s %s%s"
-                    % (spec.id, spec.type.removeprefix("TYPE_"), age, relay)
+                    "  %-6s %-9s %-14s %-22s%s"
+                    % (spec.id, spec.type.removeprefix("TYPE_"), age, link, relay)
                 )
 
             lines += [
@@ -517,6 +609,11 @@ class Bridge:
                     c.commands_routed,
                     c.commands_undeliverable,
                     "  last: " + c.last_command if c.last_command else "",
+                ),
+                "vehicle link %s" % (
+                    "off" if self.tcp is None
+                    else "%s:%d, %d connected" % (self.cfg.tcp_host,
+                                                 self.cfg.tcp_port, len(peers))
                 ),
                 "seq        %s" % (self.seqs.snapshot(),),
                 "wire log   %s" % self.wire.path,
@@ -531,6 +628,22 @@ def _decode(msg) -> dict:
         msg, always_print_fields_with_no_presence=True,
         preserving_proto_field_name=True,
     )
+
+
+def _to_json(msg) -> bytes:
+    """Protobuf -> the JSON bytes the vehicle link carries.
+
+    protobuf's own encoder rather than json.dumps, because it is the half
+    that already knows the convention for non-finite floats: they go out as
+    the quoted string "NaN", which is exactly what ParseDict demands coming
+    back the other way. Hand-rolling this is how two directions drift apart.
+
+    preserving_proto_field_name so the boat's keys read the same as the
+    handbook's field names.
+    """
+    return json_format.MessageToJson(
+        msg, preserving_proto_field_name=True, indent=None
+    ).encode("utf-8")
 
 
 def _vehicle_from_topic(topic: str) -> str:

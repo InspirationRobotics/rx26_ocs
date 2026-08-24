@@ -113,6 +113,7 @@ function vehicleCard(v, streaming, injectOn) {
     <div><b>${v.id}</b> <span class="muted">${v.type.replace('TYPE_','')}</span>
          ${v.relay_via ? `<span class="muted">via ${v.relay_via}</span>`:''} ${health}</div>
     <table style="margin-top:6px">
+      <tr><th>link</th><td>${v.link ? (v.peer ? v.link+' <span class="muted">'+v.peer+'</span>' : v.link) : '—'}</td></tr>
       <tr><th>state</th><td>${hb.state || '—'}</td></tr>
       <tr><th>task</th><td>${hb.current_task || '—'}</td></tr>
       <tr><th>position</th><td>${pos}</td></tr>

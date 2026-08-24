@@ -34,10 +34,11 @@ adopting a newer robocommand revision, and you read the diff when you do.
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-**Expect:** `Ran 57 tests` then `OK`.
+**Expect:** `Ran 69 tests` then `OK`.
 
 Config validation, sequence-store durability, the rate governor, the run state
-machine, the wire format. If this fails, nothing below is worth running.
+machine, the wire format, and the vehicle link's frame boundaries. If this
+fails, nothing below is worth running.
 
 ---
 
@@ -72,6 +73,53 @@ To see just the summary:
 
 ---
 
+## 2b. The vehicle link bench — about 30 seconds
+
+```powershell
+.venv\Scripts\python.exe bench_stage2.py
+```
+
+**Expect:** every line `PASS`, ending `16/16 checks passed`.
+
+Stage 1 exercises the bridge over MQTT. This one exercises the **TCP link the
+vehicles actually use** — and it does it by importing the boat's own client,
+`crusader_groundstation/ocs_link.py` out of the rx26_asv checkout, rather than
+writing a stand-in here.
+
+**That import is the whole point.** The frame format is duplicated across the
+two repos by necessity — a ROS package cannot import from the OCS — so the one
+failure this bench exists to catch is those two copies drifting apart. A test
+that spoke the OCS's own framing back to itself would agree with itself
+perfectly while the boat sent garbage.
+
+It expects `rx26_asv` to be a sibling of this repo. If it is not:
+
+```powershell
+$env:RX26_ASV = "C:\path\to\rx26_asv"
+```
+
+| Check | What it proves |
+|---|---|
+| `B2` | The OCS learns which vehicle is on a socket from the message, not the connection |
+| `B5`/`B6` | The NaN and TASK_UNKNOWN nets still fire on the TCP path |
+| `B7` | Two frames in **one** write arrive as two, not one |
+| `B8` | One frame split across two writes arrives once — not twice, not never |
+| `B9b` | A command for USV1 does **not** go down UUV1's socket |
+| `B12b` | 20 heartbeats queued during an outage produce **one** frame on reconnect |
+
+`B7` and `B8` are the ones that matter most. TCP does not preserve message
+boundaries, and a client that reads whatever `recv()` happens to return works
+on a bench at 2 Hz and starts tearing messages the moment traffic is bursty —
+which is exactly what a reconnect produces.
+
+`B12b` is the other one. Without a latest-wins slot on the boat, a dropped link
+accumulates heartbeats and dumps them all on reconnect; the OCS rate governor
+then discards most as a rate problem when it was a link problem, and the
+survivors get re-stamped with the current time — so a position from ten seconds
+ago reaches RoboNation labelled as current.
+
+---
+
 ## 3. The GUI, standalone — no sim box needed
 
 ```powershell
@@ -86,7 +134,36 @@ buttons and puts an orange banner across the top; without it the buttons are
 gone and the endpoint returns 403.
 
 **Expect:** RoboCommand `DOWN 192.168.65.2:1883` (correct — no sim box), team
-broker `connected 127.0.0.1:11883`, three vehicle cards reading "never heard".
+broker `connected 127.0.0.1:11883`, `vehicle link: listening on 0.0.0.0:37564`,
+and three vehicle cards reading "never heard".
+
+### Driving it with the real boat client
+
+The inject buttons fake data *inside* the OCS. To exercise the actual vehicle
+link, run the boat's client against it — no ROS and no Pixhawk needed:
+
+```powershell
+cd ..\rx26_asv\crusader_groundstation
+..\..\OCS\.venv\Scripts\python.exe -m crusader_groundstation.ocs_link --host 127.0.0.1
+```
+
+**`127.0.0.1` is correct only because both ends are on this laptop.** On the
+Jetson that address is the Jetson itself and the connect fails; there, `ocs_host`
+in `crusader_params.yaml` must be the OCS's address on the team subnet.
+
+**Expect** in the OCS log:
+
+```
+vehicle link: 127.0.0.1:13474 connected
+vehicle link: 127.0.0.1:13474 identified as USV1
+```
+
+and the USV1 card showing `link  tcp  127.0.0.1:13474`. Stop the client with
+Ctrl+C and the OCS must log `(USV1) disconnected` within a second — if it does
+not, clean-close detection is broken and a dead link will read as healthy.
+
+`--fault nan` and `--fault unknown_task` provoke the two validator faults over
+the real link.
 
 Walk the fault buttons on the USV card and watch the Log pane:
 
@@ -267,7 +344,12 @@ and it lives on the sim box, not here.**
   pill go red, plug it back in, and confirm it goes green and reports
   `reconnected into RUNNING; NOT re-declaring` without minting a new
   declaration.
-- **No real vehicle has ever published to this OCS.** Every heartbeat so far
-  came from the inject buttons.
+- **No real vehicle has ever published to this OCS.** The boat's own client
+  code now drives the link (level 2b and level 3), but every heartbeat so far
+  is still synthesized — nothing has yet come from a Pixhawk, over WiFi, on a
+  Jetson. `ros2 run crusader_groundstation ocs_client` with real topics flowing
+  is the step that has not been taken.
+- **The UUV and UAV have no client at all.** Only `crusader_groundstation` in
+  rx26_asv has one; Graey and BabyDragon still report nothing.
 - The UUV's submerged heartbeat is unresolved — see
   [ROBONATION_QUESTIONS.md](ROBONATION_QUESTIONS.md) Q1.

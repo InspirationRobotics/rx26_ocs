@@ -417,6 +417,10 @@ def main() -> int:
     failed = [t for t, ok, _ in _results if not ok]
     if failed:
         print("FAILED: %s" % ", ".join(failed))
+    # os._exit skips atexit AND the stdio flush. Piped, stdout is block-
+    # buffered, so without this the summary line is simply lost -- which
+    # is exactly the line CI and TESTING.md tell you to look for.
+    sys.stdout.flush()
     os._exit(0 if not failed else 1)
 
 

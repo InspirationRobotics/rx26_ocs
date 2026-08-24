@@ -102,6 +102,13 @@ class Config:
     seq_store: Path = Path("run/seq.json")
     wire_log: Path = Path("run/wire")
 
+    #: Where vehicles dial in. 0.0.0.0 because the OCS is dual-homed and the
+    #: team NIC is not the one we bind by name -- see README on why this must
+    #: never be 127.0.0.1 (nothing off the laptop could reach it).
+    tcp_host: str = "0.0.0.0"
+    tcp_port: int = 37564
+    tcp_enabled: bool = True
+
     # ---- fleet lookups ----------------------------------------------------
 
     @property
@@ -271,6 +278,7 @@ def load(path: str | Path) -> Config:
 
     limits = raw.get("limits", {})
     paths = raw.get("paths", {})
+    tcp = raw.get("tcp", {})
 
     return Config(
         team_id=team_id,
@@ -284,4 +292,7 @@ def load(path: str | Path) -> Config:
         stale_ms=float(limits.get("stale_ms", 1000.0)),
         seq_store=Path(paths.get("seq_store", "run/seq.json")),
         wire_log=Path(paths.get("wire_log", "run/wire")),
+        tcp_host=str(tcp.get("host", "0.0.0.0")),
+        tcp_port=int(tcp.get("port", 37564)),
+        tcp_enabled=bool(tcp.get("enabled", True)),
     )
