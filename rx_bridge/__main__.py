@@ -22,9 +22,12 @@ from .bridge import Bridge
 from .config import ConfigError, load
 
 HELP = """commands:
-  declare   publish the RunDeclaration (needs the retained RxCourse first)
-  status    run state, per-vehicle silence, counters, seq, wire log path
-  end       end the run; reports stop
+  declare   publish the RunDeclaration. Needs the retained RxCourse first.
+            Legal again after `end` -- a timeslot holds several runs, and
+            each declaration gets its own sequence number.
+  status    run state, per-vehicle silence and publish rate, counters,
+            course validation, who is not yet AUTO, seq, wire log path
+  end       end the run; reports stop. Declare again for the next one.
   quit      shut down
 """
 

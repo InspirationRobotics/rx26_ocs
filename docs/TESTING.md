@@ -34,7 +34,7 @@ adopting a newer robocommand revision, and you read the diff when you do.
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-**Expect:** `Ran 69 tests` then `OK`.
+**Expect:** `Ran 92 tests` then `OK`.
 
 Config validation, sequence-store durability, the rate governor, the run state
 machine, the wire format, and the vehicle link's frame boundaries. If this
@@ -48,7 +48,7 @@ fails, nothing below is worth running.
 .venv\Scripts\python.exe bench_stage1.py
 ```
 
-**Expect:** every line `PASS`, ending `17/17 checks passed`.
+**Expect:** every line `PASS`, ending `21/21 checks passed`.
 
 Runs the entire start-of-run sequence against a broker inside the same process:
 connect, receive the course, refuse a premature declaration, declare, heartbeat
@@ -62,6 +62,8 @@ The two that matter most:
 |---|---|
 | `A10b` | RunStart from RoboNation actually reaches the vehicles' command topic |
 | `A11b` | A RunStart answering someone else's declaration is **not** relayed |
+| `A14b` | A second run in the same timeslot does **not** reuse the first's declaration seq |
+| `A14c` | A stale RunStart for run 1 does **not** start run 2 |
 
 No docker, no broker install, no network, no boat. Run this before every commit.
 
@@ -185,6 +187,34 @@ is fit to declare at all.
 
 ---
 
+## 3b. Several runs in one timeslot
+
+A timeslot holds more than one run, so the OCS has to be able to declare
+again after finishing. With the GUI running (level 3):
+
+1. **Declare run**, let it reach `DECLARED`, then **End run**.
+2. **Declare run** again.
+
+**Expect** the result line to read `re-declared with seq=2 (declaration 2
+by this process)` — note **seq=2, not seq=1**.
+
+That number is the whole point. Each declaration must carry a sequence
+number no earlier declaration has used, because RoboCommand's RunStart
+names the `declaration_seq` it answers. If two declarations both said
+`seq=1`, a late RunStart for the first run would match the second and
+start your fleet against the wrong declaration — passing the very check
+written to prevent it. `A14b` and `A14c` in level 2 prove this
+automatically; this is how you confirm it by hand.
+
+**Declaring during a run is refused**, deliberately: `cannot declare
+during a run -- end it first`. Declaring over a live run would leave the
+fleet flying one run while the OCS reported another.
+
+To genuinely start sequence numbers over — a new competition day, a
+different machine — delete `run/seq.json`. Nothing else rewinds them.
+
+---
+
 ## 4. Against RoboNation's real stack — the one that counts
 
 ### 4a. Start their server *on the sim box*
@@ -281,6 +311,14 @@ reserved ranges:
 ```powershell
 netsh interface ipv4 show excludedportrange protocol=tcp
 ```
+
+**A flapping RoboCommand link is usually a second OCS, not the network.**
+Our MQTT client id is stable by design — it is what lets the broker keep
+our session across a drop. The cost is that a second client using the
+same id takes the session, and the two then kick each other off forever.
+After three drops in 30 s the log says so explicitly (`DUPLICATE OCS?`).
+Find the other instance and stop it; the handbook permits the team one
+connection, so the fight is the rule being enforced.
 
 **Do not plug the sim box into the team router** — not the LAN port, not the
 WAN port. Vehicles must not be able to reach RoboCommand. Give it its own

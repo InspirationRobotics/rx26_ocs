@@ -73,6 +73,18 @@ const $ = id => document.getElementById(id);
 
 function pill(cls, text) { return `<span class="pill ${cls}">${text}</span>`; }
 
+// What we are actually publishing to RoboCommand for this vehicle. The
+// handbook obliges 2 Hz per active vehicle; this is the measurement, so a
+// forward loop that has quietly fallen behind is visible rather than assumed.
+// Only meaningful once reports are flowing -- before declaring we publish
+// nothing on purpose, and 0.00 Hz there is correct, not a fault.
+function rateCell(v) {
+  const hz = v.published_hz || 0;
+  if (hz === 0) return `<span class="muted">nothing published</span>`;
+  const cls = hz >= 1.8 ? 'ok' : (hz >= 1.0 ? 'warn' : 'bad');
+  return `${pill(cls, hz.toFixed(2) + ' Hz')} <span class="muted">need 2.00</span>`;
+}
+
 async function post(url, body) {
   const r = await fetch(url, {method:'POST', body: JSON.stringify(body||{})});
   const j = await r.json().catch(()=>({result:'(no response)'}));
@@ -114,6 +126,7 @@ function vehicleCard(v, streaming, injectOn) {
          ${v.relay_via ? `<span class="muted">via ${v.relay_via}</span>`:''} ${health}</div>
     <table style="margin-top:6px">
       <tr><th>link</th><td>${v.link ? (v.peer ? v.link+' <span class="muted">'+v.peer+'</span>' : v.link) : '—'}</td></tr>
+      <tr><th>published</th><td>${rateCell(v)}</td></tr>
       <tr><th>state</th><td>${hb.state || '—'}</td></tr>
       <tr><th>task</th><td>${hb.current_task || '—'}</td></tr>
       <tr><th>position</th><td>${pos}</td></tr>
@@ -148,9 +161,25 @@ async function refresh() {
     + (r.declaration_seq!=null ? ` <span class="muted">decl_seq=${r.declaration_seq}</span>`:'')
     + (r.run_id!=null ? ` <span class="muted">run_id=${r.run_id}</span>`:'');
 
-  $('course').innerHTML = s.course && s.course.course_id
-    ? `${s.course.course_id} <span class="muted">pinger ${s.course.pinger_freq_hz||'?'} Hz</span>`
-    : pill('idle','not received');
+  const cf = s.course_findings || [];
+  $('course').innerHTML = (s.course && s.course.course_id
+      ? `${s.course.course_id} <span class="muted">pinger ${s.course.pinger_freq_hz||'?'} Hz, `
+        + `${(s.course.corners||[]).length} corners</span>`
+      : pill('idle','not received'))
+    // Advisory, never blocking -- their frame is authoritative even when it
+    // is odd. But the operator must not declare against a course we misread.
+    + (cf.length ? ` ${pill('bad','suspect')}<div class="muted" style="margin-top:4px">`
+                   + cf.map(x=>`&bull; ${x}`).join('<br>') + '</div>' : '');
+
+  // RoboCommand holds RunStart until EVERY declared vehicle reports
+  // STATE_AUTO -- with no timeout and no error, so naming the laggard is the
+  // difference between a diagnosis and a silent wait.
+  const wait = s.awaiting_auto || [];
+  if (r.state === 'DECLARED') {
+    $('run').innerHTML += wait.length
+      ? ` <span class="muted">waiting on ${wait.join(', ')} to reach AUTO</span>`
+      : ` ${pill('ok','all AUTO')} <span class="muted">RunStart is theirs to send</span>`;
+  }
 
   const c = s.counters;
   $('counters').innerHTML = `<td>${c.forwarded}</td><td>${c.dropped_rate}</td>

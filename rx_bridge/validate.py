@@ -53,6 +53,41 @@ def check(msg, *, allow_unknown: tuple[str, ...] = ()) -> list[Finding]:
     return found
 
 
+#: A course polygon needs at least three corners to bound an area. Fewer is not
+#: a tight fence, it is a line or a point -- and it means we misread the frame.
+MIN_CORNERS = 3
+
+
+def check_course(course) -> list[Finding]:
+    """Validate a received RxCourse. Findings are ADVISORY -- see below.
+
+    The handbook's sequence has the OCS receive *and validate* the course before
+    it declares, and until now this file only ever inspected what we SEND. The
+    course is the one message we are handed rather than build, which makes it
+    the one most worth checking: everything downstream is positioned relative to
+    it, and a course we misread is a run scored somewhere else.
+
+    NOTHING HERE BLOCKS THE RUN, and that is deliberate. A bridge that refuses to
+    leave CONNECTED because it dislikes RoboNation's course cannot declare at
+    all, and "nothing else can proceed" is a lost run rather than a caught bug.
+    Their frame is authoritative even when it is odd. So we say so, loudly, in
+    the log and on the page, and let the operator decide -- which is exactly the
+    call a person should be making in the window before declaring.
+    """
+    found = list(check(course))          # NaN/Inf in corner coordinates
+    if not course.course_id:
+        found.append(Finding("course_id", "EMPTY", "no course identifier"))
+    if course.pinger_freq_hz <= 0:
+        found.append(Finding("pinger_freq_hz", "ZERO",
+                             "no pinger frequency; acoustic tasks cannot tune"))
+    n = len(course.corners)
+    if n < MIN_CORNERS:
+        found.append(Finding("corners", "TOO_FEW",
+                             "%d corner(s); need >= %d to bound an area"
+                             % (n, MIN_CORNERS)))
+    return found
+
+
 def _walk(msg, prefix: str, out: list[Finding], allowed: frozenset[str]) -> None:
     for field, value in msg.ListFields():
         path = f"{prefix}{field.name}"

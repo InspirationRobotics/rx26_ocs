@@ -429,5 +429,126 @@ host = "192.168.65.2"
         self.assertIn("robocommand", str(cm.exception))
 
 
+class TestMultipleRunsPerTimeslot(unittest.TestCase):
+    """A timeslot holds more than one run, so ending one must not strand the OCS.
+
+    The subtle half is not the state machine, it is the sequence numbers: two
+    declarations that both carry seq=1 make a stale RunStart from the first run
+    match the second, which defeats the one check standing between us and
+    starting a run against somebody else's declaration.
+    """
+
+    def _ended(self) -> RunMachine:
+        m = RunMachine()
+        m.on_connect()
+        m.on_course(object())
+        m.on_declared(1)
+        m.on_run_start(1, 77)
+        m.on_end()
+        return m
+
+    def test_a_finished_run_may_declare_again(self):
+        m = self._ended()
+        self.assertEqual(m.state, RunState.ENDED)
+        self.assertTrue(m.may_declare())
+
+    def test_re_declaring_starts_a_second_run(self):
+        m = self._ended()
+        v = m.on_declared(2)
+        self.assertTrue(v)
+        self.assertEqual(m.state, RunState.DECLARED)
+        self.assertEqual(m.declaration_seq, 2)
+        self.assertEqual(m.runs_declared, 2)
+        self.assertIn("re-declared", v.reason)
+
+    def test_the_previous_run_id_does_not_leak_into_the_next(self):
+        """DECLARED with last run's run_id still showing reads as already running."""
+        m = self._ended()
+        self.assertEqual(m.run_id, 77)
+        m.on_declared(2)
+        self.assertIsNone(m.run_id)
+
+    def test_declaring_over_a_live_run_is_refused_with_a_way_out(self):
+        m = RunMachine()
+        m.on_connect()
+        m.on_course(object())
+        m.on_declared(1)
+        m.on_run_start(1, 5)
+        self.assertFalse(m.may_declare())
+        v = m.on_declared(2)
+        self.assertFalse(v)
+        self.assertIn("end the current run first", v.reason)
+        self.assertEqual(m.state, RunState.RUNNING)
+        self.assertEqual(m.run_id, 5)
+
+    def test_a_stale_run_start_cannot_start_the_second_run(self):
+        """The whole reason declarations must not reuse a sequence number."""
+        m = self._ended()
+        m.on_declared(2)                       # second run, new seq
+        stale = m.on_run_start(1, 77)          # RunStart answering run ONE
+        self.assertFalse(stale)
+        self.assertEqual(m.state, RunState.DECLARED)
+        self.assertIsNone(m.run_id)
+        good = m.on_run_start(2, 78)
+        self.assertTrue(good)
+        self.assertEqual(m.run_id, 78)
+
+    def test_the_run_can_be_ended_and_redeclared_repeatedly(self):
+        m = self._ended()
+        for seq in (2, 3, 4):
+            self.assertTrue(m.on_declared(seq))
+            self.assertTrue(m.on_run_start(seq, seq * 10))
+            self.assertTrue(m.on_end())
+        self.assertEqual(m.runs_declared, 4)
+
+
+class TestSeqStoreAcrossRuns(unittest.TestCase):
+    """ensure_epoch is what keeps declaration sequence numbers unique."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = Path(self.dir) / "seq.json"
+
+    def test_the_request_counter_climbs_across_runs(self):
+        s = SeqStore(self.path)
+        s.ensure_epoch("ASTA-1")
+        first = s.next_request()
+        s.ensure_epoch("ASTA-2")               # second run, same timeslot
+        second = s.next_request()
+        self.assertEqual((first, second), (1, 2))
+        self.assertNotEqual(first, second)
+
+    def test_ensure_epoch_only_creates_once(self):
+        s = SeqStore(self.path)
+        self.assertTrue(s.ensure_epoch("ASTA-1"))
+        self.assertFalse(s.ensure_epoch("ASTA-2"))
+        self.assertEqual(s.epoch, "ASTA-1")
+
+    def test_ensure_epoch_does_not_rewind_report_counters(self):
+        s = SeqStore(self.path)
+        s.ensure_epoch("ASTA-1")
+        for _ in range(5):
+            s.next_report("USV1")
+        s.ensure_epoch("ASTA-2")
+        self.assertEqual(s.next_report("USV1"), 6)
+
+    def test_new_epoch_still_wipes_when_asked_explicitly(self):
+        """The deliberate reset must still exist -- a new day, a new store."""
+        s = SeqStore(self.path)
+        s.ensure_epoch("ASTA-1")
+        s.next_request()
+        s.new_epoch("ASTA-day2")
+        self.assertEqual(s.next_request(), 1)
+
+    def test_the_climbing_counter_survives_a_restart(self):
+        s = SeqStore(self.path)
+        s.ensure_epoch("ASTA-1")
+        s.next_request()
+        del s
+        again = SeqStore(self.path)
+        self.assertFalse(again.ensure_epoch("ASTA-2"))
+        self.assertEqual(again.next_request(), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

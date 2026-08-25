@@ -79,8 +79,32 @@ class SeqStore:
     def epoch(self) -> str:
         return self._epoch
 
+    def ensure_epoch(self, epoch: str) -> bool:
+        """Begin an epoch only if there is not one already. True if created.
+
+        A timeslot holds several runs, and each one publishes a fresh
+        RunDeclaration. If every declaration started a new epoch the request
+        counter would reset, every declaration would carry seq=1, and a
+        RunStart answering the FIRST run would match the second -- passing
+        the check in runstate.on_run_start that exists to catch exactly that,
+        and starting a run against the wrong declaration.
+
+        So the counter climbs for the life of the store instead. Every
+        declaration in a session gets a seq no other declaration has had,
+        which is also the plainest reading of the handbook's "do not reuse
+        messages from previous runs".
+
+        To genuinely start over -- a new competition day, a different
+        machine -- delete the store file. That is a deliberate act, which is
+        the right weight for something that rewinds sequence numbers.
+        """
+        if self._epoch:
+            return False
+        self.new_epoch(epoch)
+        return True
+
     def new_epoch(self, epoch: str) -> None:
-        """Start a run. Zeroes every counter -- see the module docstring."""
+        """Wipe and start over. Zeroes every counter -- see the docstring."""
         self._epoch = epoch
         self._request = 0
         self._reports = {}

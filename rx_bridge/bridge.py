@@ -45,6 +45,47 @@ from .tcpserver import TcpServer
 from .wirelog import WireLog
 
 
+#: Window over which the published heartbeat rate is measured. Long enough
+#: that one late frame does not read as a rate collapse, short enough that a
+#: vehicle going quiet shows up while the operator can still act on it.
+_HB_WINDOW_S = 10.0
+
+
+class HeartbeatRate:
+    """What we are ACTUALLY publishing per vehicle, in Hz.
+
+    The handbook obliges the OCS to publish a heartbeat per active vehicle at
+    2 Hz. Until now the bridge forwarded whatever arrived and nobody counted,
+    so "are we meeting our obligation" was a question you answered by reading
+    a wire log after the run. This answers it during the run.
+
+    Measured on what we PUBLISHED, not on what the vehicle sent -- a frame
+    the governor dropped or the validator refused did not reach RoboCommand,
+    and counting it would report compliance we do not have.
+    """
+
+    def __init__(self) -> None:
+        self._t: dict[str, deque] = {}
+
+    def record(self, vehicle_id: str, now: float) -> None:
+        d = self._t.setdefault(vehicle_id, deque())
+        d.append(now)
+        cut = now - _HB_WINDOW_S
+        while d and d[0] < cut:
+            d.popleft()
+
+    def hz(self, vehicle_id: str, now: float) -> float:
+        d = self._t.get(vehicle_id)
+        if not d:
+            return 0.0
+        cut = now - _HB_WINDOW_S
+        recent = [t for t in d if t >= cut]
+        if len(recent) < 2:
+            return 0.0
+        span = recent[-1] - recent[0]
+        return (len(recent) - 1) / span if span > 0 else 0.0
+
+
 @dataclass
 class Counters:
     forwarded: int = 0
@@ -68,6 +109,16 @@ class Bridge:
         self.machine = RunMachine()
         self.seqs = SeqStore(cfg.seq_store)
         self.counters = Counters()
+        self.hb_rate = HeartbeatRate()
+        #: Findings from the last RxCourse. Advisory -- see validate.check_course.
+        self.course_findings: list[str] = []
+        #: True once every declared vehicle has been seen in STATE_AUTO, so the
+        #: 'all AUTO but no RunStart' case is distinguishable from 'still
+        #: waiting on a vehicle'. Logged on the edge, not every frame.
+        self._all_auto = False
+        #: Recent RoboCommand disconnects, for the duplicate-client check.
+        self._rc_drops: deque = deque(maxlen=8)
+        self._warned_duplicate = False
         self.wire = WireLog(cfg.wire_log, run_tag=cfg.team_id)
 
         # What the web page reads. Decoded with protobuf's own MessageToDict
@@ -173,6 +224,7 @@ class Bridge:
         with self._lock:
             v = self.machine.on_connect()
         self.links["robocommand"] = True
+        self._on_rc_connect_stable()
         self.log("RoboCommand: " + v.reason)
         self.wire.event("connect", v.reason)
 
@@ -182,6 +234,45 @@ class Bridge:
         self.links["robocommand"] = False
         self.log("RoboCommand lost (%s): %s" % (reason, v.reason))
         self.wire.event("disconnect", "%s: %s" % (reason, v.reason))
+        self._check_duplicate_ocs()
+
+    def _check_duplicate_ocs(self) -> None:
+        """Explain a flapping RoboCommand link, once.
+
+        Our MQTT client id is stable by design -- it is what lets the broker
+        keep our session across a drop, which the handbook asks for. The cost
+        is that a SECOND client using the same id takes the session away, and
+        the two then kick each other off forever. On the wire that looks like
+        an unstable network, and people go and re-crimp a perfectly good
+        cable. It is not the network; it is two OCS instances.
+
+        Not repaired automatically, deliberately. Giving each instance a
+        unique id would let both stay connected, and the handbook permits the
+        team exactly one OCS connection -- so the fight is the rule being
+        enforced. The fix is to stop the other instance, which needs a human.
+        """
+        now = time.monotonic()
+        self._rc_drops.append(now)
+        recent = [t for t in self._rc_drops if now - t <= 30.0]
+        if len(recent) >= 3 and not self._warned_duplicate:
+            self._warned_duplicate = True
+            detail = (
+                "RoboCommand link has dropped %d times in 30 s. This is "
+                "almost never the network: another client is connecting as "
+                "\"ocs-%s\" and taking the session. Find the other OCS "
+                "instance and stop it -- the handbook permits the team one "
+                "connection." % (len(recent), self.cfg.team_id)
+            )
+            self.log("DUPLICATE OCS? " + detail)
+            self.wire.event("duplicate_ocs", detail)
+
+    def _on_rc_connect_stable(self) -> None:
+        """Clear the warning latch after a spell of stability."""
+        now = time.monotonic()
+        if self._warned_duplicate and not [
+            t for t in self._rc_drops if now - t <= 60.0
+        ]:
+            self._warned_duplicate = False
 
     def _on_rc_message(self, _client, _ud, msg) -> None:
         self.wire.frame("rx", msg.topic, msg.payload)
@@ -197,12 +288,23 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             self.log("undecodable RxCourse: %s" % exc)
             return
+        # Validate before advancing. Advisory only: a bridge that refuses to
+        # leave CONNECTED because it dislikes their course cannot declare at
+        # all, and their frame is authoritative even when it is odd. Say so
+        # loudly instead, in the window where a person can still act on it.
+        findings = validate.check_course(course)
         with self._lock:
+            self.course_findings = [str(f) for f in findings]
             v = self.machine.on_course(course)
         self.log(
             "course %s: pinger %d Hz, %d corners -- %s"
             % (course.course_id, course.pinger_freq_hz, len(course.corners), v.reason)
         )
+        if findings:
+            detail = "; ".join(str(f) for f in findings)
+            self.log("COURSE SUSPECT: %s -- accepted anyway; check before "
+                     "declaring" % detail)
+            self.wire.event("course_suspect", detail)
         self.course = _decode(course)
 
     def _handle_command(self, payload: bytes) -> None:
@@ -455,6 +557,8 @@ class Bridge:
             payload = report.SerializeToString()
             seq = report.seq
             self.counters.forwarded += 1
+            if is_hb:
+                self.hb_rate.record(vehicle, now)
             # Record it again now that seq and sent_at are ours, so the page
             # shows the frame RoboCommand actually received rather than the
             # vehicle's draft of it. The earlier write above is what keeps a
@@ -464,6 +568,40 @@ class Bridge:
         topic = self.cfg.rc_report_topic(vehicle)
         self.rc.publish(topic, payload, qos=0 if is_hb else 1)
         self.wire.frame("tx", topic, payload, note="seq=%d %s" % (seq, body))
+        if is_hb:
+            self._note_auto_edge()
+
+    def awaiting_auto(self) -> list[str]:
+        """Declared vehicles not yet seen in STATE_AUTO.
+
+        RoboCommand publishes RunStart only once every vehicle in the
+        declaration reports STATE_AUTO -- with no timeout and no error, so a
+        fleet stuck one vehicle short looks exactly like a broken link to
+        their server. This names the vehicle, which turns a silent wait into
+        something the operator can act on.
+        """
+        out = []
+        for spec in self.cfg.vehicles:
+            hb = (self.latest.get(spec.id) or {}).get("heartbeat") or {}
+            if hb.get("state") != "STATE_AUTO":
+                out.append(spec.id)
+        return out
+
+    def _note_auto_edge(self) -> None:
+        """Log the moment the fleet becomes fully AUTO, once.
+
+        That instant is when RunStart becomes their side's responsibility. If
+        it does not arrive after this line, the problem is not our fleet.
+        """
+        waiting = self.awaiting_auto()
+        if not waiting and not self._all_auto:
+            self._all_auto = True
+            self.log("all declared vehicles report STATE_AUTO -- RunStart is "
+                     "now RoboCommand's move")
+            self.wire.event("all_auto", ", ".join(self.cfg.vehicle_ids))
+        elif waiting and self._all_auto:
+            self._all_auto = False
+            self.log("no longer all AUTO -- waiting on %s" % ", ".join(waiting))
 
     # ---- operator actions -------------------------------------------------
 
@@ -471,12 +609,18 @@ class Bridge:
         """Publish the RunDeclaration. This is what creates the obligations."""
         with self._lock:
             if not self.machine.may_declare():
+                if self.machine.state.name == "RUNNING":
+                    return ("cannot declare during a run -- end it first, "
+                            "then declare the next one")
                 return (
                     "cannot declare in %s -- need the retained RxCourse first"
                     % self.machine.state.name
                 )
 
-            self.seqs.new_epoch("%s-%d" % (self.cfg.team_id, int(time.time())))
+            # ensure_, not new_: a second run in the same timeslot must NOT
+            # rewind the request counter, or its declaration reuses seq=1 and
+            # a stale RunStart from the first run matches it. See seqstore.
+            self.seqs.ensure_epoch("%s-%d" % (self.cfg.team_id, int(time.time())))
 
             req = rx_requests_pb2.RxRequest()
             req.team_id = self.cfg.team_id
@@ -504,6 +648,9 @@ class Bridge:
             payload = req.SerializeToString()
             seq = req.seq
             v = self.machine.on_declared(seq)
+            # A new run needs its own readiness edge, or the "all AUTO"
+            # line from the previous run suppresses this run's.
+            self._all_auto = False
             self.seqs.save_run(self.machine.state.name,
                                self.machine.declaration_seq, self.machine.run_id)
 
@@ -548,8 +695,16 @@ class Bridge:
                 "tcp_peers": peers,
                 "run": {"state": m.state.name,
                         "declaration_seq": m.declaration_seq,
-                        "run_id": m.run_id},
+                        "run_id": m.run_id,
+                        "runs_declared": m.runs_declared,
+                        "may_declare": m.may_declare()},
                 "course": self.course,
+                "course_findings": list(self.course_findings),
+                "awaiting_auto": [
+                    v.id for v in self.cfg.vehicles
+                    if ((self.latest.get(v.id) or {}).get("heartbeat") or {})
+                    .get("state") != "STATE_AUTO"
+                ],
                 "vehicles": [
                     {"id": v.id, "type": v.type, "relay_via": v.relay_via,
                      "stale_ms": self.cfg.stale_ms_for(v.id),
@@ -561,6 +716,10 @@ class Bridge:
                      "link": ("tcp" if v.id in peers
                               else c.last_via.get(v.id, "")),
                      "peer": peers.get(v.id, ""),
+                     # What we are actually PUBLISHING for this vehicle. The
+                     # handbook obliges 2 Hz; this is the measurement, not
+                     # the intention.
+                     "published_hz": round(self.hb_rate.hz(v.id, now), 2),
                      "report": self.latest.get(v.id, {})}
                     for v in self.cfg.vehicles
                 ],
@@ -594,9 +753,11 @@ class Bridge:
                 age = "never heard" if seen is None else "%.1fs ago" % (now - seen)
                 relay = " via %s" % spec.relay_via if spec.relay_via else ""
                 link = peers.get(spec.id) or c.last_via.get(spec.id, "-")
+                hz = self.hb_rate.hz(spec.id, now)
                 lines.append(
-                    "  %-6s %-9s %-14s %-22s%s"
-                    % (spec.id, spec.type.removeprefix("TYPE_"), age, link, relay)
+                    "  %-6s %-9s %-14s %5.2f Hz  %-22s%s"
+                    % (spec.id, spec.type.removeprefix("TYPE_"), age, hz,
+                       link, relay)
                 )
 
             lines += [
@@ -609,6 +770,18 @@ class Bridge:
                     c.commands_routed,
                     c.commands_undeliverable,
                     "  last: " + c.last_command if c.last_command else "",
+                ),
+                "course     %s" % (
+                    "not received" if not self.course
+                    else "%s, %d corners%s" % (
+                        self.course.get("course_id", "?"),
+                        len(self.course.get("corners", [])),
+                        "" if not self.course_findings
+                        else "  SUSPECT: " + "; ".join(self.course_findings),
+                    )
+                ),
+                "awaiting   %s" % (
+                    ", ".join(self.awaiting_auto()) or "nothing -- all AUTO"
                 ),
                 "vehicle link %s" % (
                     "off" if self.tcp is None

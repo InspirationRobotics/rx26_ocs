@@ -264,6 +264,15 @@ wire_log = "{wire}"
 """
 
 
+def run_start_bytes(declaration_seq: int, run_id: int) -> bytes:
+    """A RunStart as RoboCommand would send it, for the re-declaration checks."""
+    cmd = rx_commands_pb2.RxCommand()
+    cmd.seq = 900 + run_id % 100
+    cmd.run_start.declaration_seq = declaration_seq
+    cmd.run_start.run_id = run_id
+    return cmd.SerializeToString()
+
+
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="g3-stage1-"))
     cfg_path = work / "bridge.toml"
@@ -328,8 +337,15 @@ def main() -> int:
     check("A7", 10 <= fwd <= 14, "%d frames in 6 s (expect ~12 at 2 Hz)" % fwd)
 
     print("\nA8-A9  the faults that cannot be provoked on a bench")
-    inv0, fwd0 = bridge.counters.dropped_invalid, bridge.counters.forwarded
     usv.nan = True
+    # Drain before snapshotting. At the instant the fault is switched on a
+    # CLEAN frame may already be in flight -- published, queued, or partway
+    # through the hot path -- and it lands after the snapshot, reading as a
+    # bad frame that got through. One heartbeat interval of settle removes
+    # the race without weakening the check: zero clean frames may be
+    # forwarded across the three seconds that follow.
+    settle(1.0)
+    inv0, fwd0 = bridge.counters.dropped_invalid, bridge.counters.forwarded
     settle(3.0)
     check("A8", bridge.counters.dropped_invalid > inv0
           and bridge.counters.forwarded == fwd0,
@@ -338,8 +354,9 @@ def main() -> int:
              bridge.counters.forwarded - fwd0))
     usv.nan = False
 
-    inv1, fwd1 = bridge.counters.dropped_invalid, bridge.counters.forwarded
     usv.unknown_task = True
+    settle(1.0)                     # same race as A8; see the note there
+    inv1, fwd1 = bridge.counters.dropped_invalid, bridge.counters.forwarded
     settle(3.0)
     check("A9", bridge.counters.dropped_invalid > inv1
           and bridge.counters.forwarded == fwd1,
@@ -404,6 +421,36 @@ def main() -> int:
           "run state after restart: %s (declaration_seq=%s), was %s (%s)"
           % (reborn.machine.state.name, reborn.machine.declaration_seq,
              state_before.name, decl_before))
+
+    print("\nA14  a second run in the same timeslot")
+    # End, declare again, and prove the second declaration is distinguishable
+    # from the first. The unit tests cover RunMachine and SeqStore separately;
+    # this is the one that proves declare() wires them together correctly.
+    first_seq = reborn.machine.declaration_seq
+    reborn.end()
+    n_req = len(rc.requests)
+    again = reborn.declare()
+    settle(1.5)
+    second_seq = reborn.machine.declaration_seq
+    check("A14a", reborn.machine.state is RunState.DECLARED
+          and len(rc.requests) == n_req + 1,
+          "%s -- RoboCommand received a second declaration" % again)
+    check("A14b", second_seq is not None and second_seq != first_seq,
+          "declaration_seq %s -> %s: the second run does NOT reuse the first's "
+          "sequence number" % (first_seq, second_seq))
+    # The teeth: a RunStart answering run one must not start run two.
+    reborn._handle_command(run_start_bytes(first_seq, 999))
+    settle(0.8)
+    check("A14c", reborn.machine.state is RunState.DECLARED
+          and reborn.machine.run_id != 999,
+          "a stale RunStart for run 1 did NOT start run 2 (state=%s run_id=%s)"
+          % (reborn.machine.state.name, reborn.machine.run_id))
+    reborn._handle_command(run_start_bytes(second_seq, 1000))
+    settle(0.8)
+    check("A14d", reborn.machine.state is RunState.RUNNING
+          and reborn.machine.run_id == 1000,
+          "the matching RunStart started run 2: state=%s run_id=%s"
+          % (reborn.machine.state.name, reborn.machine.run_id))
 
     lines = wire.read_text(encoding="utf-8").strip().splitlines() if wire.exists() else []
     check("A13", len(lines) > 10 and '"b64"' in "".join(lines[:40]),

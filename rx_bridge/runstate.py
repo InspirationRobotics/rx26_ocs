@@ -42,6 +42,18 @@ _REPORTING = frozenset({RunState.DECLARED, RunState.RUNNING})
 #: States we restore to after a reconnect rather than rewinding to CONNECTED.
 _STICKY = frozenset({RunState.DECLARED, RunState.RUNNING})
 
+#: States from which a RunDeclaration may be published.
+#:
+#: ENDED is here because a timeslot holds more than one run. Finishing a
+#: run must not strand the OCS: the course we were given is still the
+#: course, so the next declaration needs no reconnect and no restart --
+#: end, declare, go again.
+#:
+#: RUNNING is deliberately NOT here. Declaring over a live run would leave
+#: the fleet flying one run while the OCS reports another, and the operator
+#: pressing 'end' first is the whole cost of ruling that out.
+_DECLARABLE = frozenset({RunState.COURSE_RX, RunState.ENDED})
+
 
 @dataclass
 class Verdict:
@@ -68,6 +80,10 @@ class RunMachine:
     run_id: int | None = None
     #: Latest RxCourse, kept as an opaque object; only bridge.py reads inside it.
     course: object | None = None
+    #: How many runs we have declared this session. For the operator, who
+    #: needs to know whether the RunStart on screen belongs to this run or
+    #: the last one.
+    runs_declared: int = 0
 
     _prior: RunState = field(default=RunState.DISCONNECTED, repr=False)
 
@@ -153,11 +169,29 @@ class RunMachine:
 
     def on_declared(self, seq: int) -> Verdict:
         """Called *after* the RunDeclaration is on the wire, with its seq."""
-        if self.state is not RunState.COURSE_RX:
-            return Verdict(False, f"declare in {self.state.name}; expected COURSE_RX")
+        if self.state not in _DECLARABLE:
+            want = " or ".join(sorted(s.name for s in _DECLARABLE))
+            hint = ("  -- end the current run first"
+                    if self.state is RunState.RUNNING else "")
+            return Verdict(
+                False,
+                f"declare in {self.state.name}; expected {want}{hint}",
+            )
+        again = self.state is RunState.ENDED
+        # The previous run's id must not survive into this one. Left set, the
+        # page shows a run_id while we are only DECLARED, and the operator
+        # reads a run that has not started yet as already running.
+        self.run_id = None
         self.declaration_seq = seq
         self.state = RunState.DECLARED
-        return Verdict(True, f"declared with seq={seq}; awaiting RunStart")
+        self.runs_declared += 1
+        word = "re-declared" if again else "declared"
+        # "by this process", not "this timeslot": a restart restores the run
+        # but not the count, so claiming a timeslot-wide run number would be
+        # wrong exactly when someone is relying on it after a crash.
+        return Verdict(True, f"{word} with seq={seq} (declaration "
+                             f"{self.runs_declared} by this process); "
+                             f"awaiting RunStart")
 
     def on_end(self) -> Verdict:
         if self.state not in _REPORTING:
@@ -169,7 +203,7 @@ class RunMachine:
     # ---- predicates the bridge asks before it acts -----------------------
 
     def may_declare(self) -> bool:
-        return self.state is RunState.COURSE_RX
+        return self.state in _DECLARABLE
 
     def may_report(self) -> bool:
         return self.state in _REPORTING

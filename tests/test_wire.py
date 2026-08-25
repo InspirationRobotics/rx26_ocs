@@ -19,6 +19,7 @@ try:
     from rx_bridge import validate
     from rx_bridge.proto import common_pb2, rx_common_pb2
     from rx_bridge.proto import rx_commands_pb2, rx_reports_pb2, rx_requests_pb2
+    from rx_bridge.proto import rx_course_pb2
 except ImportError as exc:  # pragma: no cover
     raise unittest.SkipTest("generated protobuf unavailable: %s" % exc) from None
 
@@ -231,6 +232,95 @@ class TestRunStartMatching(unittest.TestCase):
         self.assertEqual(back.WhichOneof("body"), "run_start")
         self.assertEqual(back.run_start.declaration_seq, 1)
         self.assertEqual(back.run_start.run_id, 42)
+
+
+def a_course(*, corners=4, cid="ALPHA", freq=25000):
+    """What RoboCommand publishes retained, at their own test course."""
+    c = rx_course_pb2.RxCourse()
+    c.course_id = cid
+    c.pinger_freq_hz = freq
+    pts = [(1.28010, 103.85520), (1.28010, 103.85625),
+           (1.28110, 103.85625), (1.28110, 103.85520)]
+    for lat, lon in pts[:corners]:
+        c.corners.add(latitude=lat, longitude=lon)
+    return c
+
+
+class TestCourseValidation(unittest.TestCase):
+    """Project.md's sequence says the OCS receives AND VALIDATES RxCourse.
+
+    The course is the one message we are handed rather than build, and
+    everything downstream is positioned relative to it.
+    """
+
+    def test_a_good_course_is_clean(self):
+        self.assertEqual(validate.check_course(a_course()), [])
+
+    def test_a_course_with_too_few_corners_is_caught(self):
+        f = validate.check_course(a_course(corners=2))
+        self.assertTrue(any(x.path == "corners" for x in f), f)
+
+    def test_a_nameless_course_is_caught(self):
+        f = validate.check_course(a_course(cid=""))
+        self.assertTrue(any(x.path == "course_id" for x in f), f)
+
+    def test_a_zero_pinger_frequency_is_caught(self):
+        f = validate.check_course(a_course(freq=0))
+        self.assertTrue(any(x.path == "pinger_freq_hz" for x in f), f)
+
+    def test_a_nan_corner_is_caught(self):
+        """The same net that catches a NaN heading, pointed at their frame."""
+        c = a_course()
+        c.corners[0].latitude = float("nan")
+        f = validate.check_course(c)
+        self.assertTrue(any(x.problem == "NaN" for x in f), f)
+
+    def test_findings_are_advisory_and_carry_a_readable_reason(self):
+        """Nothing here blocks a run -- the operator has to be able to read it
+        and decide, so every finding must say what is wrong in words."""
+        for f in validate.check_course(a_course(corners=1, cid="", freq=0)):
+            self.assertTrue(str(f).strip())
+            self.assertIn(":", str(f))
+
+
+class TestHeartbeatRate(unittest.TestCase):
+    """Project.md: the OCS publishes heartbeats for all declared vehicles.
+
+    The handbook puts a number on that -- 2 Hz -- so the bridge measures what it
+    actually published rather than assuming the forward loop kept up.
+    """
+
+    def setUp(self):
+        from rx_bridge.bridge import HeartbeatRate
+        self.r = HeartbeatRate()
+
+    def test_two_hz_measures_as_two_hz(self):
+        for i in range(20):
+            self.r.record("USV1", 100.0 + i * 0.5)
+        self.assertAlmostEqual(self.r.hz("USV1", 100.0 + 19 * 0.5), 2.0, places=2)
+
+    def test_a_slow_vehicle_reads_slow(self):
+        for i in range(5):
+            self.r.record("UUV1", 100.0 + i * 2.0)
+        self.assertAlmostEqual(self.r.hz("UUV1", 108.0), 0.5, places=2)
+
+    def test_a_vehicle_never_heard_from_is_zero_not_an_error(self):
+        self.assertEqual(self.r.hz("UAV1", 200.0), 0.0)
+
+    def test_one_lone_frame_is_not_a_rate(self):
+        self.r.record("USV1", 100.0)
+        self.assertEqual(self.r.hz("USV1", 100.5), 0.0)
+
+    def test_the_window_forgets_old_frames(self):
+        """A vehicle that stopped an hour ago must not still read 2 Hz."""
+        for i in range(20):
+            self.r.record("USV1", 100.0 + i * 0.5)
+        self.assertEqual(self.r.hz("USV1", 100.0 + 3600), 0.0)
+
+    def test_vehicles_are_metered_independently(self):
+        for i in range(20):
+            self.r.record("USV1", 100.0 + i * 0.5)
+        self.assertEqual(self.r.hz("UUV1", 109.5), 0.0)
 
 
 if __name__ == "__main__":

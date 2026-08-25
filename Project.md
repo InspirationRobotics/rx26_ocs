@@ -22,6 +22,18 @@ OSC shall be able to send rx_requests to RoboNation server to declare a run.
 OSC shall eb able to receive rx_command from RoboNation server and send msg back to corresponded vehicle.
 OSC shall be able to start autonomous missoins on all three vehicles.
 
+# Sequence
+The OCS connects to the course RoboCommand broker.
+The OCS subscribes to RxCourse and its team command topic.
+The OCS receives and validates RxCourse.
+The OCS publishes RunDeclaration.
+The OCS publishes heartbeats for all declared vehicles.
+Each declared vehicle’s heartbeat reports STATE_AUTO when that vehicle is autonomous and ready.
+RoboCommand publishes RunStart after the run-start conditions are satisfied.
+The OCS verifies that RunStart.declaration_seq matches the declaration it sent.
+The OCS records the assigned run_id and begins official run processing.
+The OCS can redeclare a run after current run ends.
+
 
 
 
