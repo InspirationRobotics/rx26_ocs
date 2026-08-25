@@ -47,6 +47,7 @@
       <button class="go" onclick="post('/api/declare')">Declare run</button>
       <button class="stop" onclick="post('/api/end')">End run</button>
     </div>
+    <div id="activecount" class="muted" style="margin-top:6px"></div>
     <div id="action" class="muted" style="margin-top:6px"></div>
   </div>
 
@@ -72,6 +73,31 @@
 const $ = id => document.getElementById(id);
 
 function pill(cls, text) { return `<span class="pill ${cls}">${text}</span>`; }
+
+// Which vehicles go into the RunDeclaration. This is not cosmetic:
+// RoboCommand holds RunStart until EVERY declared vehicle reports
+// STATE_AUTO, with no timeout, so declaring a vehicle that is not on the
+// water means the run simply never starts.
+//
+// The box shows the EFFECTIVE state; clicking forces the opposite. A
+// forced vehicle is marked, with a click to hand it back to the
+// telemetry -- otherwise an override set an hour ago is invisible.
+function activeBox(v) {
+  const forced = v.active_forced;
+  const mark = forced === null || forced === undefined ? ''
+    : ` <a href="#" onclick="setActive('${v.id}',null);return false" `
+      + `class="muted" title="back to deciding from telemetry">forced</a>`;
+  return `<input type="checkbox" ${v.active ? 'checked' : ''} `
+       + `onclick="setActive('${v.id}', this.checked)" `
+       + `title="include ${v.id} in the RunDeclaration">${mark}`;
+}
+
+function setActive(id, on) {
+  fetch('/api/active', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({vehicle:id, on:on})})
+    .then(r=>r.json()).then(j=>{ $('action').textContent = j.result; refresh(); });
+}
 
 // What we are actually publishing to RoboCommand for this vehicle. The
 // handbook obliges 2 Hz per active vehicle; this is the measurement, so a
@@ -122,7 +148,7 @@ function vehicleCard(v, streaming, injectOn) {
     </div>` : '';
 
   return `<div class="card grow">
-    <div><b>${v.id}</b> <span class="muted">${v.type.replace('TYPE_','')}</span>
+    <div>${activeBox(v)} <b>${v.id}</b> <span class="muted">${v.type.replace('TYPE_','')}</span>
          ${v.relay_via ? `<span class="muted">via ${v.relay_via}</span>`:''} ${health}</div>
     <table style="margin-top:6px">
       <tr><th>link</th><td>${v.link ? (v.peer ? v.link+' <span class="muted">'+v.peer+'</span>' : v.link) : '—'}</td></tr>
@@ -174,6 +200,22 @@ async function refresh() {
   // RoboCommand holds RunStart until EVERY declared vehicle reports
   // STATE_AUTO -- with no timeout and no error, so naming the laggard is the
   // difference between a diagnosis and a silent wait.
+  // Below the handbook's floor the declaration cannot be made at all, so
+  // say why on the button rather than letting it fail on click.
+  const act = s.active || [], need = s.por_min_vehicles || 2;
+  const decl = document.querySelector('button.go');
+  if (decl) {
+    const ok = act.length >= need && (s.run.may_declare !== false);
+    decl.disabled = !ok;
+    decl.title = act.length < need
+      ? `need at least ${need} active vehicles, have ${act.length}`
+      : `declare ${act.join(', ')}`;
+  }
+  $('activecount').innerHTML = act.length
+    ? `${act.length} active: <b>${act.join(', ')}</b>`
+      + (act.length < need ? ` ${pill('bad','need '+need)}` : '')
+    : pill('bad','no active vehicles');
+
   const wait = s.awaiting_auto || [];
   if (r.state === 'DECLARED') {
     $('run').innerHTML += wait.length

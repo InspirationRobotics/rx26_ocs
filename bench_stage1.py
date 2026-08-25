@@ -252,6 +252,12 @@ port = {port}
 host = "{host}"
 port = {port}
 
+[limits]
+# 1, not the handbook's 2: this rig is one vehicle by design, and it
+# exercises the sequence mechanics rather than producing a PoR
+# submission. The real two-vehicle declaration is bench_stage3.
+min_declared = 1
+
 [tiers]
 task1 = "TIER_CORE"
 task2 = "TIER_NONE"

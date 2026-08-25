@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from rx_bridge.active import ACTIVE_WINDOW_S, choose_active  # noqa: E402
 from rx_bridge.config import ConfigError, load          # noqa: E402
 from rx_bridge.governor import Governor                 # noqa: E402
 from rx_bridge.runstate import RunMachine, RunState     # noqa: E402
@@ -548,6 +549,65 @@ class TestSeqStoreAcrossRuns(unittest.TestCase):
         again = SeqStore(self.path)
         self.assertFalse(again.ensure_epoch("ASTA-2"))
         self.assertEqual(again.next_request(), 2)
+
+
+class TestActiveSet(unittest.TestCase):
+    """Which vehicles go into the RunDeclaration.
+
+    Not cosmetic: RoboCommand holds RunStart until EVERY declared vehicle
+    reports STATE_AUTO, with no timeout and no error. Declaring a vehicle that
+    is not on the water means the run never starts, and the symptom looks like
+    a broken link to their server rather than a fleet one vehicle short.
+    """
+
+    FLEET = ("USV1", "UUV1", "UAV1")
+
+    def test_only_vehicles_reporting_recently_are_active(self):
+        seen = {"USV1": 100.0, "UAV1": 100.0}
+        self.assertEqual(
+            choose_active(self.FLEET, {}, seen, 101.0), ("USV1", "UAV1"))
+
+    def test_a_vehicle_that_stopped_reporting_falls_out(self):
+        seen = {"USV1": 100.0}
+        self.assertEqual(choose_active(self.FLEET, {}, seen, 100.0), ("USV1",))
+        self.assertEqual(
+            choose_active(self.FLEET, {}, seen, 100.0 + ACTIVE_WINDOW_S + 0.1), ())
+
+    def test_a_vehicle_never_heard_from_is_never_active(self):
+        """UUV1 has no reporter. Declaring it is how a run fails to start."""
+        seen = {"USV1": 100.0, "UAV1": 100.0}
+        self.assertNotIn("UUV1", choose_active(self.FLEET, {}, seen, 101.0))
+
+    def test_the_operator_can_force_a_vehicle_in(self):
+        """A reporter about to come up, or a vehicle relayed by another."""
+        self.assertEqual(
+            choose_active(self.FLEET, {"UUV1": True}, {}, 0.0), ("UUV1",))
+
+    def test_the_operator_can_force_a_reporting_vehicle_out(self):
+        seen = {"USV1": 100.0, "UAV1": 100.0}
+        self.assertEqual(
+            choose_active(self.FLEET, {"USV1": False}, seen, 101.0), ("UAV1",))
+
+    def test_config_order_is_preserved(self):
+        """RunDeclaration.vehicle_ids is repeated; a stable order keeps one
+        run's wire log diffable against the last."""
+        seen = {v: 100.0 for v in self.FLEET}
+        self.assertEqual(choose_active(self.FLEET, {}, seen, 101.0), self.FLEET)
+        # Same set, opposite insertion order in the dicts.
+        seen2 = {"UAV1": 100.0, "UUV1": 100.0, "USV1": 100.0}
+        self.assertEqual(choose_active(self.FLEET, {}, seen2, 101.0), self.FLEET)
+
+    def test_an_override_beats_the_telemetry_in_both_directions(self):
+        seen = {"USV1": 100.0}
+        both = {"USV1": False, "UUV1": True}
+        self.assertEqual(choose_active(self.FLEET, both, seen, 101.0), ("UUV1",))
+
+    def test_the_por_two_vehicle_case(self):
+        """The shape the Communications PoR actually needs: USV + UAV, no UUV."""
+        seen = {"USV1": 100.0, "UAV1": 100.2}
+        active = choose_active(self.FLEET, {}, seen, 100.5)
+        self.assertEqual(active, ("USV1", "UAV1"))
+        self.assertGreaterEqual(len(active), 2)
 
 
 if __name__ == "__main__":

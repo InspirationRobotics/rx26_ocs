@@ -99,6 +99,15 @@ class Config:
     heartbeat_reserve: float = 2.0
     stale_ms: float = 1000.0
 
+    #: Fewest vehicles a RunDeclaration may name. Handbook 3.1 requires the
+    #: Communications Proof of Readiness run to be performed with at least
+    #: two, so 2 is the real value and anything lower produces rc-test logs
+    #: that fail review. It is configurable ONLY so single-vehicle bench
+    #: rigs can exercise the rest of the sequence; the bridge warns on every
+    #: start when it is below two, because a floor lowered for a bench and
+    #: forgotten is exactly how it would be wrong on the day.
+    min_declared: int = 2
+
     seq_store: Path = Path("run/seq.json")
     wire_log: Path = Path("run/wire")
 
@@ -290,6 +299,7 @@ def load(path: str | Path) -> Config:
         rate=float(limits.get("rate", 5.0)),
         heartbeat_reserve=float(limits.get("heartbeat_reserve", 2.0)),
         stale_ms=float(limits.get("stale_ms", 1000.0)),
+        min_declared=int(limits.get("min_declared", 2)),
         seq_store=Path(paths.get("seq_store", "run/seq.json")),
         wire_log=Path(paths.get("wire_log", "run/wire")),
         tcp_host=str(tcp.get("host", "0.0.0.0")),

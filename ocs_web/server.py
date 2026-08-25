@@ -11,6 +11,7 @@ Endpoints:
     GET  /                 the page
     GET  /api/state        everything, as JSON (the page polls this)
     POST /api/declare      publish the RunDeclaration
+    POST /api/active       force a vehicle in/out of the declaration
     POST /api/end          end the run
     POST /api/inject       publish one fake heartbeat as a chosen vehicle
 
@@ -214,6 +215,13 @@ def make_handler(bridge: Bridge, injector: Injector | None, logs: list):
                 self._json({"result": bridge.declare()})
             elif self.path == "/api/end":
                 self._json({"result": bridge.end()})
+            elif self.path == "/api/active":
+                # on: true = force into the declaration, false = force out,
+                # null = back to deciding from whether it is reporting.
+                on = body.get("on")
+                self._json({"result": bridge.set_active(
+                    body.get("vehicle", ""),
+                    None if on is None else bool(on))})
             elif self.path == "/api/inject":
                 if injector is None:
                     self._json({"result": "injection is off -- restart with "

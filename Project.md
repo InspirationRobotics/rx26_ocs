@@ -26,8 +26,9 @@ OSC shall be able to start autonomous missoins on all three vehicles.
 The OCS connects to the course RoboCommand broker.
 The OCS subscribes to RxCourse and its team command topic.
 The OCS receives and validates RxCourse.
-The OCS publishes RunDeclaration.
-The OCS publishes heartbeats for all declared vehicles.
+The OCS publishes RunDeclaration for active vehicles only.
+The OCS publishes heartbeats for all declared and active vehicles.
+The OCS communicates to vehilces to enter auto mode and wait for run start confirmation
 Each declared vehicle’s heartbeat reports STATE_AUTO when that vehicle is autonomous and ready.
 RoboCommand publishes RunStart after the run-start conditions are satisfied.
 The OCS verifies that RunStart.declaration_seq matches the declaration it sent.

@@ -34,7 +34,7 @@ adopting a newer robocommand revision, and you read the diff when you do.
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-**Expect:** `Ran 92 tests` then `OK`.
+**Expect:** `Ran 100 tests` then `OK`.
 
 Config validation, sequence-store durability, the rate governor, the run state
 machine, the wire format, and the vehicle link's frame boundaries. If this
@@ -215,6 +215,36 @@ different machine — delete `run/seq.json`. Nothing else rewinds them.
 
 ---
 
+## 3c. The Proof of Readiness rehearsal — about 25 seconds
+
+```powershell
+.venv\Scripts\python.exe bench_stage3.py
+```
+
+**Expect:** every line `PASS`, ending `21/21 checks passed`.
+
+This is the one shaped like the submission. Handbook 3.1 asks for rc-test
+logs of a 3.4.10 run start sequence with **at least two vehicles** in the
+`run_declaration`, so this bench connects two, leaves a third configured but
+absent, and walks all nine steps.
+
+| Check | What it proves |
+|---|---|
+| `C2c` | One active vehicle is refused, naming the two-vehicle floor |
+| `C3b` | The declaration names exactly the vehicles that are really there |
+| `C3d` | **UUV1 is not declared** — it has no reporter, and declaring it would hang the run forever |
+| `C4b` | The standby-auto directive reaches both, carrying our `declaration_seq` |
+| `C5c` | The published rate is ~2 Hz per vehicle, which is what the handbook mandates |
+| `C6a` | A RunStart answering somebody else's declaration is refused |
+
+`C3d` is the one to understand. RoboCommand publishes RunStart only once
+**every** declared vehicle reports `STATE_AUTO` — with no timeout and no
+error. Declare a vehicle that is not on the water and the run simply never
+starts, and the symptom is indistinguishable from a broken link to their
+server. The active set is what prevents that.
+
+---
+
 ## 4. Against RoboNation's real stack — the one that counts
 
 ### 4a. Start their server *on the sim box*
@@ -382,6 +412,11 @@ and it lives on the sim box, not here.**
   pill go red, plug it back in, and confirm it goes green and reports
   `reconnected into RUNNING; NOT re-declaring` without minting a new
   declaration.
+- **`mission_planner` must be running or the vehicle says nothing.**
+  `ocs_client` now takes state and task from `/crsd/mission_state` and
+  refuses to invent them, so a boat with no planner connects to the OCS and
+  then reports nothing at all. That is deliberate, and it is the first thing
+  to check when a connected vehicle shows "never heard".
 - **No real vehicle has ever published to this OCS.** The boat's own client
   code now drives the link (level 2b and level 3), but every heartbeat so far
   is still synthesized — nothing has yet come from a Pixhawk, over WiFi, on a

@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime, timezone
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -35,6 +36,7 @@ from google.protobuf import json_format
 import paho.mqtt.client as mqtt
 
 from . import validate
+from .active import ACTIVE_WINDOW_S, choose_active
 from .config import Config
 from .governor import Governor
 from .proto import common_pb2, rx_commands_pb2, rx_common_pb2, rx_course_pb2
@@ -44,6 +46,10 @@ from .seqstore import SeqStore
 from .tcpserver import TcpServer
 from .wirelog import WireLog
 
+
+#: Handbook 3.1's floor, for the warning below. The value actually enforced
+#: is cfg.min_declared, so a bench can lower it -- see config.py.
+_POR_MIN_VEHICLES = 2
 
 #: Window over which the published heartbeat rate is measured. Long enough
 #: that one late frame does not read as a rate collapse, short enough that a
@@ -119,6 +125,12 @@ class Bridge:
         #: Recent RoboCommand disconnects, for the duplicate-client check.
         self._rc_drops: deque = deque(maxlen=8)
         self._warned_duplicate = False
+        #: Operator overrides for the active set: vehicle_id -> True (force
+        #: in) / False (force out). Absent means 'decide from the telemetry'.
+        #: Deliberately NOT persisted -- which vehicles are on the water is a
+        #: fact about right now, and a stale answer restored from disk is
+        #: worse than asking the fleet again.
+        self._active_override: dict[str, bool] = {}
         self.wire = WireLog(cfg.wire_log, run_tag=cfg.team_id)
 
         # What the web page reads. Decoded with protobuf's own MessageToDict
@@ -202,6 +214,16 @@ class Bridge:
             "bridge up: team=%s robocommand=%s"
             % (self.cfg.team.host, self.cfg.robocommand.host)
         )
+        if self.cfg.min_declared < _POR_MIN_VEHICLES:
+            # Every start, not once: a floor lowered for a bench and left
+            # there is only caught by saying so until somebody fixes it.
+            self.log(
+                "WARNING: limits.min_declared = %d. Handbook 3.1 requires %d "
+                "vehicles in the run_declaration -- rc-test logs from a run "
+                "declared below that will not satisfy the Communications "
+                "Proof of Readiness."
+                % (self.cfg.min_declared, _POR_MIN_VEHICLES)
+            )
 
     def stop(self) -> None:
         if self.tcp is not None:
@@ -603,6 +625,82 @@ class Bridge:
             self._all_auto = False
             self.log("no longer all AUTO -- waiting on %s" % ", ".join(waiting))
 
+    def active_ids(self, now: float | None = None) -> tuple[str, ...]:
+        """Which vehicles go into the declaration, in config order.
+
+        A vehicle is active if it has reported within _ACTIVE_WINDOW_S, unless
+        the operator has forced it in or out.
+
+        THIS IS ON THE CRITICAL PATH FOR THE RUN, not a display nicety.
+        RoboCommand publishes RunStart only once EVERY declared vehicle has
+        reported STATE_AUTO -- with no timeout and no error. Declare a vehicle
+        that is not on the water and the run never starts, and the failure
+        looks like a broken link to their server rather than like a fleet one
+        vehicle short.
+        """
+        return choose_active(
+            self.cfg.vehicle_ids,
+            self._active_override,
+            self.counters.last_seen,
+            time.time() if now is None else now,
+        )
+
+    def set_active(self, vehicle_id: str, on: bool | None) -> str:
+        """Force a vehicle in (True) or out (False) of the declaration.
+
+        None returns it to being decided by whether it is reporting. Forcing a
+        vehicle IN is legitimate -- a reporter that is about to come up, or a
+        vehicle relayed by another -- so this is not merely an exclude list.
+        """
+        if self.cfg.vehicle(vehicle_id) is None:
+            return "%s is not a configured vehicle" % vehicle_id
+        with self._lock:
+            if on is None:
+                self._active_override.pop(vehicle_id, None)
+            else:
+                self._active_override[vehicle_id] = bool(on)
+            active = self.active_ids()
+        word = "auto" if on is None else ("forced IN" if on else "forced OUT")
+        self.log("active set: %s %s -- declaring %s"
+                 % (vehicle_id, word, ", ".join(active) or "nothing"))
+        return "ok"
+
+    def _send_standby_auto(self, vehicles: tuple[str, ...], seq: int) -> None:
+        """Tell the declared vehicles to stand by in auto and await RunStart.
+
+        ADVISORY, and it has to stay that way. This does not change anybody's
+        flight mode: the standing rule in both vehicle repos is that the RC
+        e-stop is the only safety path and WiFi is never a safety mechanism.
+        The vehicle's mission planner reads this and decides; a vehicle that
+        RC has not armed must ignore it.
+
+        Its own message type, not a field bolted onto RxCommand -- that schema
+        is RoboNation's and must not grow team-local inventions.
+        """
+        if self.tcp is None:
+            return
+        body = json.dumps({"ocs_directive": {
+            "action": "standby_auto",
+            "declaration_seq": seq,
+            "vehicles": list(vehicles),
+            "sent_at": _rfc3339(),
+        }}).encode("utf-8")
+        reached, missed = [], []
+        for vid in vehicles:
+            if self.tcp.send(vid, body):
+                reached.append(vid)
+                self.wire.frame("tx", "tcp://%s" % vid, body,
+                                note="standby_auto seq=%d" % seq)
+            else:
+                missed.append(vid)
+        self.log("standby_auto -> %s%s"
+                 % (", ".join(reached) or "nobody",
+                    "" if not missed
+                    else "  (NOT DELIVERED: %s -- no vehicle link)"
+                         % ", ".join(missed)))
+        self.wire.event("standby_auto", "sent=%s missed=%s"
+                        % (",".join(reached), ",".join(missed)))
+
     # ---- operator actions -------------------------------------------------
 
     def declare(self) -> str:
@@ -617,6 +715,18 @@ class Bridge:
                     % self.machine.state.name
                 )
 
+            # Only what is actually on the water. See active_ids().
+            active = self.active_ids()
+            if len(active) < self.cfg.min_declared:
+                return (
+                    "cannot declare %d vehicle(s) -- need at least %d in the "
+                    "run_declaration (handbook 3.1, for the Communications "
+                    "Proof of Readiness). Active: %s. Start a reporter, or "
+                    "force one in from the page."
+                    % (len(active), self.cfg.min_declared,
+                       ", ".join(active) or "nothing")
+                )
+
             # ensure_, not new_: a second run in the same timeslot must NOT
             # rewind the request counter, or its declaration reuses seq=1 and
             # a stale RunStart from the first run matches it. See seqstore.
@@ -628,7 +738,7 @@ class Bridge:
             req.sent_at.FromNanoseconds(time.time_ns())
 
             decl = req.run_declaration
-            decl.vehicle_ids.extend(self.cfg.vehicle_ids)
+            decl.vehicle_ids.extend(active)
             tier = common_pb2.TaskTier
             decl.task1_tier = tier.Value(self.cfg.tiers[0])
             decl.task2_tier = tier.Value(self.cfg.tiers[1])
@@ -657,9 +767,12 @@ class Bridge:
         self.rc.publish(self.cfg.rc_request_topic(), payload, qos=1)
         self.wire.frame(
             "tx", self.cfg.rc_request_topic(), payload,
-            note="RunDeclaration seq=%d" % seq,
+            note="RunDeclaration seq=%d [%s]" % (seq, ",".join(active)),
         )
-        return v.reason
+        # After the declaration is on the wire, not before: the vehicles are
+        # being told to stand by for a run we have actually declared.
+        self._send_standby_auto(active, seq)
+        return "%s; declared %s" % (v.reason, ", ".join(active))
 
     def end(self) -> str:
         with self._lock:
@@ -678,6 +791,7 @@ class Bridge:
         peers = self.tcp.peers() if self.tcp is not None else {}
         with self._lock:
             c, m = self.counters, self.machine
+            active_now = self.active_ids(now)
             return {
                 "now": now,
                 "team_id": self.cfg.team_id,
@@ -700,6 +814,8 @@ class Bridge:
                         "may_declare": m.may_declare()},
                 "course": self.course,
                 "course_findings": list(self.course_findings),
+                "active": list(self.active_ids(now)),
+                "por_min_vehicles": self.cfg.min_declared,
                 "awaiting_auto": [
                     v.id for v in self.cfg.vehicles
                     if ((self.latest.get(v.id) or {}).get("heartbeat") or {})
@@ -716,6 +832,8 @@ class Bridge:
                      "link": ("tcp" if v.id in peers
                               else c.last_via.get(v.id, "")),
                      "peer": peers.get(v.id, ""),
+                     "active": v.id in active_now,
+                     "active_forced": self._active_override.get(v.id),
                      # What we are actually PUBLISHING for this vehicle. The
                      # handbook obliges 2 Hz; this is the measurement, not
                      # the intention.
@@ -780,6 +898,12 @@ class Bridge:
                         else "  SUSPECT: " + "; ".join(self.course_findings),
                     )
                 ),
+                "active     %s%s" % (
+                    ", ".join(self.active_ids()) or "nothing",
+                    "" if len(self.active_ids()) >= self.cfg.min_declared
+                    else "   << below the %d required to declare"
+                         % self.cfg.min_declared,
+                ),
                 "awaiting   %s" % (
                     ", ".join(self.awaiting_auto()) or "nothing -- all AUTO"
                 ),
@@ -801,6 +925,11 @@ def _decode(msg) -> dict:
         msg, always_print_fields_with_no_presence=True,
         preserving_proto_field_name=True,
     )
+
+
+def _rfc3339() -> str:
+    """Now, in the form protobuf and the vehicles both parse."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def _to_json(msg) -> bytes:

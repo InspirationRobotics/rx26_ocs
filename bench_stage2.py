@@ -78,6 +78,9 @@ port = {port}
 task1 = "TIER_CORE"
 
 [limits]
+# 1, not the handbook's 2: UUV1 joins late via RawClient, so only USV1
+# is active at declare time. bench_stage3 is the two-vehicle one.
+min_declared = 1
 rate = 5.0
 heartbeat_reserve = 2.0
 stale_ms = 1000.0
