@@ -6,3 +6,6 @@ __pycache__/
 # seq store is durable state that must never be shared between machines --
 # committing it would let two OCS instances think they own the same counters.
 run/
+
+# Word lock files -- created while a .docx in docs/ is open, deleted on close.
+~$*

@@ -36,8 +36,27 @@ from rx_bridge.runstate import RunState                                # noqa: E
 
 TCP_PORT = 37599        # not 37564: never collide with a real OCS on this box
 
-_DEFAULT_ASV = Path(__file__).resolve().parent.parent / "rx26_asv"
-_ASV = Path(os.environ.get("RX26_ASV", _DEFAULT_ASV))
+def _find_asv() -> Path:
+    """Locate the boat repo, whatever the tree looks like this week.
+
+    RX26_ASV wins. Otherwise try the layouts the repo has actually had: a
+    sibling of this one, and under Boat/ once the vehicles were foldered by
+    craft. Searching beats hardcoding because the answer has already changed
+    once, and the failure it produces -- a bench that exits before testing
+    anything -- reads like the vehicle link is broken.
+    """
+    env = os.environ.get("RX26_ASV")
+    if env:
+        return Path(env)
+    root = Path(__file__).resolve().parent.parent
+    for candidate in (root / "rx26_asv", root / "Boat" / "rx26_asv"):
+        if (candidate / "crusader_groundstation" / "crusader_groundstation"
+                / "ocs_link.py").is_file():
+            return candidate
+    return root / "rx26_asv"        # for the error message below
+
+
+_ASV = _find_asv()
 _PKG = _ASV / "crusader_groundstation"
 if not (_PKG / "crusader_groundstation" / "ocs_link.py").is_file():
     raise SystemExit(
