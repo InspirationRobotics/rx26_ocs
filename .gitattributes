@@ -1,0 +1,3 @@
+# Windows launchers: cmd.exe mis-jumps to labels in LF-only batch files.
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
