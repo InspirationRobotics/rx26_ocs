@@ -34,10 +34,12 @@ adopting a newer robocommand revision, and you read the diff when you do.
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-**Expect:** `Ran 100 tests` then `OK`.
+**Expect:** `Ran 121 tests` then `OK`.
 
 Config validation, sequence-store durability, the rate governor, the run state
-machine, the wire format, and the vehicle link's frame boundaries. If this
+machine, the wire format, the vehicle link's frame boundaries, and the fleet map
+page's routes (`/map`, the vendored Leaflet files, the `/api/fleet` proxy against
+a stub and against nothing listening). If this
 fails, nothing below is worth running.
 
 ---

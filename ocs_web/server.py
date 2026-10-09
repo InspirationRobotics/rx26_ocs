@@ -9,7 +9,10 @@ not already need.
 
 Endpoints:
     GET  /                 the page
+    GET  /map              the fleet map page (routes live in maproutes.py)
     GET  /api/state        everything, as JSON (the page polls this)
+    GET  /api/fleet        fleet_link's /fleet, proxied (or {"error": ...})
+    GET  /api/map-config   map centre and the vehicle-GUI links
     POST /api/declare      publish the RunDeclaration
     POST /api/active       force a vehicle in/out of the declaration
     POST /api/end          end the run
@@ -32,12 +35,15 @@ import time
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import paho.mqtt.client as mqtt
 
 from rx_bridge.bridge import Bridge
 from rx_bridge.config import ConfigError, load
 from rx_bridge.proto import common_pb2, rx_common_pb2, rx_reports_pb2
+
+from . import maproutes
 
 HERE = Path(__file__).resolve().parent
 
@@ -178,7 +184,12 @@ def _start_local_broker(host: str, port: int, log) -> None:
         % (host, port))
 
 
-def make_handler(bridge: Bridge, injector: Injector | None, logs: list):
+def make_handler(bridge: Bridge, injector: Injector | None, logs: list, *,
+                 fleet_url: str = maproutes.DEFAULT_FLEET_URL,
+                 map_cfg: dict | None = None):
+    if map_cfg is None:
+        map_cfg = maproutes.build_map_config(None, fleet_url)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):            # quiet; the page is polling
             pass
@@ -194,6 +205,13 @@ def make_handler(bridge: Bridge, injector: Injector | None, logs: list):
             self._send(code, json.dumps(obj).encode("utf-8"))
 
         def do_GET(self):
+            # The map page's routes first; None means "not mine" and every
+            # path they do not claim falls through to the routes below.
+            hit = maproutes.route(self.path, fleet_url=fleet_url,
+                                  map_cfg=map_cfg)
+            if hit is not None:
+                self._send(*hit)
+                return
             if self.path in ("/", "/index.html"):
                 self._send(200, (HERE / "index.html").read_bytes(), "text/html")
             elif self.path.startswith("/api/state"):
@@ -265,7 +283,15 @@ def main(argv=None) -> int:
                          "NOT default to 1883 because Windows reserves that "
                          "port in the Hyper-V range and the bind fails with "
                          "WinError 10013.")
+    ap.add_argument("--fleet-url", default=maproutes.DEFAULT_FLEET_URL,
+                    metavar="URL",
+                    help="where the map page's /api/fleet proxy reads "
+                         "fleet_link's GET /fleet (default %(default)s)")
     args = ap.parse_args(argv)
+
+    fleet = urlsplit(args.fleet_url)
+    if fleet.scheme not in ("http", "https") or not fleet.netloc:
+        ap.error("--fleet-url must be an http(s) URL, got %r" % args.fleet_url)
 
     try:
         cfg = load(args.config)
@@ -295,9 +321,17 @@ def main(argv=None) -> int:
     if injector:
         log("INJECTION ENABLED -- fake data can be published as any vehicle")
 
+    map_cfg = maproutes.build_map_config(
+        maproutes.load_map_table(args.config), args.fleet_url)
+    for w in map_cfg["warnings"]:
+        log("map config: " + w)
+
     srv = ThreadingHTTPServer(("127.0.0.1", args.port),
-                              make_handler(bridge, injector, logs))
-    log("OCS page on http://127.0.0.1:%d" % args.port)
+                              make_handler(bridge, injector, logs,
+                                           fleet_url=args.fleet_url,
+                                           map_cfg=map_cfg))
+    log("OCS page on http://127.0.0.1:%d   map on /map   fleet_link at %s"
+        % (args.port, args.fleet_url))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

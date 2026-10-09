@@ -1,39 +1,74 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>OCS — ASTA</title>
+<script>
+/* Applied BEFORE the body paints, so day mode never flashes the night palette.
+   Same key and same rule as map.html (same origin, so the choice is shared).
+   try/catch: a browser set to block site data throws on the accessor. */
+try { if (localStorage.getItem('ocs-theme') === 'day')
+        document.documentElement.setAttribute('data-theme', 'day'); } catch (e) {}
+</script>
 <style>
-  :root { color-scheme: dark; }
-  body { background:#11141a; color:#dfe4ec; font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;
+  /* TWO THEMES, EVERY COLOUR A VARIABLE. Night is the original palette, unchanged.
+     Day is a sunlight theme (near-black on near-white, darkened status colours)
+     for a laptop in direct equatorial sun; its values match map.html's. */
+  :root { color-scheme: dark;
+    --bg:#11141a; --fg:#dfe4ec; --h1:#8fa3bf; --h2:#7d8ba0;
+    --card:#171b23; --card-line:#232936; --muted:#6d7a8d; --pre:#9fb0c7;
+    --ok-bg:#173a24;   --ok-fg:#5fd18a;   --bad-bg:#3d1a1e;  --bad-fg:#ff8b93;
+    --warn-bg:#3b3117; --warn-fg:#e8b757; --idle-bg:#232936;  --idle-fg:#8b99ae;
+    --btn-bg:#232b38; --btn-line:#33405a; --btn-hi:#2c374a;
+    --go-bg:#183a26;   --go-line:#2f6b45;   --go-fg:#7fe0a4;
+    --stop-bg:#3a1a1e; --stop-line:#6b2f35; --stop-fg:#ff9aa2;
+    --banner-bg:#4a2410; --banner-line:#8a4a1a; --banner-fg:#ffb877;
+    --link:#7fb4ff; }
+  html[data-theme="day"] { color-scheme: light;
+    --bg:#ffffff; --fg:#0b0e12; --h1:#14496e; --h2:#3f4a55;
+    --card:#eef1f4; --card-line:#8d99a6; --muted:#5a6672; --pre:#1f2a35;
+    --ok-bg:#cfeedb;   --ok-fg:#0a6b2e;   --bad-bg:#f8d7d9;  --bad-fg:#a50f16;
+    --warn-bg:#fae3bd; --warn-fg:#7a4200; --idle-bg:#d9dfe5;  --idle-fg:#2b343d;
+    --btn-bg:#dde3e9; --btn-line:#8d99a6; --btn-hi:#ccd5dd;
+    --go-bg:#cfeedb;   --go-line:#0a6b2e;   --go-fg:#0a6b2e;
+    --stop-bg:#f8d7d9; --stop-line:#a50f16; --stop-fg:#8c1015;
+    --banner-bg:#ffd9b8; --banner-line:#a34a00; --banner-fg:#5c2600;
+    --link:#0b4f9a; }
+  body { background:var(--bg); color:var(--fg); font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;
          margin:0; padding:14px 18px; }
-  h1 { font-size:15px; margin:0 0 10px; letter-spacing:.08em; text-transform:uppercase; color:#8fa3bf }
-  h2 { font-size:12px; margin:18px 0 6px; letter-spacing:.08em; text-transform:uppercase; color:#7d8ba0 }
+  .top { display:flex; align-items:center; flex-wrap:wrap; gap:6px 14px; margin:0 0 10px }
+  h1 { font-size:15px; margin:0; letter-spacing:.08em; text-transform:uppercase; color:var(--h1) }
+  .nav a { color:var(--link); text-decoration:none } .nav b { color:var(--fg) }
+  h2 { font-size:12px; margin:18px 0 6px; letter-spacing:.08em; text-transform:uppercase; color:var(--h2) }
   .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start }
-  .card { background:#171b23; border:1px solid #232936; border-radius:6px; padding:10px 12px; }
+  .card { background:var(--card); border:1px solid var(--card-line); border-radius:6px; padding:10px 12px; }
   .grow { flex:1; min-width:320px }
   table { border-collapse:collapse; width:100% }
   td,th { text-align:left; padding:3px 10px 3px 0; vertical-align:top; white-space:nowrap }
-  th { color:#7d8ba0; font-weight:normal }
+  th { color:var(--h2); font-weight:normal }
   .pill { display:inline-block; padding:1px 7px; border-radius:9px; font-size:11px }
-  .ok   { background:#173a24; color:#5fd18a }
-  .bad  { background:#3d1a1e; color:#ff8b93 }
-  .warn { background:#3b3117; color:#e8b757 }
-  .idle { background:#232936; color:#8b99ae }
-  button { background:#232b38; color:#dfe4ec; border:1px solid #33405a; border-radius:4px;
+  .ok   { background:var(--ok-bg); color:var(--ok-fg) }
+  .bad  { background:var(--bad-bg); color:var(--bad-fg) }
+  .warn { background:var(--warn-bg); color:var(--warn-fg) }
+  .idle { background:var(--idle-bg); color:var(--idle-fg) }
+  button { background:var(--btn-bg); color:var(--fg); border:1px solid var(--btn-line); border-radius:4px;
            padding:4px 10px; font:inherit; cursor:pointer }
-  button:hover { background:#2c374a }
-  button.go { border-color:#2f6b45; background:#183a26; color:#7fe0a4 }
-  button.stop { border-color:#6b2f35; background:#3a1a1e; color:#ff9aa2 }
-  #banner { background:#4a2410; border:1px solid #8a4a1a; color:#ffb877;
+  button:hover { background:var(--btn-hi) }
+  button.go { border-color:var(--go-line); background:var(--go-bg); color:var(--go-fg) }
+  button.stop { border-color:var(--stop-line); background:var(--stop-bg); color:var(--stop-fg) }
+  #banner { background:var(--banner-bg); border:1px solid var(--banner-line); color:var(--banner-fg);
             padding:6px 12px; border-radius:5px; margin-bottom:12px; display:none }
-  pre { margin:0; max-height:150px; overflow:auto; color:#9fb0c7; font-size:12px }
-  .muted { color:#6d7a8d }
-  details summary { cursor:pointer; color:#7d8ba0 }
+  pre { margin:0; max-height:150px; overflow:auto; color:var(--pre); font-size:12px }
+  .muted { color:var(--muted) }
+  details summary { cursor:pointer; color:var(--h2) }
   details pre { max-height:260px; margin-top:6px }
 </style>
 
 <div id="banner">⚠ FAKE DATA INJECTION IS ENABLED — this OCS can publish heartbeats no vehicle sent.</div>
 
-<h1>OCS · <span id="team">…</span></h1>
+<div class="top">
+  <h1>OCS · <span id="team">…</span></h1>
+  <span class="nav"><b>/</b> ↔ <a href="/map">/map</a></span>
+  <button id="theme"></button>
+</div>
 
 <div class="row">
   <div class="card">
@@ -242,6 +277,23 @@ async function refresh() {
   $('log').textContent = (s.log||[]).join('\n');
   $('log').scrollTop = $('log').scrollHeight;
 }
+
+// Day/night. Same key and logic as map.html (same origin: one choice for both
+// pages); the pre-paint script in <head> has already applied a saved 'day'.
+const themeNow = () =>
+  document.documentElement.getAttribute('data-theme') === 'day' ? 'day' : 'night';
+function paintThemeButton(mode) {      // the button names the mode it switches TO
+  $('theme').textContent = mode === 'day' ? '☾ night' : '☀ day';
+  $('theme').title = mode === 'day' ? 'back to the low-light palette'
+                                    : 'high-contrast palette for direct sun';
+}
+$('theme').onclick = () => {
+  const mode = themeNow() === 'day' ? 'night' : 'day';
+  document.documentElement.setAttribute('data-theme', mode);
+  try { localStorage.setItem('ocs-theme', mode); } catch (e) {}
+  paintThemeButton(mode);
+};
+paintThemeButton(themeNow());
 
 refresh();
 setInterval(refresh, 500);

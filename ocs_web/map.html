@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OCS — map</title>
+<script>
+/* Applied BEFORE the body paints, so day mode never flashes the night palette.
+   Same key and same rule as index.html (same origin, so the choice is shared).
+   try/catch: a browser set to block site data throws on the accessor. */
+try { if (localStorage.getItem('ocs-theme') === 'day')
+        document.documentElement.setAttribute('data-theme', 'day'); } catch (e) {}
+</script>
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<style>
+  /* TWO THEMES, EVERY COLOUR A VARIABLE (same convention as the boat GUI).
+     NIGHT is the default: dark and dim for the dock at dusk. DAY is a sunlight
+     theme for a laptop in direct equatorial sun, not just a light one: near-black
+     on near-white, dark borders, darkened status colours, strong saturated
+     vehicle colours. Marker SVG and trails take their colour from --v-* through
+     CSS, so a theme switch recolours the map with no JS involved. */
+  :root {
+    color-scheme: dark;
+    --bg:#11141a; --panel:#171b23; --card:#1c212b; --line:#2b3342;
+    --fg:#dfe4ec; --dim:#8b99ae; --head:#8fa3bf; --link:#7fb4ff;
+    --ok:#5fd18a; --ok-bg:#173a24; --bad:#ff8b93; --bad-bg:#3d1a1e;
+    --warn:#e8b757; --warn-bg:#3b3117; --idle:#8b99ae; --idle-bg:#232936;
+    --btn:#232b38; --btn-hi:#2c374a; --btn-line:#33405a;
+    --banner-bg:#4a2410; --banner-line:#8a4a1a; --banner-fg:#ffb877;
+    --mapbg:#0d1016; --halo:#0b0d12;
+    --v-boat:#4da3ff; --v-drone:#ffb454; --v-sub:#38d9c6; --v-other:#c3a6ff;
+  }
+  html[data-theme="day"] {
+    color-scheme: light;
+    --bg:#ffffff; --panel:#eef1f4; --card:#e4e9ee; --line:#8d99a6;
+    --fg:#0b0e12; --dim:#3f4a55; --head:#14496e; --link:#0b4f9a;
+    --ok:#0a6b2e; --ok-bg:#cfeedb; --bad:#a50f16; --bad-bg:#f8d7d9;
+    --warn:#7a4200; --warn-bg:#fae3bd; --idle:#2b343d; --idle-bg:#d9dfe5;
+    --btn:#dde3e9; --btn-hi:#ccd5dd; --btn-line:#8d99a6;
+    --banner-bg:#ffd9b8; --banner-line:#a34a00; --banner-fg:#5c2600;
+    --mapbg:#eceae3; --halo:#ffffff;
+    --v-boat:#0040c0; --v-drone:#c24d00; --v-sub:#00665f; --v-other:#6a1fb0;
+  }
+
+  [hidden] { display:none !important }
+  * { box-sizing:border-box }
+  html, body { margin:0; background:var(--bg); color:var(--fg);
+               font:13px/1.5 ui-monospace,Menlo,Consolas,monospace }
+  body { display:flex; flex-direction:column; height:100vh; height:100dvh }
+  a { color:var(--link) }
+  .dim { color:var(--dim) }
+
+  #top { display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px;
+         padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--line) }
+  h1 { font-size:15px; margin:0; letter-spacing:.08em; text-transform:uppercase; color:var(--head) }
+  h2 { font-size:12px; margin:0 0 6px; letter-spacing:.08em; text-transform:uppercase; color:var(--head) }
+  .nav a { text-decoration:none } .nav b { color:var(--fg) }
+  #sum { margin-left:auto }
+  button { background:var(--btn); color:var(--fg); border:1px solid var(--btn-line);
+           border-radius:4px; padding:4px 10px; font:inherit; cursor:pointer }
+  button:hover { background:var(--btn-hi) }
+
+  .banner { padding:5px 12px; border-bottom:1px solid var(--line); overflow-wrap:anywhere }
+  .banner.bad  { background:var(--bad-bg); color:var(--bad) }
+  .banner.warn { background:var(--banner-bg); color:var(--banner-fg); border-color:var(--banner-line) }
+
+  #wrap { flex:1; min-height:0; display:flex }
+  #map { flex:1; min-width:0 }
+  #side { width:460px; max-width:50%; overflow-y:auto; padding:10px 12px;
+          background:var(--bg); border-left:1px solid var(--line) }
+  section { margin-bottom:14px }
+
+  .pill { display:inline-block; padding:0 7px; border-radius:9px; font-size:11px }
+  .pill.ok { background:var(--ok-bg); color:var(--ok) }
+  .pill.bad { background:var(--bad-bg); color:var(--bad) }
+  .pill.warn { background:var(--warn-bg); color:var(--warn) }
+  .pill.idle { background:var(--idle-bg); color:var(--idle) }
+
+  /* vehicle rows: wrapped fields, not a table, so a phone needs no side-scroll */
+  .vrow { background:var(--panel); border:1px solid var(--line); border-radius:6px;
+          padding:6px 9px; margin-bottom:6px; overflow-wrap:anywhere }
+  .vrow.nopos { border-style:dashed }
+  .vrow .l1 { margin-bottom:2px }
+  .f { display:inline-block; margin-right:12px; white-space:nowrap }
+  .f i { font-style:normal; color:var(--dim) }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+         background:var(--vc); vertical-align:baseline; margin-right:3px }
+  .dot.ocs { background:none; border:2px solid var(--vc) }
+  .k-boat { --vc:var(--v-boat) } .k-drone { --vc:var(--v-drone) }
+  .k-sub { --vc:var(--v-sub) }   .k-other { --vc:var(--v-other) }
+
+  .lrow { margin-bottom:3px }
+  .grow { display:flex; flex-wrap:wrap; align-items:baseline; gap:0 8px; margin-bottom:5px;
+          overflow-wrap:anywhere }
+  .pdot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--idle) }
+  .pdot.up { background:var(--ok) } .pdot.down { background:var(--bad) }
+  .gstate { min-width:7em }
+  #legend { margin-bottom:8px }
+
+  /* ---- Leaflet, re-skinned: its stock CSS is hard-coded white/grey ---------- */
+  .leaflet-container { background:var(--mapbg); font:inherit; color:var(--fg) }
+  .leaflet-bar { box-shadow:none !important; border:1px solid var(--line) !important }
+  .leaflet-bar a, .leaflet-bar a:hover { background-color:var(--panel); color:var(--fg);
+                                         border-bottom-color:var(--line) }
+  .leaflet-control-layers { background:var(--panel); color:var(--fg); box-shadow:none;
+                            border:1px solid var(--line) !important }
+  .leaflet-control-layers-expanded { padding:4px 8px }
+  .leaflet-control-scale-line { background:var(--panel); color:var(--fg); border-color:var(--fg);
+                                text-shadow:none }
+  .leaflet-container .leaflet-control-attribution { background:var(--panel); color:var(--dim) }
+  .leaflet-control-attribution a { color:var(--link) }
+  .leaflet-tooltip.vlabel { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+                            box-shadow:none; padding:0 5px; font-size:11px; line-height:1.4 }
+  .leaflet-tooltip.vlabel::before { display:none }
+  /* NIGHT + Streets: dim the stock light tiles. Only the tile pane, so markers,
+     labels and controls keep the palette above. Blank has no tiles: no effect. */
+  html:not([data-theme="day"]) .leaflet-tile-pane {
+    filter:invert(1) hue-rotate(180deg) brightness(.85) }
+
+  /* ---- markers ---------------------------------------------------------------- */
+  .vicon, .xmark { background:none; border:none }
+  .vicon svg { display:block; overflow:visible }
+  .vicon .body { fill:var(--vc); stroke:var(--halo); stroke-width:1.5; paint-order:stroke }
+  .vicon .ring { fill:none; stroke:var(--vc); stroke-width:3 }
+  .vicon .ringhalo { fill:none; stroke:var(--halo); stroke-width:6 }
+  .vicon .ptr { stroke:var(--vc); stroke-width:3; stroke-linecap:round }
+  .xmark { color:var(--vc); font:bold 20px/16px ui-monospace,Menlo,Consolas,monospace;
+           text-align:center; text-shadow:0 0 3px var(--halo), 0 0 3px var(--halo), 0 0 3px var(--halo) }
+  path.trail { stroke:var(--vc); stroke-width:3; stroke-opacity:.85; fill:none }
+  path.trail.ocs { stroke-width:2 }
+  path.trail.stale { stroke-dasharray:3 7; stroke-opacity:.4 }
+
+  /* phone: map on top, panel below, page scrolls vertically only */
+  @media (max-width: 820px) {
+    body { height:auto; min-height:100vh }
+    #wrap { flex-direction:column; flex:none }
+    #map { flex:none; height:62vh; min-height:300px }
+    #side { width:auto; max-width:none; overflow:visible; border-left:0;
+            border-top:1px solid var(--line) }
+    #sum { margin-left:0; width:100% }
+  }
+</style>
+</head>
+<body>
+
+<div id="top">
+  <h1>OCS · map</h1>
+  <span class="nav"><a href="/">/</a> ↔ <b>/map</b></span>
+  <button id="fit" title="zoom to every vehicle with a live position">Fit all</button>
+  <button id="theme"></button>
+  <span id="sum" class="dim"></span>
+</div>
+<div id="banners"></div>
+<div class="banner bad" id="tilenote" hidden>Street tiles are not loading (no internet?) —
+  choose “Blank (offline)” on the map.</div>
+
+<div id="wrap">
+  <div id="map"></div>
+  <aside id="side">
+    <section>
+      <h2>Vehicles</h2>
+      <div id="legend" class="dim">filled arrow/dot = fleet_link live position ·
+        ring = OCS report (the feed RoboCommand gets) ·
+        × = last fix, stale: <b>history, not a current position</b></div>
+      <div id="rows"><div class="dim">waiting for first poll…</div></div>
+    </section>
+    <section>
+      <h2>fleet_link links</h2>
+      <div id="links" class="dim">—</div>
+    </section>
+    <section>
+      <h2>Vehicle GUIs</h2>
+      <div id="guis" class="dim">—</div>
+    </section>
+  </aside>
+</div>
+
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script>
+(function () {
+'use strict';
+
+const POLL_MS = 1000, PROBE_MS = 5000, PROBE_TIMEOUT_MS = 2000, FETCH_TIMEOUT_MS = 3000;
+const TRAIL_MAX = 120;            // fresh fixes kept per vehicle
+const TRAIL_EPS = 1e-6;           // ~0.1 m: a stationary vehicle does not grow its trail
+// index.html calls a vehicle silent after max(1.5 s, the bridge's stale_ms for it);
+// the map uses the same rule, so the two pages never disagree about "stale".
+const FRESH_FLOOR_S = 1.5;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ---- storage: every access guarded, the page works with it blocked ------------
+const store = {
+  get(k)    { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+// ---- theme (same logic as index.html; the pre-paint script is in <head>) -------
+const themeNow = () =>
+  document.documentElement.getAttribute('data-theme') === 'day' ? 'day' : 'night';
+function paintThemeButton(mode) {   // the button names the mode it switches TO
+  const b = $('theme');
+  b.textContent = mode === 'day' ? '☾ night' : '☀ day';
+  b.title = mode === 'day' ? 'back to the low-light palette'
+                           : 'high-contrast palette for direct sun';
+}
+function setTheme(mode) {
+  document.documentElement.setAttribute('data-theme', mode);
+  store.set('ocs-theme', mode);
+  paintThemeButton(mode);
+}
+$('theme').onclick = () => setTheme(themeNow() === 'day' ? 'night' : 'day');
+paintThemeButton(themeNow());
+
+// ---- numbers and formatting -----------------------------------------------------
+// JSON can carry a float as the string "NaN"; anything not a finite number is null.
+const num = x => (typeof x === 'number' && isFinite(x)) ? x : null;
+const fixed = (x, n) => { x = num(x); return x === null ? '—' : x.toFixed(n); };
+const ageText = x => { x = num(x); return x === null ? 'never' : x.toFixed(1) + ' s'; };
+const hms = ms => new Date(ms).toTimeString().slice(0, 8);
+
+// A usable position: finite, in range, and not exactly 0,0 (no fix). Else null.
+function validFix(lat, lon) {
+  lat = num(lat); lon = num(lon);
+  if (lat === null || lon === null || Math.abs(lat) > 90 || Math.abs(lon) > 180 ||
+      (lat === 0 && lon === 0)) return null;
+  return [lat, lon];
+}
+
+// fetch(url, opts) that gives up after `ms` (AbortError), so one hung request
+// can neither freeze the poll loop nor leave a probe dot on "checking".
+async function fetchWithin(ms, url, opts) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  try { return await fetch(url, Object.assign({signal: ac.signal, cache: 'no-store'}, opts)); }
+  finally { clearTimeout(timer); }
+}
+async function getJSON(url) {
+  const r = await fetchWithin(FETCH_TIMEOUT_MS, url);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+const reasonOf = e => (e && e.name === 'AbortError') ? 'timed out' : String((e && e.message) || e);
+
+// ---- the two position sources, normalised to one record shape --------------------
+const KIND_OF_TYPE = {TYPE_USV: 'boat', TYPE_UAV: 'drone', TYPE_UUV: 'sub'};
+const KIND_ORDER = {boat: 0, drone: 1, sub: 2, other: 3};
+
+// fleet_link entry. Every position value is already null when stale (its rule).
+function recFromFleet(e) {
+  const p = e.position || {}, h = e.heartbeat || {};
+  const name = e.name || ('sysid ' + e.sysid);
+  return {key: 'f:' + e.sysid, ocs: false, name, sysid: e.sysid,
+    label: name + ' · ' + e.sysid,
+    kind: (e.vehicle === 'boat' || e.vehicle === 'drone') ? e.vehicle : 'other',
+    src: e.link || null, mode: h.mode || null, armed: h.armed,
+    hbAge: h.age_s, posAge: p.age_s, posSrc: p.source || null,
+    lat: p.lat, lon: p.lon, heading: p.heading_deg, gs: p.groundspeed_mps};
+}
+
+// OCS vehicle: the report that goes to RoboCommand. The bridge keeps the last
+// report forever, so freshness is decided HERE from silent_s, and when it is
+// stale every value is blanked -- the age stays.
+function recFromOcs(v) {
+  const hb = (v.report && v.report.heartbeat) || {};
+  const pos = hb.position || null;
+  const silent = num(v.silent_s);
+  const budget = Math.max(FRESH_FLOOR_S, (num(v.stale_ms) || 0) / 1000);
+  const fresh = silent !== null && silent <= budget;
+  return {key: 'o:' + v.id, ocs: true, name: v.id, sysid: null,
+    label: v.id + ' (OCS)', kind: KIND_OF_TYPE[v.type] || 'other', src: 'OCS',
+    mode: fresh && hb.state ? String(hb.state).replace(/^STATE_/, '') : null,
+    armed: null,
+    hbAge: silent,
+    // a report that has a position carries it in the same frame it arrived in
+    posAge: pos ? silent : null, posSrc: pos ? 'OCS report' : null,
+    lat: fresh && pos ? pos.latitude : null, lon: fresh && pos ? pos.longitude : null,
+    heading: fresh ? hb.heading_deg : null, gs: fresh ? hb.spd_mps : null};
+}
+
+// ---- the map ------------------------------------------------------------------------
+const HAVE_MAP = typeof L !== 'undefined';
+let map = null, layer = null, streets = null, blank = null;
+const tracks = new Map();         // key -> per-vehicle map state, kept across polls
+let autoFitted = false;
+
+function iconFor(kind, ocs, heading) {
+  const h = heading === null ? null : Math.round(heading) % 360;
+  const rot = inner => h === null ? '' : '<g transform="rotate(' + h + ')">' + inner + '</g>';
+  let shapes;
+  if (ocs) {                      // hollow ring (+ a pointer when heading is known)
+    shapes = '<circle class="ringhalo" r="11"/><circle class="ring" r="11"/>'
+           + rot('<line class="ptr" x1="0" y1="-1" x2="0" y2="-8"/>');
+  } else if (h === null) {        // no heading: plain circle
+    shapes = '<circle class="body" r="7"/>';
+  } else {                        // arrow, north up, rotated clockwise by heading
+    shapes = rot('<path class="body" d="M0 -13 L9 11 L0 6 L-9 11 Z"/>');
+  }
+  return L.divIcon({className: 'vicon k-' + kind,
+                    html: '<svg width="32" height="32" viewBox="-16 -16 32 32">' + shapes + '</svg>',
+                    iconSize: [32, 32], iconAnchor: [16, 16]});
+}
+
+function getTrack(rec) {
+  let t = tracks.get(rec.key);
+  if (!t) {
+    t = {key: rec.key, kind: rec.kind, ocs: rec.ocs, label: rec.label,
+         segs: [[]], n: 0, gap: false, last: null,   // last = {lat, lon, ms} of the last fresh fix
+         live: false, marker: null, poly: null, x: null, iconKey: '', labelShown: ''};
+    tracks.set(rec.key, t);
+  }
+  t.label = rec.label;
+  return t;
+}
+
+function trimTrail(t) {
+  while (t.n > TRAIL_MAX) {
+    const s = t.segs[0];
+    if (!s.length) { t.segs.shift(); continue; }
+    s.shift(); t.n--;
+    if (!s.length && t.segs.length > 1) t.segs.shift();
+  }
+}
+
+const setStaleClass = (poly, on) => {
+  const el = poly && poly.getElement();
+  if (el) el.classList.toggle('stale', on);
+};
+
+// A fresh fix: extend the trail and move the live marker IN PLACE.
+function drawLive(t, rec, fix, nowMs) {
+  if (t.gap) { t.segs.push([]); t.gap = false; }   // never join across a gap
+  const seg = t.segs[t.segs.length - 1], prev = seg[seg.length - 1];
+  if (!prev || Math.abs(prev[0] - fix[0]) > TRAIL_EPS || Math.abs(prev[1] - fix[1]) > TRAIL_EPS) {
+    seg.push(fix); t.n++; trimTrail(t);
+  }
+  // when the position was MADE, not when we polled it
+  t.last = {lat: fix[0], lon: fix[1], ms: nowMs - (num(rec.posAge) || 0) * 1000};
+  t.live = true;
+  if (!HAVE_MAP) return;
+
+  const ll = L.latLng(fix[0], fix[1]);
+  const hdg = num(rec.heading);
+  const iconKey = t.kind + '|' + t.ocs + '|' + (hdg === null ? 'n' : Math.round(hdg) % 360);
+  if (!t.marker) {
+    t.marker = L.marker(ll, {icon: iconFor(t.kind, t.ocs, hdg), interactive: false,
+                             keyboard: false, zIndexOffset: t.ocs ? 0 : 100});
+    t.marker.bindTooltip(esc(t.label), {permanent: true, className: 'vlabel',
+      direction: t.ocs ? 'left' : 'right', offset: [t.ocs ? -14 : 14, 0]});
+    t.iconKey = iconKey; t.labelShown = t.label;
+  } else {
+    t.marker.setLatLng(ll);
+    if (iconKey !== t.iconKey) { t.marker.setIcon(iconFor(t.kind, t.ocs, hdg)); t.iconKey = iconKey; }
+    if (t.label !== t.labelShown) { t.marker.setTooltipContent(esc(t.label)); t.labelShown = t.label; }
+  }
+  if (!layer.hasLayer(t.marker)) t.marker.addTo(layer);
+  if (t.x && layer.hasLayer(t.x)) layer.removeLayer(t.x);
+
+  if (!t.poly) t.poly = L.polyline([], {interactive: false,
+    className: 'trail k-' + t.kind + (t.ocs ? ' ocs' : '')}).addTo(layer);
+  t.poly.setLatLngs(t.segs);
+  setStaleClass(t.poly, false);
+}
+
+// No position now. The live marker goes; what remains is history, drawn as
+// history: a dim dashed trail and a "x" at the last fix that says how old it is.
+function drawStale(t, nowMs) {
+  t.live = false;
+  if (!t.gap && t.last) t.gap = true;
+  if (!HAVE_MAP) return;
+  if (t.marker && layer.hasLayer(t.marker)) layer.removeLayer(t.marker);
+  if (!t.last) return;                             // never had a fresh fix: nothing to show
+  setStaleClass(t.poly, true);
+  const ll = L.latLng(t.last.lat, t.last.lon);
+  if (!t.x) {
+    t.x = L.marker(ll, {icon: L.divIcon({className: 'xmark k-' + t.kind, html: '×',
+                                         iconSize: [18, 18], iconAnchor: [9, 9]}),
+                        keyboard: false, zIndexOffset: -100});
+    t.x.bindTooltip('', {direction: 'top', offset: [0, -8], className: 'vlabel'});
+  } else t.x.setLatLng(ll);
+  const secs = Math.max(0, Math.round((nowMs - t.last.ms) / 1000));
+  t.x.setTooltipContent('<b>' + esc(t.label) + '</b><br>last fix ' + hms(t.last.ms) + ', ' + secs + ' s ago');
+  if (!layer.hasLayer(t.x)) t.x.addTo(layer);
+}
+
+function fitAll() {
+  if (!HAVE_MAP) return false;
+  const pts = [];
+  tracks.forEach(t => { if (t.live && t.last) pts.push([t.last.lat, t.last.lon]); });
+  if (!pts.length) tracks.forEach(t => { if (t.last) pts.push([t.last.lat, t.last.lon]); });
+  if (!pts.length) return false;
+  map.fitBounds(L.latLngBounds(pts).pad(0.25), {maxZoom: 18, animate: false});
+  return true;
+}
+
+function drawAll(recs, nowMs) {
+  const seen = new Set();
+  let anyLive = false;
+  recs.forEach(r => {
+    const t = getTrack(r);
+    seen.add(r.key);
+    const fix = validFix(r.lat, r.lon);
+    if (fix) { drawLive(t, r, fix, nowMs); anyLive = true; } else drawStale(t, nowMs);
+  });
+  // Vehicles that vanished from a source (or the whole source is down): stale.
+  tracks.forEach((t, k) => { if (!seen.has(k)) drawStale(t, nowMs); });
+  if (anyLive && !autoFitted) { autoFitted = fitAll(); }
+}
+
+// ---- the vehicle list (rebuilt with innerHTML every poll; it is not the map) ---------
+const pill = (cls, text) => '<span class="pill ' + cls + '">' + text + '</span>';
+const field = (label, val) => '<span class="f"><i>' + label + '</i> ' + val + '</span>';
+
+function rowHtml(r) {
+  const fix = validFix(r.lat, r.lon);
+  const armed = r.armed === true ? pill('warn', 'ARMED')
+              : r.armed === false ? pill('idle', 'disarmed') : '—';
+  return '<div class="vrow' + (fix ? '' : ' nopos') + '">'
+    + '<div class="l1"><span class="dot k-' + r.kind + (r.ocs ? ' ocs' : '') + '"></span>'
+    + '<b>' + esc(r.name) + '</b>' + (r.sysid != null ? ' · ' + esc(r.sysid) : '')
+    + ' ' + pill('idle', esc(r.src || '—')) + ' '
+    + field('mode', r.mode ? esc(r.mode) : '—') + field('armed', armed)
+    + field('hb', ageText(r.hbAge)) + '</div>'
+    + '<div>' + field('pos', ageText(r.posAge) + (r.posSrc ? ' ' + esc(r.posSrc) : ''))
+    + field('lat/lon', fix ? fix[0].toFixed(5) + ', ' + fix[1].toFixed(5)
+                           : '—' + ' ' + pill('idle', 'no live position'))
+    + field('hdg', fixed(r.heading, 0) + (num(r.heading) === null ? '' : '°'))
+    + field('gs', fixed(r.gs, 1) + (num(r.gs) === null ? '' : ' m/s')) + '</div></div>';
+}
+
+function linksHtml(fleet) {
+  if (!fleet) return '<div class="dim">fleet_link not answering — no link status</div>';
+  const out = ['wifi', 'rfd'].map(name => {
+    const lk = (fleet.links || {})[name];
+    if (!lk) return '<div class="lrow"><b>' + name + '</b> <span class="dim">not reported</span></div>';
+    const state = lk.enabled === false ? pill('idle', 'disabled')
+                : lk.open ? pill('ok', 'open') : pill('bad', 'closed');
+    const rate = num(lk.rate_in_Bps);
+    return '<div class="lrow"><b>' + name + '</b> ' + esc(lk.type || '') + ' ' + state + ' '
+      + field('rate', rate === null ? '—' : rate.toFixed(0) + ' B/s')
+      + field('last frame', ageText(lk.last_frame_age_s))
+      + (lk.error ? ' ' + pill('bad', esc(lk.error)) : '') + '</div>';
+  });
+  if (num(fleet.decode_errors)) out.push('<div class="dim">decode errors: ' + esc(fleet.decode_errors) + '</div>');
+  return out.join('');
+}
+
+const banner = (cls, html) => '<div class="banner ' + cls + '">' + html + '</div>';
+const why = text => ' <span class="dim">(' + esc(text) + ')</span>';
+
+function bannersHtml(d) {
+  const out = [];
+  if (d.fleetErr) {
+    const e = d.fleetErr;
+    out.push(banner('bad', (e.fleet_url
+      ? 'fleet_link not answering at ' + esc(hostOf(e.fleet_url)) + ' — run OCS\\FLEET_LINK.cmd'
+      : 'OCS web server not answering (/api/fleet)') + why(e.error)));
+  }
+  if (d.stateErr) {
+    out.push(banner('bad', 'OCS vehicle reports (/api/state) not answering — '
+      + 'no OCS positions' + why(d.stateErr)));
+  }
+  if (d.inject) {
+    out.push(banner('warn', '⚠ FAKE DATA INJECTION IS ENABLED — '
+      + 'OCS vehicle positions on this map may be fake.'));
+  }
+  return out.join('');
+}
+const hostOf = u => { try { return new URL(u).host; } catch (e) { return u; } };
+
+function onData(f, o, nowMs) {
+  const d = {fleet: null, fleetErr: null, state: null, stateErr: null, inject: false};
+  if (f.status === 'fulfilled') {
+    if (f.value && f.value.error) d.fleetErr = f.value; else d.fleet = f.value;
+  } else d.fleetErr = {error: reasonOf(f.reason), fleet_url: null};
+  if (o.status === 'fulfilled') { d.state = o.value; d.inject = !!(o.value.inject && o.value.inject.enabled); }
+  else d.stateErr = reasonOf(o.reason);
+
+  const recs = [];
+  if (d.fleet) Object.values(d.fleet.sysids || {}).forEach(e => recs.push(recFromFleet(e)));
+  if (d.state) (d.state.vehicles || []).forEach(v => recs.push(recFromOcs(v)));
+  recs.sort((a, b) => (a.ocs - b.ocs) || (KIND_ORDER[a.kind] - KIND_ORDER[b.kind])
+                   || ((a.sysid || 0) - (b.sysid || 0)) || a.name.localeCompare(b.name));
+
+  drawAll(recs, nowMs);
+
+  $('rows').innerHTML = recs.length ? recs.map(rowHtml).join('')
+                                    : '<div class="dim">no vehicles heard</div>';
+  $('links').innerHTML = linksHtml(d.fleet);
+  $('banners').innerHTML = bannersHtml(d);
+  const summary = (up, ocs, noun) => {
+    const mine = recs.filter(r => r.ocs === ocs);
+    return up ? mine.length + ' ' + noun + ', ' + mine.filter(r => validFix(r.lat, r.lon)).length
+                + ' with position' : 'down';
+  };
+  $('sum').textContent = 'fleet_link ' + summary(!!d.fleet, false, 'sysids')
+    + ' · OCS ' + summary(!!d.state, true, 'vehicles');
+}
+
+async function poll() {
+  const t0 = performance.now();
+  try {
+    const [f, o] = await Promise.allSettled([getJSON('/api/fleet'), getJSON('/api/state')]);
+    onData(f, o, Date.now());
+  } catch (e) { console.error(e); }
+  setTimeout(poll, Math.max(100, POLL_MS - (performance.now() - t0)));
+}
+
+// ---- links to each vehicle GUI, with a reachability dot ---------------------------------
+// no-cors cannot see a status code, so all it can say is: something answered, or not.
+async function answers(url) {
+  try { await fetchWithin(PROBE_TIMEOUT_MS, url, {mode: 'no-cors'}); return true; }
+  catch (e) { return false; }
+}
+
+function buildGuis(list) {
+  const box = $('guis');
+  box.textContent = '';
+  if (!list.length) { box.textContent = 'none configured'; return []; }
+  return list.map(g => {
+    const row = document.createElement('div'); row.className = 'grow';
+    const dot = document.createElement('span'); dot.className = 'pdot';
+    const a = document.createElement('a');
+    a.href = g.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = g.name;
+    const st = document.createElement('span'); st.className = 'gstate dim'; st.textContent = 'checking…';
+    const meta = document.createElement('span'); meta.className = 'dim';
+    meta.textContent = g.url + (g.note ? ' · ' + g.note : '');
+    row.append(dot, a, st, meta);
+    box.append(row);
+    return {url: g.url, dot, st};
+  });
+}
+
+async function probeAll(items) {
+  await Promise.all(items.map(async it => {
+    const up = await answers(it.url);
+    it.dot.className = 'pdot ' + (up ? 'up' : 'down');
+    it.st.textContent = up ? 'answers' : 'no answer';
+  }));
+}
+
+// ---- start ------------------------------------------------------------------------------------
+async function init() {
+  let cfg = null;
+  try { cfg = await getJSON('/api/map-config'); } catch (e) { console.error(e); }
+
+  if (HAVE_MAP) {
+    map = L.map('map', {zoomSnap: 0.5, maxZoom: 22});
+    layer = L.layerGroup().addTo(map);
+    streets = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxNativeZoom: 19, maxZoom: 22,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'});
+    blank = L.layerGroup();                      // no tiles: the page background shows
+    (store.get('ocs-map-base') === 'blank' ? blank : streets).addTo(map);
+    // collapsed:false -- the stock toggle icon is a PNG this build does not ship
+    L.control.layers({'Streets (online)': streets, 'Blank (offline)': blank}, null,
+                     {collapsed: false}).addTo(map);
+    L.control.scale({imperial: false}).addTo(map);
+
+    let tileErr = 0;
+    streets.on('tileerror', () => { if (++tileErr >= 3) $('tilenote').hidden = false; });
+    streets.on('tileload', () => { tileErr = 0; $('tilenote').hidden = true; });
+    map.on('baselayerchange', e => {
+      store.set('ocs-map-base', e.layer === blank ? 'blank' : 'streets');
+      if (e.layer === blank) $('tilenote').hidden = true;
+    });
+
+    // last view if saved, else the configured centre; with neither, the whole world
+    let view = null;
+    try {
+      const v = JSON.parse(store.get('ocs-map-view'));
+      if (v && num(v.lat) !== null && num(v.lng) !== null && Number.isInteger(v.zoom) &&
+          v.zoom >= 0 && v.zoom <= 22) view = v;
+    } catch (e) {}
+    if (view) map.setView([view.lat, view.lng], view.zoom);
+    else if (cfg && validFix(cfg.center[0], cfg.center[1])) map.setView(cfg.center, 16);
+    else map.setView([0, 0], 2);
+    map.on('moveend', () => {
+      const c = map.getCenter();
+      store.set('ocs-map-view', JSON.stringify({lat: c.lat, lng: c.lng, zoom: map.getZoom()}));
+    });
+
+    $('fit').onclick = () => {
+      if (!fitAll() && cfg && validFix(cfg.center[0], cfg.center[1])) map.setView(cfg.center, 16);
+    };
+  } else {
+    $('fit').disabled = true;
+    $('banners').innerHTML = banner('bad', 'Leaflet did not load (/vendor/leaflet/leaflet.js) '
+      + '— the vehicle list still works, the map does not.');
+  }
+
+  poll();
+
+  if (cfg && Array.isArray(cfg.guis)) {
+    const items = buildGuis(cfg.guis);
+    const run = () => probeAll(items).catch(console.error);
+    run(); setInterval(run, PROBE_MS);
+  } else {
+    $('guis').textContent = 'link list unavailable (/api/map-config)';
+  }
+}
+init();
+})();
+</script>
+</body>
+</html>
