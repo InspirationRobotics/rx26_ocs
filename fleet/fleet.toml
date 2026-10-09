@@ -1,0 +1,74 @@
+# fleet_link configuration -- see fleet/README.md for what each of these means.
+#
+# Port discipline (umbrella CLAUDE.md): the aircraft owns 1454x, the boat 1455x.
+# The outputs below are LOOPBACK ports on this laptop. fleet_link only ever SENDS to
+# them from its own ephemeral sockets, so a consumer that binds one of them is the
+# only thing that can receive there.
+
+[status]
+host = "127.0.0.1"
+port = 8098                 # GET /fleet
+# stale_s = 3.0             # measured values older than this are reported as null
+# summary_s = 10            # console summary interval
+
+[dialect]
+# The robotx dialect carries the 42xxx RXL messages. Left out, fleet_link looks for
+# Mesh\dialect\gen\robotx.py in this checkout, then the boat's identical copy.
+# robotx = "C:\\path\\to\\robotx.py"
+
+# ---------------------------------------------------------------- the two inputs
+
+[links.wifi]
+type = "udp"
+bind = "0.0.0.0"
+port = 14550                # the boat's MAVProxy unicasts AND broadcasts here
+# enabled = false           # or: --wifi-port NONE
+
+[links.rfd]
+type = "serial"
+device = "COM8"             # RFD900ux base station: SiK multipoint master, NODEID 1
+baud = 115200
+reopen_s = 5                # retry this often while the port is missing or busy
+# enabled = false           # or: --serial NONE
+
+# ------------------------------------------------------------------- the outputs
+# links     which inputs feed this output (and which it may transmit on)
+# sysids    which source sysids it receives; leave out for all
+# transmit  false = LISTEN-ONLY: anything the consumer sends is dropped and counted
+
+[outputs.qgc]
+port = 14570                # QGroundControl: a UDP link listening on 14570
+links = ["wifi", "rfd"]
+transmit = true
+
+[outputs.boat_gui]
+port = 14554                # the boat laptop GUI
+links = ["wifi"]
+sysids = [2]
+transmit = false
+
+[outputs.drone_gui]
+port = 14543                # gcs_radio.py (udpin:127.0.0.1:14543) -- it DOES transmit
+links = ["rfd"]
+transmit = true
+
+[outputs.drone_diag]
+port = 14544                # ad-hoc diagnostics, listen-only, kept last on purpose
+links = ["rfd"]
+transmit = false
+
+# --------------------------------------------------------------- vehicle names
+# Only used to label sysids in /fleet. A sysid listed here is reported with its group
+# as "vehicle"; anything else is "unknown" with the name "sysid N".
+
+[vehicles]
+boat = [2, 42]              # autopilot, companion (rxl_link_node)
+drone = [1, 200]            # autopilot, companion
+radio = [51]                # RFD900ux RADIO_STATUS
+
+# What a map should print for each group above ("name" in /fleet). A group left out is
+# shown by its own key.
+[names]
+boat = "Crusader"
+drone = "Ekko"
+radio = "RFD900ux"
