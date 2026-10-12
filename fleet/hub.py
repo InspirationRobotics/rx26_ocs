@@ -24,6 +24,17 @@ THE RULES THE DESIGN RESTS ON
   and counted. A `transmit` output's frames go to the link that last heard the
   frame's target_system (within `route_age_s`), or to all of the output's links
   when there is no target.
+
+OBSERVERS. `observe(fn, msgids)` taps frames without touching routing: fn is called
+for every accepted inbound frame ("rx"), every frame written toward a link ("tx",
+from an output or from `transmit`), and every frame an output offered that was
+refused ("refused"). Observers run under the hub lock, so they must be quick, and an
+exception in one is counted and swallowed -- a logger or an adapter can never take
+routing down. The tunnel log and the OCS adapter are the two observers.
+
+`transmit(link, raw)` is how fleet_link itself originates a frame (the OCS adapter's
+RXL TUNNELs). It goes to ONE named link and nowhere else, never through the learned
+routes.
 """
 from __future__ import annotations
 
@@ -32,7 +43,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 from .mavframe import (Dialect, Frame, FrameSplitter, ParseStats, pack_datagrams,
                        split_datagram)
@@ -45,6 +56,7 @@ DEDUP_WINDOW_S = 1.0
 DEDUP_CAPACITY = 2048          # frames remembered per link, whatever the rate
 ROUTE_AGE_S = 30.0             # a sysid not heard this recently has no route
 _WRITE_ERROR_LOG_EVERY = 50    # log the 1st write error, then every Nth
+_OBSERVER_ERROR_LOG_EVERY = 100
 
 
 @dataclass(frozen=True)
@@ -93,6 +105,7 @@ class LinkIO(Endpoint):
 
 
 class OutputIO(Endpoint):
+    host: Optional[str] = None           # where it sends, for /fleet (loopback, except --sim-boat)
     local_port: Optional[int] = None     # our source port, for /fleet
 
     def send(self, data: bytes) -> bool:
@@ -226,6 +239,7 @@ class OutputPort:
     def status(self) -> dict:
         c = self.cfg
         return {
+            "host": self.io.host,
             "port": c.port,
             "reply_port": self.io.local_port,
             "links": list(c.links),
@@ -270,10 +284,36 @@ class Hub:
             self.outputs[cfg.name] = OutputPort(cfg, io)
         self.vehicles = VehicleTable(names, stale_s)
         self.started_at = clock()
+        self._observers: List[Tuple[Callable, Optional[FrozenSet[int]]]] = []
+        self.observer_errors = 0
+        self._sections: Dict[str, Callable[[], dict]] = {}
         for port in self.links.values():
             port.io.bind(self)
         for out in self.outputs.values():
             out.io.bind(self)
+
+    # ------------------------------------------------------------- observers
+
+    def observe(self, fn: Callable, msgids: Optional[Iterable[int]] = None) -> None:
+        """Call fn(event, where, frame, now, info) for frames with a msgid in `msgids`
+        (None = every frame). `event` is "rx" (where = link), "tx" (where = link;
+        info has origin and sent) or "refused" (where = output; info has reason)."""
+        self._observers.append((fn, None if msgids is None else frozenset(msgids)))
+
+    def add_status_section(self, name: str, fn: Callable[[], dict]) -> None:
+        """Add a top-level block to /fleet, computed by fn() at each snapshot."""
+        self._sections[name] = fn
+
+    def _notify(self, event: str, where: str, frame: Frame, now: float, **info) -> None:
+        for fn, ids in self._observers:
+            if ids is not None and frame.msgid not in ids:
+                continue
+            try:
+                fn(event, where, frame, now, info)
+            except Exception:                                        # noqa: BLE001
+                self.observer_errors += 1
+                if self.observer_errors == 1 or self.observer_errors % _OBSERVER_ERROR_LOG_EVERY == 0:
+                    log.exception("observer raised (%d so far)", self.observer_errors)
 
     # ------------------------------------------------------------ life cycle
 
@@ -333,6 +373,8 @@ class Hub:
             for f in frames:
                 if f.validated:
                     self.vehicles.note(f, name, now)
+                if self._observers:
+                    self._notify("rx", name, f, now)
             if frames:
                 self._fan_out(name, frames)
 
@@ -358,6 +400,8 @@ class Hub:
                 out.frames_in_from_consumer += 1
                 if not out.cfg.transmit:
                     out.dropped_listen_only += 1
+                    if self._observers:
+                        self._notify("refused", name, f, now, reason="listen_only")
                     continue
                 self._route_reverse(out, f, now)
 
@@ -375,10 +419,16 @@ class Hub:
             if port.io.needs_addr and addr is None:
                 continue                              # a UDP link nobody has spoken on yet
             sent = True
-            if not port.io.send(frame.raw, 1, addr):
+            accepted = port.io.send(frame.raw, 1, addr)
+            if not accepted:
                 port.tx_dropped += 1
+            if self._observers:
+                self._notify("tx", port.name, frame, now, origin="output:" + out.name,
+                             sent=accepted)
         if not sent:
             out.no_route += 1
+            if self._observers:
+                self._notify("refused", out.name, frame, now, reason="no_route")
 
     def _learned_route(self, out: OutputPort, sysid: int, now: float):
         """(LinkPort, address) of the freshest link in this output's list that
@@ -393,12 +443,45 @@ class Hub:
                 best = (heard[0], port, heard[1])
         return None if best is None else (best[1], best[2])
 
+    # ---------------------------------------------- frames fleet_link originates
+
+    def heard_age(self, link: str, sysid: int) -> Optional[float]:
+        """Seconds since a CRC-validated frame from `sysid` was accepted on `link`;
+        None if never. The same fact the reverse path's route rule is built on."""
+        with self.lock:
+            heard = self.links[link].heard.get(sysid)
+            return None if heard is None else self.clock() - heard[0]
+
+    def transmit(self, link: str, raw: bytes, *, origin: str) -> bool:
+        """Write one whole frame that fleet_link itself built to ONE link. True when
+        the transport accepted it (a serial link queues it; the bytes are reported
+        later through link_tx). False -- and tx_dropped counts it -- when the link is
+        switched off, down, or full."""
+        with self.lock:
+            now = self.clock()
+            port = self.links.get(link)
+            if port is None or not port.io.enabled:
+                return False
+            addr = None
+            if port.io.needs_addr:
+                addr = port.last_addr
+                if addr is None:
+                    return False                  # a UDP link nobody has spoken on yet
+            accepted = port.io.send(raw, 1, addr)
+            if not accepted:
+                port.tx_dropped += 1
+            if self._observers:
+                frames = split_datagram(self.dialect, raw)
+                if frames:
+                    self._notify("tx", link, frames[0], now, origin=origin, sent=accepted)
+            return accepted
+
     # ------------------------------------------------------------------ status
 
     def snapshot(self) -> dict:
         with self.lock:
             now = self.clock()
-            return {
+            snap = {
                 "schema": SCHEMA_VERSION,
                 "time": round(self.wall(), 3),
                 "uptime_s": round(now - self.started_at, 1),
@@ -409,3 +492,9 @@ class Hub:
                 "outputs": {n: o.status() for n, o in self.outputs.items()},
                 "sysids": self.vehicles.snapshot(now),
             }
+        for name, fn in self._sections.items():
+            try:
+                snap[name] = fn()
+            except Exception as e:                                   # noqa: BLE001
+                snap[name] = {"error": "%s: %s" % (type(e).__name__, e)}
+        return snap

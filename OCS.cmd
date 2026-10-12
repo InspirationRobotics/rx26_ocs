@@ -21,6 +21,11 @@ rem    OCS.cmd --inject --local-broker   plus the fake-data buttons
 rem  Set OCS_NO_FLEET=1 to skip the fleet link, OCS_NO_BROWSER=1 to
 rem  skip opening the browser.
 rem
+rem  fleet_link options (e.g. --sim-boat, the WSL2 Crusader sim on the
+rem  radio) cannot be given here: the arguments above go to ocs_web.
+rem  Start FLEET_LINK.cmd with them FIRST; this file then finds it
+rem  running and leaves it alone.
+rem
 rem  The probe is curl.exe and the windows are ordinary visible ones:
 rem  this PC's malware protection deletes launchers that hide a
 rem  background window or script web requests (2026-09-30).

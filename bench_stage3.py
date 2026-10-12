@@ -36,18 +36,12 @@ from rx_bridge.bridge import Bridge                                    # noqa: E
 from rx_bridge.config import load                                      # noqa: E402
 from rx_bridge.runstate import RunState                                # noqa: E402
 
-from crusader_groundstation.ocs_link import OcsLink, fake_report       # noqa: E402
+from crusader_groundstation.ocs_link import OcsLink, fake_report, rfc3339   # noqa: E402
 
 TCP_PORT = 37598          # its own port; never collide with a real OCS
 
 CONFIG = """
 team_id = "{team}"
-uav_geofence = [
-    [1.28010, 103.85520],
-    [1.28010, 103.85625],
-    [1.28110, 103.85625],
-    [1.28010, 103.85520],
-]
 
 [[vehicle]]
 id = "USV1"
@@ -91,11 +85,21 @@ wire_log  = "{wire}"
 
 
 class Vehicle:
-    """One vehicle's client, streaming at the mandated 2 Hz."""
+    """One vehicle's client, streaming at the mandated 2 Hz.
 
-    def __init__(self, vid: str, vtype: str, logs: list) -> None:
+    A UAV also plays the radio adapter's part in the geofence handshake: when the OCS
+    tells it a fence (`ocs_info.uav_geofence`) it answers with an `ocs_fence` -- verified,
+    the OPEN polygon it was given, read back now -- and the OCS will not declare an
+    aircraft without that. `confirm_fence=False` holds the answer back until `confirm()`,
+    which is how the bench proves a declaration is REFUSED without it.
+    """
+
+    def __init__(self, vid: str, vtype: str, logs: list, *, confirm_fence: bool = True) -> None:
         self.vid = vid
         self.directives: list = []
+        self.fence = None                          # the last uav_geofence told, closed
+        self.auto_confirm = confirm_fence
+        self._owe_fence = threading.Event()
         self.link = OcsLink("127.0.0.1", TCP_PORT,
                             on_command=self._on_msg,
                             log=lambda m, v=vid: logs.append("%s: %s" % (v, m)))
@@ -108,9 +112,30 @@ class Vehicle:
     def _on_msg(self, msg):
         if "ocs_directive" in msg:
             self.directives.append(msg["ocs_directive"])
+        info = msg.get("ocs_info")
+        if self._type == "TYPE_UAV" and info and info.get("uav_geofence"):
+            self.fence = info["uav_geofence"]
+            if self.auto_confirm:
+                self._owe_fence.set()
+
+    def confirm(self) -> None:
+        """Answer the fence the OCS last told this aircraft, on the next cycle."""
+        self._owe_fence.set()
+
+    def _fence_frame(self) -> dict:
+        poly = [[p["latitude"], p["longitude"]] for p in self.fence[:-1]]     # OPEN form
+        return {"ocs_fence": {"vehicle_id": self.vid, "state": "done", "polygon": poly,
+                              "verified": True, "verified_at": rfc3339(),
+                              "reason": "written and read back: %d vertices" % len(poly),
+                              "lockout": None}}
 
     def _run(self):
         while not self._stop.is_set():
+            if self._owe_fence.is_set() and self.fence:
+                self._owe_fence.clear()
+                self.link.publish(self._fence_frame())
+                self._stop.wait(0.5)
+                continue
             r = fake_report(self.vid, TEAM, self._t0)
             r["heartbeat"]["vehicle_type"] = self._type
             if self._type == "TYPE_UAV":
@@ -164,11 +189,25 @@ def main() -> int:
     check("C2c", "at least 2" in msg,
           "one vehicle is refused, naming the handbook floor: %r" % msg[:70])
 
-    uav = Vehicle("UAV1", "TYPE_UAV", logs)
+    uav = Vehicle("UAV1", "TYPE_UAV", logs, confirm_fence=False)
     settle(2.0)
     check("C2d", bridge.active_ids() == ("USV1", "UAV1"),
           "both connected -> active=%s (UUV1 absent, never declared)"
           % (bridge.active_ids(),))
+
+    print("\nC2e-C2f  an aircraft is not declared until its autopilot is KNOWN to hold the fence")
+    n_req = len(rc.requests)
+    msg = bridge.declare()
+    check("C2e", msg.startswith("cannot declare") and "UAV1" in msg and "not confirmed" in msg
+          and len(rc.requests) == n_req and bridge.machine.state is RunState.COURSE_RX,
+          "no ocs_fence yet -> REFUSED, nothing sent to RoboCommand: %r" % msg[:80])
+    uav.confirm()
+    settle(1.5)
+    fc = bridge.snapshot()["fence_confirm"].get("UAV1", {})
+    check("C2f", fc.get("verified") is True and fc.get("matches_course_fence") is True
+          and bridge.declare_blocker() is None,
+          "the aircraft read the course fence back (%s, %s vertices) -> the gate opens"
+          % (bridge.snapshot()["uav_geofence_source"], len(fc.get("polygon") or [])))
 
     print("\nC3  3.4.10 step 4: the declaration names exactly the active two")
     n_req = len(rc.requests)
@@ -184,6 +223,12 @@ def main() -> int:
     check("C3d", "UUV1" not in declared,
           "UUV1 has no reporter and is NOT declared -- this is what stops the "
           "run hanging forever waiting for it")
+    sent_fence = [(p.latitude, p.longitude)
+                  for p in rc.requests[-1].run_declaration.uav_geofence] if rc.requests else []
+    check("C3e", len(sent_fence) >= 4 and sent_fence[0] == sent_fence[-1]
+          and sent_fence == list(bridge._fence.polygon),
+          "RoboCommand got the COURSE's fence, closed (%d points) -- the one the aircraft holds"
+          % len(sent_fence))
 
     print("\nC4  the standby-auto directive reaches the declared vehicles")
     settle(1.0)

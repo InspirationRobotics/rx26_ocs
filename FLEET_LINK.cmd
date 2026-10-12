@@ -3,6 +3,13 @@ rem FLEET_LINK.cmd -- start the OCS fleet link in its own window, unless it is a
 rem
 rem   FLEET_LINK.cmd                        the usual: COM8, UDP 14550, status on 8098
 rem   FLEET_LINK.cmd --serial COM9          any fleet_link option is passed straight through
+rem   FLEET_LINK.cmd --sim-boat HOST:PORT   SIMULATION ONLY: mirror the radio to the WSL2 Crusader sim,
+rem                                         whose replies are then TRANSMITTED ON THE REAL RADIO. Never
+rem                                         at competition. HOST comes from: python -m fleet.wsl_ip
+rem                                         (add --sim-boat-rx-only to keep the sim off the air).
+rem                                         fleet\README.md "Sim boat on the radio"
+rem Options only count on a FRESH start: if fleet_link already answers, this file says so and
+rem exits, and the options you gave are NOT applied.
 rem
 rem "Already running" means something answers GET /fleet on the DEFAULT status port,
 rem 8098, so if you start it with --status-port run python -m fleet.fleet_link yourself.
@@ -15,6 +22,7 @@ setlocal
 curl.exe -s -f -m 2 -o NUL http://127.0.0.1:8098/fleet
 if not errorlevel 1 (
     echo Fleet link is already running - http://127.0.0.1:8098/fleet answers.
+    if not "%~1"=="" echo The options you gave were NOT applied. Stop it with ctrl-C in its window, then run this again.
     exit /b 0
 )
 python -c "import pymavlink, serial" >NUL 2>&1

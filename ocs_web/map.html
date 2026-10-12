@@ -27,7 +27,7 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
     --warn:#e8b757; --warn-bg:#3b3117; --idle:#8b99ae; --idle-bg:#232936;
     --btn:#232b38; --btn-hi:#2c374a; --btn-line:#33405a;
     --banner-bg:#4a2410; --banner-line:#8a4a1a; --banner-fg:#ffb877;
-    --mapbg:#0d1016; --halo:#0b0d12;
+    --mapbg:#0d1016; --halo:#0b0d12; --logo-bg:#ffffff;
     --v-boat:#4da3ff; --v-drone:#ffb454; --v-sub:#38d9c6; --v-other:#c3a6ff;
   }
   html[data-theme="day"] {
@@ -38,7 +38,7 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
     --warn:#7a4200; --warn-bg:#fae3bd; --idle:#2b343d; --idle-bg:#d9dfe5;
     --btn:#dde3e9; --btn-hi:#ccd5dd; --btn-line:#8d99a6;
     --banner-bg:#ffd9b8; --banner-line:#a34a00; --banner-fg:#5c2600;
-    --mapbg:#eceae3; --halo:#ffffff;
+    --mapbg:#eceae3; --halo:#ffffff; --logo-bg:#ffffff;
     --v-boat:#0040c0; --v-drone:#c24d00; --v-sub:#00665f; --v-other:#6a1fb0;
   }
 
@@ -52,6 +52,10 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
 
   #top { display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px;
          padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--line) }
+  /* The team's logos (dark line art): a white badge in BOTH themes, as on the boat and drone GUIs. */
+  .logos { display:flex; align-items:center; gap:6px; flex:none; background:var(--logo-bg);
+           border:1px solid var(--line); border-radius:6px; padding:2px 6px }
+  .logos img { height:26px; width:auto; display:block }
   h1 { font-size:15px; margin:0; letter-spacing:.08em; text-transform:uppercase; color:var(--head) }
   h2 { font-size:12px; margin:0 0 6px; letter-spacing:.08em; text-transform:uppercase; color:var(--head) }
   .nav a { text-decoration:none } .nav b { color:var(--fg) }
@@ -130,6 +134,17 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
   path.trail.ocs { stroke-width:2 }
   path.trail.stale { stroke-dasharray:3 7; stroke-opacity:.4 }
 
+  /* ---- fences: course boundary (RoboCommand), the UAV geofence declared for this course, and
+     what the autopilot holds (read back by fleet_link). CSS beats Leaflet's SVG attributes. */
+  path.fence-course { stroke:var(--dim); stroke-width:2; stroke-dasharray:2 6; fill:none }
+  path.fence-declared { stroke:var(--v-drone); stroke-width:2; stroke-dasharray:9 6; fill:none }
+  path.fence-fc { stroke:var(--v-drone); stroke-width:4; stroke-opacity:.9; fill:var(--v-drone); fill-opacity:.14 }
+  path.fence-fc.excl { stroke:var(--bad); fill:var(--bad) }
+  .sw { display:inline-block; width:20px; height:0; vertical-align:middle; margin:0 4px 0 2px }
+  .sw.course { border-top:2px dotted var(--dim) }
+  .sw.decl { border-top:2px dashed var(--v-drone) }
+  .sw.fc { border-top:4px solid var(--v-drone) }
+
   /* phone: map on top, panel below, page scrolls vertically only */
   @media (max-width: 820px) {
     body { height:auto; min-height:100vh }
@@ -144,9 +159,11 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
 <body>
 
 <div id="top">
+  <div class="logos"><img src="/static/ti_logo.jpg" alt="Team Inspiration" title="Team Inspiration" width="73" height="96"><img src="/static/asta_logo.png" alt="Advancing Science, Technology &amp; Art" title="Advancing Science, Technology &amp; Art" width="87" height="96"></div>
   <h1>OCS · map</h1>
   <span class="nav"><a href="/">/</a> ↔ <b>/map</b></span>
   <button id="fit" title="zoom to every vehicle with a live position">Fit all</button>
+  <button id="fence" title="zoom to the course and the geofences" disabled>Fence</button>
   <button id="theme"></button>
   <span id="sum" class="dim"></span>
 </div>
@@ -163,6 +180,13 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
         ring = OCS report (the feed RoboCommand gets) ·
         × = last fix, stale: <b>history, not a current position</b></div>
       <div id="rows"><div class="dim">waiting for first poll…</div></div>
+    </section>
+    <section>
+      <h2>Geofence</h2>
+      <div id="flegend" class="dim"><span class="sw course"></span>course (RoboCommand) ·
+        <span class="sw decl"></span>declared for this course ·
+        <span class="sw fc"></span>on the autopilot (read back)</div>
+      <div id="fences" class="dim">—</div>
     </section>
     <section>
       <h2>fleet_link links</h2>
@@ -409,6 +433,109 @@ function drawAll(recs, nowMs) {
   if (anyLive && !autoFitted) { autoFitted = fitAll(); }
 }
 
+// ---- fences -------------------------------------------------------------------------------
+// Three outlines from three sources, never merged: the COURSE boundary RoboCommand published
+// (/api/state course), the UAV geofence this OCS DECLARES FOR THIS COURSE (/api/state uav_geofence;
+// uav_geofence_source says where it came from), and what each
+// radio vehicle's AUTOPILOT holds as fleet_link last read it back (/api/fleet ...fence_upload).
+// The last is what is enforced; the declared one is what RoboCommand judges. Each is drawn only
+// while its source answers: a fence nobody can vouch for right now is not drawn from memory.
+let fenceLayer = null, fenceKey = '', fenceBounds = null;
+const llOf = p => validFix(p && p.latitude, p && p.longitude);
+
+function fenceData(d) {
+  const st = d.state || {};
+  const course = st.course && Array.isArray(st.course.corners) ? st.course.corners.map(llOf).filter(Boolean) : [];
+  const declared = Array.isArray(st.uav_geofence) ? st.uav_geofence.map(llOf).filter(Boolean) : [];
+  const vs = (d.fleet && d.fleet.ocs && d.fleet.ocs.vehicles) || {};
+  const uploads = Object.keys(vs).sort().filter(id => vs[id] && vs[id].fence_upload)
+                        .map(id => ({id, f: vs[id].fence_upload}));
+  return {course, declared, uploads, source: st.uav_geofence_source, reason: st.uav_geofence_reason,
+          confirms: st.fence_confirm || {}, maxAge: num(st.fence_confirm_max_age_s) || 180};
+}
+
+function drawFences(fd) {
+  if (!HAVE_MAP) return;
+  const key = JSON.stringify([fd.course, fd.declared, fd.uploads.map(u => [u.id, u.f.autopilot_shapes])]);
+  if (key === fenceKey) return;              // redraw only on change: no flicker, no churn
+  fenceKey = key;
+  fenceLayer.clearLayers();
+  const pts = [];
+  const add = (shape, tip, ll) => {
+    shape.bindTooltip(esc(tip), {sticky: true, className: 'vlabel'}).addTo(fenceLayer);
+    pts.push(...ll);
+  };
+  fd.uploads.forEach(({id, f}) => (f.autopilot_shapes || []).forEach(s => {
+    const cls = 'fence-fc' + (s.inclusion ? '' : ' excl');
+    const tip = id + ' autopilot: ' + (s.inclusion ? 'inclusion ' : 'exclusion ') + s.type;
+    if (s.type === 'polygon') {
+      const ll = (s.points || []).map(p => validFix(p[0], p[1])).filter(Boolean);
+      if (ll.length >= 3) add(L.polygon(ll, {className: cls}), tip, ll);
+    } else if (s.type === 'circle' && s.center) {
+      const c = validFix(s.center[0], s.center[1]), r = num(s.radius_m);
+      if (c && r) add(L.circle(c, {className: cls, radius: r}), tip + ' ' + r.toFixed(0) + ' m', [c]);
+    }
+  }));
+  if (fd.course.length >= 3)
+    add(L.polygon(fd.course, {className: 'fence-course'}), 'course boundary (RoboCommand)', fd.course);
+  if (fd.declared.length >= 3)
+    add(L.polygon(fd.declared, {className: 'fence-declared'}), 'UAV geofence, declared for this course', fd.declared);
+  fenceBounds = pts.length ? L.latLngBounds(pts) : null;
+  $('fence').disabled = !fenceBounds;
+}
+
+const FENCE_STATE = {done: ['ok', 'on the autopilot'], held: ['warn', 'held'], busy: ['idle', 'working'],
+                     waiting: ['idle', 'waiting'], 'gave up': ['bad', 'gave up'], off: ['idle', 'no geofence yet']};
+
+function fencesHtml(fd, d) {
+  const out = [];
+  const n = fd.declared.length;
+  const closed = n > 1 && fd.declared[0][0] === fd.declared[n - 1][0] && fd.declared[0][1] === fd.declared[n - 1][1];
+  // "declared for this course": what RunDeclaration carries and the aircraft is told. Its source
+  // says how it was worked out ("table: ALPHA", "course boundary inset 2.0 m"); with none, why.
+  // With a course held and no fence the pill is red -- the aircraft keeps whatever fence it has.
+  out.push('<div class="lrow">' + field('declared for this course', !d.state ? pill('bad', 'OCS not answering')
+             : n ? (n - (closed ? 1 : 0)) + ' vertices' + (fd.source ? ' <span class="dim">(' + esc(fd.source) + ')</span>' : '')
+                 : pill(fd.course.length ? 'bad' : 'idle', 'none') + (fd.reason ? ' <span class="dim">' + esc(fd.reason) + '</span>' : ''))
+           + field('course', !d.state ? '—' : fd.course.length ? fd.course.length + ' corners' : 'not received')
+           + '</div>');
+  // What the radio adapter told the OCS it read back (`ocs_fence`) -- the evidence the declare gate
+  // judges. Not the same thing as the autopilot row below, which is fleet_link's own read.
+  Object.keys(fd.confirms).sort().forEach(id => {
+    const c = fd.confirms[id] || {};
+    const age = num(c.age_s);
+    const cleared = c.verified && Array.isArray(c.polygon) && c.polygon.length === 0;
+    const [cls, text] = !c.verified ? ['warn', 'not verified'] : cleared ? ['idle', 'cleared']
+      : !c.matches_course_fence ? ['warn', 'holds another polygon']
+      : (age === null || age > fd.maxAge) ? ['bad', 'stale'] : ['ok', 'confirmed'];
+    out.push('<div class="vrow"><div class="l1"><b>' + esc(id) + '</b> ' + pill(cls, text) + ' '
+      + field('OCS gate', esc(c.state || '—') + (Array.isArray(c.polygon) && c.polygon.length ? ', ' + c.polygon.length + ' vertices' : ''))
+      + field('read back', age === null ? 'age unknown' : age.toFixed(0) + ' s ago')
+      + (c.lockout ? ' ' + pill('warn', 'will not arm here') : '') + '</div>'
+      + (!c.verified && c.reason ? '<div class="dim">' + esc(c.reason) + '</div>' : '') + '</div>');
+  });
+  if (!d.fleet) out.push('<div class="dim">fleet_link not answering — what the autopilot holds is unknown</div>');
+  else if (!fd.uploads.length) out.push('<div class="dim">no radio vehicle reports a fence upload</div>');
+  fd.uploads.forEach(({id, f}) => {
+    if (f.enabled === false) {
+      out.push('<div class="vrow"><b>' + esc(id) + '</b> ' + pill('idle', 'fence upload off') + '</div>');
+      return;
+    }
+    const [cls, text] = FENCE_STATE[f.state] || ['idle', f.state];
+    const age = num(f.autopilot_read_age_s);
+    out.push('<div class="vrow"><div class="l1"><b>' + esc(id) + '</b> ' + pill(cls, esc(text))
+      + (f.lockout ? ' ' + pill('warn', 'will not arm here') : '') + ' '
+      + field('autopilot holds', f.autopilot_fence ? esc(f.autopilot_fence) : 'not read yet')
+      + field('read', age === null ? '—' : age.toFixed(0) + ' s ago') + '</div>'
+      + '<div class="dim">' + esc(f.reason || '') + '</div>'
+      + (f.lockout ? '<div class="dim">' + esc(f.lockout) + '</div>' : '')
+      + (f.backup ? '<div class="dim">previous fence saved to ' + esc(f.backup) + '</div>' : '')
+      + (f.last_error && f.state !== 'done' ? '<div>' + pill('bad', 'last error') + ' ' + esc(f.last_error) + '</div>' : '')
+      + '</div>');
+  });
+  return out.join('');
+}
+
 // ---- the vehicle list (rebuilt with innerHTML every poll; it is not the map) ---------
 const pill = (cls, text) => '<span class="pill ' + cls + '">' + text + '</span>';
 const field = (label, val) => '<span class="f"><i>' + label + '</i> ' + val + '</span>';
@@ -466,16 +593,24 @@ function bannersHtml(d) {
     out.push(banner('warn', '⚠ FAKE DATA INJECTION IS ENABLED — '
       + 'OCS vehicle positions on this map may be fake.'));
   }
+  if (d.benchAuto.length) {
+    out.push(banner('warn', '⚠ BENCH AUTO IS ON — STATE_AUTO is published for '
+      + esc(d.benchAuto.join(', ')) + ' while they report MANUAL. '
+      + 'Never at competition.'));
+  }
   return out.join('');
 }
 const hostOf = u => { try { return new URL(u).host; } catch (e) { return u; } };
 
 function onData(f, o, nowMs) {
-  const d = {fleet: null, fleetErr: null, state: null, stateErr: null, inject: false};
+  const d = {fleet: null, fleetErr: null, state: null, stateErr: null, inject: false, benchAuto: []};
   if (f.status === 'fulfilled') {
     if (f.value && f.value.error) d.fleetErr = f.value; else d.fleet = f.value;
   } else d.fleetErr = {error: reasonOf(f.reason), fleet_url: null};
-  if (o.status === 'fulfilled') { d.state = o.value; d.inject = !!(o.value.inject && o.value.inject.enabled); }
+  if (o.status === 'fulfilled') {
+    d.state = o.value; d.inject = !!(o.value.inject && o.value.inject.enabled);
+    d.benchAuto = (o.value.bench_auto && o.value.bench_auto.vehicles) || [];
+  }
   else d.stateErr = reasonOf(o.reason);
 
   const recs = [];
@@ -485,6 +620,9 @@ function onData(f, o, nowMs) {
                    || ((a.sysid || 0) - (b.sysid || 0)) || a.name.localeCompare(b.name));
 
   drawAll(recs, nowMs);
+  const fd = fenceData(d);
+  drawFences(fd);
+  $('fences').innerHTML = fencesHtml(fd, d);
 
   $('rows').innerHTML = recs.length ? recs.map(rowHtml).join('')
                                     : '<div class="dim">no vehicles heard</div>';
@@ -548,6 +686,7 @@ async function init() {
 
   if (HAVE_MAP) {
     map = L.map('map', {zoomSnap: 0.5, maxZoom: 22});
+    fenceLayer = L.layerGroup().addTo(map);      // first: trails and markers draw over it
     layer = L.layerGroup().addTo(map);
     streets = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxNativeZoom: 19, maxZoom: 22,
@@ -584,6 +723,9 @@ async function init() {
 
     $('fit').onclick = () => {
       if (!fitAll() && cfg && validFix(cfg.center[0], cfg.center[1])) map.setView(cfg.center, 16);
+    };
+    $('fence').onclick = () => {
+      if (fenceBounds) map.fitBounds(fenceBounds.pad(0.3), {maxZoom: 19, animate: false});
     };
   } else {
     $('fit').disabled = true;

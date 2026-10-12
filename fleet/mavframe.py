@@ -116,14 +116,51 @@ def _infos_from_map(mavlink_map, source: str) -> Dict[int, MsgInfo]:
             for mid, cls in mavlink_map.items()}
 
 
+#: The robotx dialect is the team's own: its ids sit in the 42xxx block. When the
+#: dialect could not be loaded, frames in this block are still treated as custom
+#: inter-vehicle traffic (the tunnel log keeps them) instead of silently vanishing.
+CUSTOM_ID_BLOCK = range(42000, 43000)
+
+MSG_TUNNEL = 385
+
+
 class Dialect:
     """msgid -> MsgInfo, built from the merged ardupilotmega + robotx maps."""
 
     def __init__(self, info: Dict[int, MsgInfo], notes: Sequence[str] = (),
-                 robotx_path: Optional[str] = None):
+                 robotx_path: Optional[str] = None, robotx_module=None):
         self._info = info
         self.notes = list(notes)
         self.robotx_path = robotx_path
+        self._robotx_module = robotx_module
+        self._robotx_decoder = None
+
+    def custom_ids(self) -> frozenset:
+        """Message ids that belong to the robotx dialect (RXL_SAFE_PASSAGE 42011 ...):
+        the custom inter-vehicle messages, as opposed to stock MAVLink. Read from
+        the dialect that was actually loaded, never from a hard-coded list."""
+        return frozenset(mid for mid, i in self._info.items() if i.source == "robotx")
+
+    def is_custom(self, msgid: int) -> bool:
+        """True for a robotx-dialect id, or -- when that dialect is not loaded -- for
+        any id in the 42xxx block it would have defined."""
+        info = self._info.get(msgid)
+        if info is not None:
+            return info.source == "robotx"
+        return self._robotx_module is None and msgid in CUSTOM_ID_BLOCK
+
+    def decode_custom(self, raw: bytes) -> Optional[dict]:
+        """A robotx-dialect frame as a dict of its fields, or None (not loaded, not
+        decodable). Never raises."""
+        if self._robotx_module is None:
+            return None
+        try:
+            if self._robotx_decoder is None:
+                self._robotx_decoder = self._robotx_module.MAVLink(None)
+                self._robotx_decoder.robust_parsing = True
+            return self._robotx_decoder.decode(bytearray(raw)).to_dict()
+        except Exception:                                    # noqa: BLE001
+            return None
 
     def get(self, msgid: int) -> Optional[MsgInfo]:
         return self._info.get(msgid)
@@ -204,6 +241,7 @@ def load_dialect(robotx_path: Optional[str] = "auto") -> Dialect:
     info = _infos_from_map(ardupilotmega.mavlink_map, "ardupilotmega")
     notes: List[str] = []
     used_path: Optional[str] = None
+    used_module = None
 
     explicit = robotx_path not in (None, "auto")
     path = locate_robotx_dialect() if robotx_path == "auto" else robotx_path
@@ -222,6 +260,7 @@ def load_dialect(robotx_path: Optional[str] = "auto") -> Dialect:
                              "pass through UNVALIDATED" % (path, e))
             else:
                 used_path = path
+                used_module = module
                 for mid, new in extra.items():
                     old = info.get(mid)
                     if old is None:
@@ -230,7 +269,7 @@ def load_dialect(robotx_path: Optional[str] = "auto") -> Dialect:
                         notes.append("msgid %d (%s): crc_extra %d in ardupilotmega but %d in "
                                      "robotx; keeping ardupilotmega's" %
                                      (mid, old.name, old.crc_extra, new.crc_extra))
-    return Dialect(info, notes, used_path)
+    return Dialect(info, notes, used_path, used_module)
 
 
 _default: Dict[object, Dialect] = {}
@@ -407,3 +446,86 @@ def pack_datagrams(raws: Sequence[bytes], max_len: int = MAX_DATAGRAM) -> List[L
     if cur:
         groups.append(cur)
     return groups
+
+
+# ------------------------------------------------------------------------ TUNNEL
+
+#: TUNNEL (385) wire layout. MAVLink sorts fields by size, so the u16 payload_type
+#: comes FIRST and the declaration order (target_system first) is not the wire order.
+#: tests/test_mavframe.py cross-checks this against pymavlink's own encoder.
+_TUNNEL_HEAD = struct.Struct("<HBBB")
+TUNNEL_PAYLOAD_MAX = 128
+_TUNNEL_FULL = _TUNNEL_HEAD.size + TUNNEL_PAYLOAD_MAX
+
+
+@dataclass(frozen=True)
+class TunnelFields:
+    payload_type: int
+    target_system: int
+    target_component: int
+    payload_length: int        # as the sender declared it (may be garbage > 128)
+    data: bytes                # the real payload bytes: payload[:payload_length], max 128
+
+    @property
+    def length_ok(self) -> bool:
+        return self.payload_length <= TUNNEL_PAYLOAD_MAX
+
+
+def parse_tunnel(frame: "Frame") -> TunnelFields:
+    """The fields of a TUNNEL frame. A v2 sender trims trailing zero bytes off the
+    payload, so it is zero-padded back to full length before it is read."""
+    body = frame.payload
+    if len(body) < _TUNNEL_FULL:
+        body = body + bytes(_TUNNEL_FULL - len(body))
+    ptype, tsys, tcomp, plen = _TUNNEL_HEAD.unpack_from(body, 0)
+    start = _TUNNEL_HEAD.size
+    return TunnelFields(ptype, tsys, tcomp, plen,
+                        bytes(body[start:start + min(plen, TUNNEL_PAYLOAD_MAX)]))
+
+
+def pack_frame(dialect: Dialect, msgid: int, payload: bytes, *, sysid: int, compid: int,
+               seq: int) -> bytes:
+    """A MAVLink 2 frame, built here (not by pymavlink) so the sender is just the CRC
+    and header code this module already tests. Trailing zero bytes are trimmed off the
+    payload as the spec requires (one byte is always kept)."""
+    info = dialect.get(msgid)
+    if info is None:
+        raise ValueError("msgid %d is not in the dialect: no crc_extra to build a frame with"
+                         % msgid)
+    body = payload[:1] + payload[1:].rstrip(b"\x00") if payload else b""
+    head = bytes((len(body), 0, 0, seq & 0xFF, sysid & 0xFF, compid & 0xFF)) + \
+        msgid.to_bytes(3, "little")
+    crc = frame_crc(head + body, info.crc_extra)
+    return bytes((MAGIC_V2,)) + head + body + crc.to_bytes(2, "little")
+
+
+def build_tunnel_frame(dialect: Dialect, data: bytes, *, payload_type: int, sysid: int,
+                       compid: int, seq: int, target_system: int = 0,
+                       target_component: int = 0) -> bytes:
+    """One TUNNEL frame carrying `data` (at most 128 bytes)."""
+    if len(data) > TUNNEL_PAYLOAD_MAX:
+        raise ValueError("TUNNEL carries at most %d bytes, got %d" % (TUNNEL_PAYLOAD_MAX, len(data)))
+    body = _TUNNEL_HEAD.pack(payload_type, target_system, target_component, len(data)) + \
+        data + bytes(TUNNEL_PAYLOAD_MAX - len(data))
+    return pack_frame(dialect, MSG_TUNNEL, body, sysid=sysid, compid=compid, seq=seq)
+
+
+# --------------------------------------------------------------------- COMMAND_LONG
+
+#: COMMAND_LONG (76) wire layout: the seven float params first, then the u16 command, then
+#: the three u8s (MAVLink sorts by size; declaration order is target_system first).
+#: tests cross-check this against pymavlink's own encoder.
+MSG_COMMAND_LONG = 76
+MAV_CMD_SET_MESSAGE_INTERVAL = 511
+_COMMAND_LONG = struct.Struct("<7fHBBB")
+
+
+def build_command_long_frame(dialect: Dialect, command: int, params: Sequence[float] = (), *,
+                             sysid: int, compid: int, seq: int, target_system: int,
+                             target_component: int = 1, confirmation: int = 0) -> bytes:
+    """One COMMAND_LONG frame. `params` are param1.., padded with 0.0 to seven."""
+    if len(params) > 7:
+        raise ValueError("COMMAND_LONG carries 7 params, got %d" % len(params))
+    p = [float(x) for x in params] + [0.0] * (7 - len(params))
+    body = _COMMAND_LONG.pack(*p, command, target_system, target_component, confirmation)
+    return pack_frame(dialect, MSG_COMMAND_LONG, body, sysid=sysid, compid=compid, seq=seq)

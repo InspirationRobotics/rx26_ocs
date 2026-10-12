@@ -71,7 +71,6 @@ from crusader_groundstation.ocs_link import (      # noqa: E402
 
 CONFIG = """
 team_id = "{team}"
-uav_geofence = []
 
 [[vehicle]]
 id = "USV1"
@@ -187,7 +186,12 @@ def main() -> int:
     settle(1.5)
 
     print("B1-B2  the boat's own client connects and is identified")
-    link = OcsLink("127.0.0.1", TCP_PORT, log=lambda m: logs.append("link: " + m))
+    # The commands the boat's client was handed, by name. Counting frames
+    # (link.counts) no longer isolates a command: the OCS also sends ocs_info on
+    # connect and ocs_directive on declaring, and both arrive the same way.
+    commands: list[dict] = []
+    link = OcsLink("127.0.0.1", TCP_PORT, on_command=commands.append,
+                   log=lambda m: logs.append("link: " + m))
     link.start()
     t0 = time.time()
     stop = threading.Event()
@@ -270,21 +274,21 @@ def main() -> int:
     cmd.keep_out_zone.SetInParent()
     bridge._route_command(cmd, "keep_out_zone")
     settle(1.0)
-    check("B9", link.counts[1] >= 1,
-          "the boat's client received %d command(s)" % link.counts[1])
-    check("B9b", not raw.got,
-          "a command addressed to USV1 did NOT go to UUV1's socket (%d seen)"
-          % len(raw.got))
+    check("B9", any("keep_out_zone" in c for c in commands),
+          "the boat's client received the keep_out_zone (%d frame(s) of any kind)"
+          % link.counts[1])
+    check("B9b", not any(b"keep_out_zone" in f for f in raw.got),
+          "a command addressed to USV1 did NOT go to UUV1's socket (%d "
+          "non-command frame(s) seen there)" % len(raw.got))
 
     bcast = rx_commands_pb2.RxCommand()
     bcast.seq = 6
     bcast.all_clear.SetInParent()
-    n_link, n_raw = link.counts[1], len(raw.got)
     bridge._route_command(bcast, "all_clear")
     settle(1.0)
-    check("B10", link.counts[1] > n_link and len(raw.got) > n_raw,
-          "an unaddressed command reached BOTH vehicles (%d, %d)"
-          % (link.counts[1] - n_link, len(raw.got) - n_raw))
+    check("B10", any("all_clear" in c for c in commands)
+          and any(b"all_clear" in f for f in raw.got),
+          "an unaddressed command reached BOTH vehicles")
 
     print("\nB11-B12  link loss: latest-wins, and reconnect")
     raw.close()

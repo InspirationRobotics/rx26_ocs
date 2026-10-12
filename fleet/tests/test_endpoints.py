@@ -118,6 +118,7 @@ class FakeSerial:
 def make_config(wifi_port, status_port, out_ports, wifi_host="127.0.0.1"):
     return parse_config({
         "status": {"port": status_port},
+        "tunnel_log": {"enabled": False},      # tests must not write into the real run/tunnel
         "dialect": {},
         "links": {"wifi": {"type": "udp", "bind": wifi_host, "port": wifi_port},
                   "rfd": {"type": "serial", "device": "FAKE", "reopen_s": 0.05}},

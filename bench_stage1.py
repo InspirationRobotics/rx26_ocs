@@ -238,7 +238,6 @@ class FakeUSV:
 
 CONFIG = """
 team_id = "{team}"
-uav_geofence = []
 
 [[vehicle]]
 id = "{vehicle}"

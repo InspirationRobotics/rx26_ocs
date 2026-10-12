@@ -10,13 +10,24 @@ Both go to loopback outputs (QGroundControl, the boat GUI, gcs_radio, diagnostic
 and /fleet on 127.0.0.1:8098 reports what is alive. This REPLACES radio_link.py on
 this laptop. Run it on the SYSTEM python (pymavlink and pyserial live there).
 
+Two things ride on top of the routing without being part of it: the tunnel log
+(tunnel_log.py: every TUNNEL and robotx-dialect frame, to run/tunnel/*.jsonl) and the OCS
+adapter (ocs_adapter.py: Ekko's radio link to the RoboCommand bridge). Both are hub
+observers; neither can stop a frame being routed.
+
 The routing rules are written up at the top of hub.py; the wire handling at the top
 of mavframe.py; the schema of /fleet in README.md.
+
+SIMULATION ONLY, COMMAND LINE ONLY: --sim-boat HOST:PORT adds one output, "sim_boat", that
+sends every frame heard on rfd to a simulated boat's radio port (the Crusader Gazebo sim in
+WSL2) and TRANSMITS WHATEVER IT SENDS BACK ON THE REAL RADIO, as a real boat's radio would.
+It is not a fleet.toml key, so the competition config cannot carry it. See README.md.
 """
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import ipaddress
 import json
 import logging
 import os
@@ -29,19 +40,23 @@ import tomllib
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from . import mavframe
 from .endpoints import (DisabledLinkIO, EndpointError, SerialLinkIO, UdpLinkIO,
                         UdpOutputIO, claim_exclusively, open_serial)
 from .hub import Hub, LinkIO, OutputCfg
+from .ocs_adapter import OcsAdapter, OcsCfg, OcsConfigError, disabled_status, parse_hostport, parse_ocs_config
+from .tunnel_log import TunnelLog
 from .vehicles import STALE_S, VehicleNames
 
 log = logging.getLogger("fleet")
 
 DEFAULT_CONFIG = Path(__file__).with_name("fleet.toml")
+OCS_DIR = Path(__file__).resolve().parents[1]       # relative paths in fleet.toml are relative to this
 NONE_WORDS = ("none", "off", "disabled")        # --serial NONE / --wifi-port NONE
+SIM_BOAT = "sim_boat"                           # the name of the --sim-boat output in /fleet
 
 
 class ConfigError(ValueError):
@@ -63,6 +78,26 @@ class LinkCfg:
 
 
 @dataclass(frozen=True)
+class TunnelLogCfg:
+    enabled: bool = True
+    dir: str = "run/tunnel"              # relative to the OCS folder; run/ is gitignored
+
+    def path(self) -> Path:
+        p = Path(self.dir)
+        return p if p.is_absolute() else OCS_DIR / p
+
+
+@dataclass(frozen=True)
+class SimBoatCfg:
+    """--sim-boat: a simulated boat's radio port (the Crusader Gazebo sim in WSL2). Set
+    ONLY by apply_overrides, from the command line; parse_config never builds one, so
+    fleet.toml -- the competition config -- cannot carry it."""
+    host: str                            # an IPv4 literal: the WSL VM's eth0 address
+    port: int
+    rx_only: bool = False                # --sim-boat-rx-only: hear the radio, never key it
+
+
+@dataclass(frozen=True)
 class Config:
     status_host: str
     status_port: int
@@ -73,6 +108,9 @@ class Config:
     stale_s: float = STALE_S
     summary_s: float = 10.0
     names: Dict[str, str] = dataclasses.field(default_factory=dict)   # [names]: role -> display
+    ocs: OcsCfg = OcsCfg(enabled=False)                                # [ocs]: Ekko's radio link to the bridge
+    tunnel_log: TunnelLogCfg = TunnelLogCfg()                          # [tunnel_log]
+    sim_boat: Optional[SimBoatCfg] = None                              # --sim-boat only, never a file key
 
     def vehicle_names(self) -> VehicleNames:
         return VehicleNames(self.vehicles, self.names)
@@ -100,6 +138,9 @@ def _sysid_list(value, where: str) -> List[int]:
 
 
 def parse_config(raw: dict) -> Config:
+    if SIM_BOAT in raw:
+        raise ConfigError("[%s]: not a config key -- --sim-boat exists on the command line only, "
+                          "so this file cannot carry a simulated boat" % SIM_BOAT)
     status = raw.get("status", {})
     links: Dict[str, LinkCfg] = {}
     for name, t in raw.get("links", {}).items():
@@ -128,6 +169,9 @@ def parse_config(raw: dict) -> Config:
             if ln not in links:
                 raise ConfigError("%s: unknown link %r (defined: %s)"
                                   % (where, ln, ", ".join(links) or "none"))
+        if "host" in t:
+            raise ConfigError("%s: 'host' is not a key -- every output is loopback (the one remote "
+                              "output is --sim-boat, command line only)" % where)
         sysids = _sysid_list(t["sysids"], where + " sysids") if "sysids" in t else None
         outputs.append(OutputCfg(name, _port(_need(t, "port", where), where),
                                  tuple(out_links),
@@ -142,6 +186,13 @@ def parse_config(raw: dict) -> Config:
             raise ConfigError("[names] %s: no such [vehicles] group (defined: %s)"
                               % (role, ", ".join(vehicles) or "none"))
 
+    try:
+        ocs = parse_ocs_config(raw.get("ocs", {}))
+    except OcsConfigError as e:
+        raise ConfigError(str(e))
+    tl = raw.get("tunnel_log", {})
+    tunnel_log = TunnelLogCfg(enabled=bool(tl.get("enabled", True)), dir=str(tl.get("dir", "run/tunnel")))
+
     dialect = raw.get("dialect", {})
     cfg = Config(status_host=str(status.get("host", "127.0.0.1")),
                  status_port=_port(status.get("port", 8098), "[status] port"),
@@ -149,7 +200,7 @@ def parse_config(raw: dict) -> Config:
                  robotx_dialect=str(dialect["robotx"]) if "robotx" in dialect else "auto",
                  stale_s=float(status.get("stale_s", STALE_S)),
                  summary_s=float(status.get("summary_s", 10.0)),
-                 names=names)
+                 names=names, ocs=ocs, tunnel_log=tunnel_log)
     validate(cfg)
     return cfg
 
@@ -176,6 +227,44 @@ def validate(cfg: Config) -> None:
             raise ConfigError("outputs %r and %r both target UDP %d"
                               % (seen[out.port], out.name, out.port))
         seen[out.port] = out.name
+    if cfg.sim_boat is not None:
+        _validate_sim_boat(cfg, udp_ports)
+
+
+def _validate_sim_boat(cfg: Config, udp_ports: set) -> None:
+    sb = cfg.sim_boat
+    rfd = cfg.links.get("rfd")
+    if rfd is None:
+        raise ConfigError("--sim-boat mirrors the rfd link and this config has no [links.rfd]")
+    if not rfd.enabled:
+        raise ConfigError("--sim-boat mirrors the rfd link, which is switched off "
+                          "(--serial NONE or enabled = false)")
+    if sb.port in udp_ports:
+        binder = next(l.name for l in cfg.links.values() if l.type == "udp" and l.enabled and l.port == sb.port)
+        raise ConfigError("--sim-boat port %d is a UDP port fleet_link binds itself (link %s): "
+                          "use the sim's own radio port, normally 14555" % (sb.port, binder))
+    if any(o.name == SIM_BOAT for o in cfg.outputs):
+        raise ConfigError("[outputs.%s] clashes with --sim-boat, which owns that output name" % SIM_BOAT)
+
+
+def parse_sim_boat(value: str) -> Tuple[str, int]:
+    """--sim-boat HOST:PORT. HOST must be an IPv4 literal, the WSL VM's eth0 address
+    (`python -m fleet.wsl_ip`); a name or an IPv6 address is refused rather than resolved."""
+    text = str(value).strip()
+    host, sep, port = text.rpartition(":")
+    if not sep or not host or not port:
+        raise ConfigError("--sim-boat: %r is not HOST:PORT (HOST = the WSL VM's eth0 IPv4 from "
+                          "python -m fleet.wsl_ip, PORT = 14555)" % text)
+    try:
+        addr = ipaddress.IPv4Address(host)
+    except ValueError:
+        raise ConfigError("--sim-boat: host %r is not an IPv4 address (use the WSL VM's eth0 "
+                          "address: python -m fleet.wsl_ip)" % host)
+    if addr.is_unspecified or addr.is_multicast or addr == ipaddress.IPv4Address("255.255.255.255"):
+        raise ConfigError("--sim-boat: %s is not a unicast address to send to" % host)
+    if not (port.isascii() and port.isdigit() and 1 <= int(port) <= 65535):
+        raise ConfigError("--sim-boat: port %r is not a UDP port (1-65535)" % port)
+    return str(addr), int(port)
 
 
 def load_config(path) -> Config:
@@ -202,8 +291,12 @@ def _switch(link: LinkCfg, value: str, **changes) -> LinkCfg:
 
 
 def apply_overrides(cfg: Config, *, serial: Optional[str] = None, baud: Optional[int] = None,
-                    wifi_port: Optional[str] = None, status_port: Optional[int] = None) -> Config:
-    """CLI overrides. `NONE` for --serial / --wifi-port switches that link off."""
+                    wifi_port: Optional[str] = None, status_port: Optional[int] = None,
+                    ocs_bridge: Optional[str] = None, tunnel_dir: Optional[str] = None,
+                    sim_boat: Optional[str] = None, sim_boat_rx_only: bool = False) -> Config:
+    """CLI overrides. `NONE` for --serial / --wifi-port / --ocs-bridge / --tunnel-dir
+    switches that off. `sim_boat` ("HOST:PORT") is the only way a SimBoatCfg comes to
+    exist."""
     links = dict(cfg.links)
 
     def need(name: str) -> LinkCfg:
@@ -219,7 +312,22 @@ def apply_overrides(cfg: Config, *, serial: Optional[str] = None, baud: Optional
         wifi = need("wifi")
         links["wifi"] = _switch(wifi, wifi_port, port=wifi.port if _is_none(wifi_port)
                                 else _port(int(wifi_port), "--wifi-port"))
-    new = dataclasses.replace(cfg, links=links,
+    ocs = cfg.ocs
+    if ocs_bridge is not None:
+        try:
+            ocs = (dataclasses.replace(ocs, enabled=False) if _is_none(ocs_bridge) else
+                   dataclasses.replace(ocs, enabled=True, **dict(zip(("bridge_host", "bridge_port"),
+                                                                      parse_hostport(ocs_bridge, "--ocs-bridge")))))
+        except OcsConfigError as e:
+            raise ConfigError(str(e))
+    tunnel_log = cfg.tunnel_log
+    if tunnel_dir is not None:
+        tunnel_log = (dataclasses.replace(tunnel_log, enabled=False) if _is_none(tunnel_dir)
+                      else dataclasses.replace(tunnel_log, enabled=True, dir=tunnel_dir))
+    if sim_boat is None and sim_boat_rx_only:
+        raise ConfigError("--sim-boat-rx-only needs --sim-boat HOST:PORT")
+    sim = cfg.sim_boat if sim_boat is None else SimBoatCfg(*parse_sim_boat(sim_boat), rx_only=sim_boat_rx_only)
+    new = dataclasses.replace(cfg, links=links, ocs=ocs, tunnel_log=tunnel_log, sim_boat=sim,
                               status_port=cfg.status_port if status_port is None
                               else _port(status_port, "--status-port"))
     validate(new)
@@ -236,6 +344,12 @@ def build_link_io(cfg: LinkCfg, taken_hint: str = "", serial_opener=open_serial)
     return SerialLinkIO(cfg.name, cfg.device, cfg.baud, cfg.reopen_s, opener=serial_opener)
 
 
+def sim_boat_output_cfg(sb: SimBoatCfg) -> OutputCfg:
+    """The one output --sim-boat adds: every sysid heard on rfd goes to the sim, and, unless
+    rx_only, whatever the sim sends back goes out on rfd by the ordinary reverse path."""
+    return OutputCfg(SIM_BOAT, sb.port, ("rfd",), None, transmit=not sb.rx_only)
+
+
 def build_hub(cfg: Config, dialect: Optional[mavframe.Dialect] = None,
               serial_opener=open_serial) -> Hub:
     if dialect is None:
@@ -245,7 +359,9 @@ def build_hub(cfg: Config, dialect: Optional[mavframe.Dialect] = None,
     hint = ("QGroundControl with UDP autoconnect? Close it or set its UDP link to %d" % qgc
             if qgc else "")
     ios = [build_link_io(l, hint, serial_opener) for l in cfg.links.values()]
-    outs = [(o, UdpOutputIO(o.name, o.port)) for o in cfg.outputs]
+    outs = [(o, UdpOutputIO(o.name, o.port)) for o in cfg.outputs]       # loopback, always
+    if cfg.sim_boat is not None:
+        outs.append((sim_boat_output_cfg(cfg.sim_boat), UdpOutputIO(SIM_BOAT, cfg.sim_boat.port, cfg.sim_boat.host)))
     return Hub(dialect, ios, outs, cfg.vehicle_names(), stale_s=cfg.stale_s)
 
 
@@ -347,6 +463,16 @@ def summary_line(snap: dict) -> str:
             if o[key]:
                 trouble.append("%s %s %d" % (name, key, o[key]))
     parts = ["fleet", " | ".join(links), ", ".join(sysids) or "no vehicles heard"]
+    sim = snap["outputs"].get(SIM_BOAT)
+    if sim:
+        parts.append("SIM BOAT %s:%d %s" % (sim["host"], sim["port"],
+                                            "KEYING rfd" if sim["transmit"] else "listen-only"))
+    ocs = snap.get("ocs") or {}
+    for vid, v in (ocs.get("vehicles") or {}).items():
+        hb = v["heartbeat"]
+        parts.append("ocs %s bridge %s hb %s%s" % (
+            vid, "up" if v["bridge"]["connected"] else "DOWN", hb["source"],
+            "" if hb["source"] != "none" else " (%s)" % (hb["reason"] or "?")[:70]))
     if trouble:
         parts.append(", ".join(trouble))
     return " | ".join(parts)
@@ -362,26 +488,60 @@ class App:
         self.cfg = cfg
         self.hub = build_hub(cfg, dialect, serial_opener)
         self.status: Optional[StatusServer] = None
+        self.tunnel_log: Optional[TunnelLog] = None
+        self.adapter: Optional[OcsAdapter] = None
+        if cfg.tunnel_log.enabled:
+            self.tunnel_log = TunnelLog(cfg.tunnel_log.path(), self.hub.dialect)
+            self.hub.observe(self.tunnel_log.on_event, self.tunnel_log.msgids)
+            self.hub.add_status_section("tunnel_log", self.tunnel_log.status)
+        if cfg.ocs.enabled and cfg.ocs.vehicles:
+            self.adapter = OcsAdapter(cfg.ocs, self.hub, tunnel_log=self.tunnel_log)
+        else:
+            reason = "switched off" if not cfg.ocs.enabled else "no [[ocs.radio_vehicle]] configured"
+            self.hub.add_status_section("ocs", lambda: disabled_status(reason))
 
     def start(self) -> None:
         try:
             # Status first: if another fleet_link is running its 8098 is the cleanest
             # tell, whereas its 14550 would blame QGroundControl.
             self.status = StatusServer(self.hub, self.cfg.status_host, self.cfg.status_port)
+            self._open_tunnel_log()
             self.hub.open()
             self.hub.start()
+            if self.adapter is not None:
+                self.adapter.start()
             self.status.start()
         except BaseException:
             self.stop()
             raise
 
+    def _open_tunnel_log(self) -> None:
+        """A log that cannot be opened is reported, never fatal: routing comes first."""
+        if self.tunnel_log is None:
+            return
+        try:
+            self.tunnel_log.open()
+        except OSError as e:
+            self.tunnel_log.errors += 1
+            self.tunnel_log.last_error = "cannot open %s: %s" % (self.cfg.tunnel_log.path(), e)
+            log.error("tunnel log NOT recording - %s (routing is unaffected)", self.tunnel_log.last_error)
+
     def stop(self) -> None:
+        if self.adapter is not None:
+            self.adapter.stop()
         self.hub.stop()
+        if self.tunnel_log is not None:
+            self.tunnel_log.close()
         if self.status is not None:
             self.status.stop()
 
     def banner(self) -> List[str]:
         lines = []
+        sb = self.cfg.sim_boat
+        if sb is not None:      # unindented on purpose: nothing else in the banner may read as routine
+            lines.append("SIM BOAT: rfd -> %s:%d; %s" % (
+                sb.host, sb.port, "listen-only (its replies are dropped and counted)" if sb.rx_only
+                else "its replies are KEYED ON THE REAL RADIO"))
         for name, l in self.cfg.links.items():
             if not l.enabled:
                 lines.append("  link %-5s disabled" % name)
@@ -389,12 +549,23 @@ class App:
                 lines.append("  link %-5s UDP %s:%d" % (name, l.bind, l.port))
             else:
                 lines.append("  link %-5s %s @ %d (reopen every %g s)" % (name, l.device, l.baud, l.reopen_s))
-        for o in self.cfg.outputs:
-            io = self.hub.outputs[o.name].io
-            lines.append("  out  %-10s -> 127.0.0.1:%-5d links=%s sysids=%s %s (replies on 127.0.0.1:%s)" % (
-                o.name, o.port, "+".join(o.links),
+        for out in self.hub.outputs.values():
+            o, io = out.cfg, out.io
+            lines.append("  out  %-10s -> %s:%-5d links=%s sysids=%s %s (replies on %s:%s)" % (
+                o.name, io.host, o.port, "+".join(o.links),
                 "all" if o.sysids is None else sorted(o.sysids),
-                "may-transmit" if o.transmit else "LISTEN-ONLY", io.local_port))
+                "may-transmit" if o.transmit else "LISTEN-ONLY", io.local_host, io.local_port))
+        o = self.cfg.ocs
+        if self.adapter is None:
+            lines.append("  ocs  adapter off")
+        else:
+            lines.append("  ocs  bridge %s:%d as sysid %d/%d for %s" % (
+                o.bridge_host, o.bridge_port, o.sysid, o.compid,
+                ", ".join("%s (companion %d, autopilot %d, %s)" % (v.vehicle_id, v.companion_sysid,
+                                                                   v.autopilot_sysid, v.link)
+                          for v in o.vehicles)))
+        lines.append("  tunnel log %s" % (
+            (self.tunnel_log.path or self.cfg.tunnel_log.path()) if self.tunnel_log else "off"))
         lines.append("  status http://%s:%d/fleet" % (self.cfg.status_host, self.cfg.status_port))
         d = self.hub.dialect
         lines.append("  dialect ardupilotmega + robotx (%s): %d messages%s" % (
@@ -410,6 +581,15 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     ap.add_argument("--baud", type=int, help="the radio's SERIAL_SPEED (default 115200)")
     ap.add_argument("--wifi-port", help="UDP port to listen on for the boat (14550), or NONE to switch it off")
     ap.add_argument("--status-port", type=int, help="port for GET /fleet (8098)")
+    ap.add_argument("--ocs-bridge", help="HOST:PORT of the rx_bridge vehicle link (127.0.0.1:37564), or NONE "
+                                         "to switch the OCS adapter off")
+    ap.add_argument("--tunnel-dir", help="folder for the tunnel log (run/tunnel), or NONE to switch it off")
+    ap.add_argument("--sim-boat", metavar="HOST:PORT",
+                    help="SIMULATION ONLY, command line only: forward every rfd frame to a simulated boat's radio "
+                         "port (the Crusader sim in WSL2, udpin 14555; HOST = the WSL eth0 IPv4, python -m "
+                         "fleet.wsl_ip). Its replies are TRANSMITTED ON THE REAL RADIO. Never at competition")
+    ap.add_argument("--sim-boat-rx-only", action="store_true",
+                    help="with --sim-boat: the sim only listens; its replies are dropped and counted")
     return ap.parse_args(argv)
 
 
@@ -429,7 +609,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
     try:
         cfg = apply_overrides(load_config(args.config), serial=args.serial, baud=args.baud,
-                              wifi_port=args.wifi_port, status_port=args.status_port)
+                              wifi_port=args.wifi_port, status_port=args.status_port,
+                              ocs_bridge=args.ocs_bridge, tunnel_dir=args.tunnel_dir,
+                              sim_boat=args.sim_boat, sim_boat_rx_only=args.sim_boat_rx_only)
         app = App(cfg)
     except (ConfigError, mavframe.DialectError, ValueError) as e:
         log.error("configuration error: %s", e)

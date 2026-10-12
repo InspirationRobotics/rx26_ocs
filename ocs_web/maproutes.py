@@ -6,12 +6,16 @@ protobuf runtime, and so the page's whole server side reads in one file.
     GET /map                         map.html
     GET /vendor/leaflet/leaflet.js   Leaflet 1.9.4, served from disk, no CDN
     GET /vendor/leaflet/leaflet.css
+    GET /static/ti_logo.jpg          Team Inspiration logo (the page headers)
+    GET /static/asta_logo.png        ASTA logo (the page headers)
     GET /api/fleet                   fleet_link's GET /fleet, proxied
     GET /api/map-config              map centre + the links to each vehicle GUI
 
-THE VENDOR ROUTES ARE A WHITELIST, NOT A DIRECTORY. Two exact paths, each mapped
-to a fixed file name here. Nothing from the request is ever joined onto a path,
-so there is no `..` to defend against: the URL is looked up, never interpreted.
+THE VENDOR ROUTES ARE A WHITELIST, NOT A DIRECTORY. Four exact paths (Leaflet's two
+files and the two team logos), each mapped to a fixed file name here. There is no
+/static/ directory route: a logo that is not listed below is a 404. Nothing from
+the request is ever joined onto a path, so there is no `..` to defend against:
+the URL is looked up, never interpreted.
 
 THE PROXY EXISTS SO THE PAGE NEEDS ONE ORIGIN. fleet_link does send
 Access-Control-Allow-Origin: *, but going through here means the browser never
@@ -67,6 +71,10 @@ _VENDOR = {
                                    "application/javascript; charset=utf-8"),
     "/vendor/leaflet/leaflet.css": ("vendor/leaflet/leaflet.css",
                                     "text/css; charset=utf-8"),
+    # The team logos, decoded from the drone GUI's team_logos.py (dark line art,
+    # shown on a white badge in both themes by both pages).
+    "/static/ti_logo.jpg": ("static/ti_logo.jpg", "image/jpeg"),
+    "/static/asta_logo.png": ("static/asta_logo.png", "image/png"),
 }
 
 _HTML = "text/html; charset=utf-8"

@@ -361,14 +361,14 @@ host = "192.168.65.2"
             self._load(bad)
         self.assertIn("itself", str(cm.exception))
 
-    def test_a_uav_without_a_geofence_will_not_load(self):
-        """Catch it here, not in a rejected RunDeclaration."""
-        bad = self.FLEET.replace(
-            "uav_geofence = [[1.0,2.0],[1.0,3.0],[2.0,3.0],[1.0,2.0]]", ""
-        )
-        with self.assertRaises(ConfigError) as cm:
-            self._load(bad)
-        self.assertIn("geofence", str(cm.exception))
+    def test_a_uav_fleet_needs_no_static_geofence(self):
+        """The top-level uav_geofence is RETIRED: the fence is per course and comes from
+        the RxCourse (rx_bridge/geofence.py), so a UAV fleet with none loads, and
+        legitimately has no fence until a course arrives."""
+        cfg = self._load(self.FLEET.replace(
+            "uav_geofence = [[1.0,2.0],[1.0,3.0],[2.0,3.0],[1.0,2.0]]", ""))
+        self.assertTrue(cfg.has_uav())
+        self.assertEqual(cfg.uav_geofence, ())
 
     def test_a_fleet_with_no_uav_needs_no_geofence(self):
         cfg = self._load(self.BASE)
@@ -407,10 +407,16 @@ host = "192.168.65.2"
             'team_id = "ASTA"\nuav_geofence = %s' % fence,
         )
 
-    def test_an_open_geofence_is_rejected(self):
+    def test_the_retired_geofence_is_not_validated(self):
+        """Kept in bridge.toml only for the drone repo's check_config.py. Nothing in the
+        OCS uses it, so an open one must not stop the OCS starting."""
+        cfg = self._load(self._with_fence("[[1.0, 2.0], [1.0, 3.0]]"))
+        self.assertEqual(len(cfg.uav_geofence), 2)
+
+    def test_a_retired_geofence_that_is_not_coordinates_still_fails_cleanly(self):
         with self.assertRaises(ConfigError) as cm:
-            self._load(self._with_fence("[[1.0, 2.0], [1.0, 3.0]]"))
-        self.assertIn("closed", str(cm.exception))
+            self._load(self._with_fence('["a", "b"]'))
+        self.assertIn("uav_geofence", str(cm.exception))
 
     def test_a_closed_geofence_is_accepted(self):
         cfg = self._load(self._with_fence("[[1.0,2.0],[1.0,3.0],[2.0,3.0],[1.0,2.0]]"))

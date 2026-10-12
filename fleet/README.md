@@ -40,8 +40,15 @@ Options (each overrides `fleet.toml`):
 | `--baud 115200` | the mesh's SERIAL_SPEED |
 | `--wifi-port 14550` | UDP port to listen on. `--wifi-port NONE` switches WiFi off |
 | `--status-port 8098` | port for `GET /fleet` |
+| `--ocs-bridge 127.0.0.1:37564` | the rx_bridge vehicle link the OCS adapter dials (`[ocs] bridge`). `--ocs-bridge NONE` switches the adapter off (`/fleet` `ocs` then reads `enabled: false` with the reason) |
+| `--tunnel-dir run\tunnel` | folder for the tunnel log (`[tunnel_log] dir`, relative to `OCS\`). `--tunnel-dir NONE` switches the log off |
+| `--sim-boat HOST:PORT` | **simulation only, command line only**: mirror `rfd` to the WSL2 Crusader sim, whose replies are transmitted on the real radio. See *Sim boat on the radio* |
+| `--sim-boat-rx-only` | with `--sim-boat`: the sim only listens, its replies are dropped and counted |
 
 Stop it with ctrl-C (or ctrl-Break) in its window.
+
+The adapter expects `ocs_web` (which hosts the bridge) on `127.0.0.1:37564`. Not
+running is normal: it logs `not reachable yet` once and redials every 1-10 s.
 
 Tests, from `OCS\`, on the system Python (no hardware needed):
 
@@ -60,7 +67,8 @@ gets `14570`.
 | `drone_gui` | 14543 | `rfd`, all sysids | yes | `Drone/.../gcs_radio.py` (its default `--from` is `udpin:127.0.0.1:14543`) |
 | `drone_diag` | 14544 | `rfd`, all sysids | **no** (listen-only) | ad-hoc probes. Kept last on purpose |
 
-Status: `127.0.0.1:8098`.
+Status: `127.0.0.1:8098`. The OCS adapter is a TCP **client** of the bridge on
+`127.0.0.1:37564`, one connection per radio vehicle.
 
 `fleet_link` only ever **sends** to these ports, from one ephemeral source socket
 per output, and replies from that consumer arrive on that same socket — so every
@@ -137,6 +145,109 @@ with the boat's telemetry and make loops possible.
   frame on that link). The boat's unicast and broadcast copies come from two source
   ports; whichever copy won the dedup race is the reply address.
 
+## What fleet_link transmits on its own
+
+Two hub observers, both outside the routing path. Everything below is also visible in `/fleet`.
+
+* **The OCS adapter** (`ocs_adapter.py`, `[ocs]` in `fleet.toml`): translates between the RoboCommand
+  bridge and Ekko's RXL TUNNELs, from sysid 250 / compid 190 to the companion (200), on `rfd` only:
+  RoboCommand's commands, the course and the UAV geofence (repeated per message type), and an RXL ACK
+  for each INCIDENT_ACK / READINESS the bridge has taken. Nothing is keyed while neither Ekko sysid has
+  been heard on `rfd` for 30 s. Until Ekko sends its own RXL HEARTBEAT it also builds UAV1's
+  RoboCommand heartbeat from the autopilot's MAVLink — that costs no air. Wire format, policies and
+  every deviation from the catalogue: `docs/EKKO_RADIO_LINK.md`. It sends the autopilot
+  (sysid 1) two things. The first is `MAV_CMD_SET_MESSAGE_INTERVAL` for EXTENDED_SYS_STATE (245) at
+  1 Hz, because ArduCopter 4.7 puts that message in no stream group and the stand-in heartbeat's
+  flight phase comes from it. It asks only while the stand-in is the one speaking, only when the
+  message has not been heard for 10 s, and at most once per 10 s — the rule and interval of
+  `gcs_radio.py`'s `WANTED` list, so the two never fight over the rate. State and counts:
+  `ocs.vehicles.<id>.heartbeat.flight_state_request`; why no heartbeat is going out:
+  `...heartbeat.reason`; commands the radio could not carry (a `run_id` above 65535 ...):
+  `...downlink.refusals_by_reason` plus a WARNING in the console.
+  The second, only with `fence_upload = true` on the radio vehicle (on for UAV1 in the shipped
+  `fleet.toml`), is **the declared geofence as an ArduPilot inclusion fence** (`fence_upload.py`):
+  when `ocs_info.uav_geofence` arrives from the bridge, the adapter reads FENCE_TYPE / FENCE_ENABLE /
+  FENCE_AUTOENABLE (PARAM_REQUEST_READ — never a PARAM_SET), downloads the autopilot's fence, and if
+  it differs saves it to `run/fence/UAV1-fence-<UTC>.json` and writes the polygon over the mission
+  protocol (type FENCE), then reads it back and compares within 1 m. Only while the autopilot
+  reports disarmed; held while polygon fencing can engage and the aircraft is outside the polygon
+  (it would block arming, or breach on takeoff). Once per polygon per run; a fence changed later in
+  QGC is not fought. QGC shows it after **Plan view > Download**. State: `ocs.vehicles.<id>.fence_upload`
+  (it also carries the declared `polygon` and the `autopilot_shapes` last read back, which the OCS `/map` draws).
+  `fence_may_block_arming = true` (on for UAV1) writes it even over FENCE_ENABLE 1 with the aircraft outside:
+  the operator accepts that it will not arm there (`lockout` in the status says so). It never covers
+  FENCE_ENABLE 0 with auto-enable on, where the aircraft could still arm and meet the fence after takeoff.
+  Per course: the bridge sends the CURRENT course's fence, so a new course's fence replaces the old
+  one automatically; nothing is cleared when a run ends. With `fence_clear_without_course = true` (on
+  for UAV1), an `ocs_info` with `"course": null` (the bridge has heard no course since it started:
+  a bench without RoboCommand) clears the autopilot's fence after a 20 s grace -- disarmed only, the
+  old fence saved first, read back empty. A course whose fence the bridge refused leaves the old
+  fence in place. Once done, the fence is read back every 60 s while disarmed; a fence changed
+  behind the OCS's back is saved and the declared one put back. The adapter reports each result to
+  the bridge as an `ocs_fence` frame (docs/VEHICLE_LINK.md) -- the bridge declares no UAV run
+  without a fresh confirmation that the autopilot holds the declared fence.
+* **The tunnel log** (`tunnel_log.py`): every TUNNEL and every robotx-dialect (42xxx) frame, both
+  directions — received, transmitted (by an output or by the adapter, `origin` says which) and refused —
+  one JSON line each in `run/tunnel/<UTC>.jsonl`, one file per start, with the RXL fields decoded where
+  the payload is known. Nothing else is logged: the rest is in the drone's own flight log. File writes
+  happen on one writer thread behind a bounded buffer, so a stalled disk (OneDrive) costs log lines —
+  counted as `tunnel_log.queue_dropped` — never routing. A clean stop writes out everything queued; a
+  hard crash loses about a second.
+
+## Sim boat on the radio
+
+`--sim-boat HOST:PORT` puts a **simulated Crusader on the real radio**. HOST:PORT is the sim's radio
+port: `rxl_link_node` in the Gazebo sim, running in WSL2 on `udpin:0.0.0.0:14555`. It adds one
+output, named `sim_boat`, and nothing else changes. **Simulation only, never at competition**: it
+keys the real radio with a simulated vehicle's traffic.
+
+* **Forwards:** every frame heard on `rfd`, every sysid, the same byte-identical frames the other outputs
+  get, as UDP to HOST:PORT. Nothing from `wifi`.
+* **Replies key the radio:** pymavlink's `udpin` answers the sender's source address, which is this
+  output's socket. Those frames are transmitted on `rfd` by the ordinary reverse path, as a real boat's
+  radio would key the shared air: Ekko hears them. The route rule is unchanged (a frame aimed at a sysid
+  goes out only if that sysid was heard on `rfd` within 30 s, otherwise `no_route`; an untargeted frame
+  goes out). `--sim-boat-rx-only` makes it listen-only: replies are dropped and counted in
+  `dropped_listen_only`, like any listen-only output.
+* **Command line only.** It is not a `fleet.toml` key (a `[sim_boat]` table or an `[outputs.*] host` key
+  is refused, not ignored), so the competition config cannot carry it. Every config output stays loopback.
+* **Loud:** the first banner line reads `SIM BOAT: rfd -> HOST:PORT; its replies are KEYED ON THE REAL
+  RADIO` (`listen-only (its replies are dropped and counted)` with `--sim-boat-rx-only`), the 10-second
+  console line carries `SIM BOAT HOST:PORT KEYING rfd`, and `/fleet` lists `outputs.sim_boat` with `host`
+  and the usual counters (`frames_out`, `frames_in_from_consumer`, `dropped_listen_only`, `no_route`).
+* **Refused at start-up** (exit code 2, one line): HOST that is not an IPv4 literal or not a unicast
+  address (a name such as `localhost` too), a port outside 1-65535 or one fleet_link binds itself (14550
+  while WiFi is on), no `rfd` link or `rfd` switched off (`--serial NONE`), `--sim-boat-rx-only` without
+  `--sim-boat`.
+
+**HOST is the WSL VM's eth0 IPv4, not loopback**, and it changes whenever the VM restarts. The helper
+prints it (default distro `Ubuntu-22.04`, or `--distro NAME`; it starts the distro if it is stopped):
+
+```
+python -m fleet.wsl_ip
+```
+
+From the `OCS` directory in PowerShell, capture it and start the link:
+
+```
+$ip = python -m fleet.wsl_ip
+```
+
+```
+.\FLEET_LINK.cmd --sim-boat "${ip}:14555"
+```
+
+Write `${ip}`, not `$ip`: PowerShell reads `"$ip:14555"` as a variable in the scope `ip`. `FLEET_LINK.cmd`
+passes its arguments straight to `fleet_link`, but only on a fresh start: if `:8098` already answers it
+says so and the option is **not** applied, so stop the running one first. `OCS.cmd` passes its arguments
+to `ocs_web`, not here, so start `FLEET_LINK.cmd --sim-boat ...` first and `OCS.cmd` then finds it running.
+By hand: `python -m fleet.fleet_link --config fleet\fleet.toml --sim-boat "${ip}:14555"`.
+
+The output socket binds the Windows-side address that routes to HOST (the WSL virtual adapter), not
+`0.0.0.0`, so the port that can key the radio is not open on WiFi. If the sim hears the radio but its
+replies never appear in `frames_in_from_consumer`, look at Windows Firewall: it must let `python.exe`
+receive UDP on the WSL network. Not yet verified against the live sim.
+
 ## `GET /fleet`
 
 JSON, schema version 1. Blanks over guesses: a measured value older than
@@ -182,6 +293,7 @@ growing `age_s`: grey the marker, do not keep drawing its last point. Fetch
   },
   "outputs": {
     "qgc": {
+      "host": "127.0.0.1",             // loopback for every output but --sim-boat's
       "port": 14570, "reply_port": 50231,  // where it sends / where its replies arrive
       "links": ["wifi", "rfd"], "sysids": null,  // null = all
       "transmit": true,
@@ -217,6 +329,22 @@ growing `age_s`: grey the marker, do not keep drawing its last point. Fetch
         "groundspeed_mps": 5.0     // null with no fix
       }
     }
+  },
+  "ocs": {                         // {"enabled": false, "reason": "..."} when the adapter is off
+    "enabled": true, "bridge": "127.0.0.1:37564", "sysid": 250, "compid": 190,
+    "tx": { "frames": 0, "bytes": 0, "bytes_per_s": 0.0 },   // everything the adapter put on the air
+    "inbox_overflow": 0,
+    "vehicles": { "UAV1": { /* bridge, uplink, heartbeat (source, reason, flight_state_request),
+                               downlink (queue, acks, refusals_by_reason ...) --
+                               field by field in docs/EKKO_RADIO_LINK.md */ } },
+    "tunnel_log": { /* as below */ }
+  },
+  "tunnel_log": {                  // absent when the log is switched off
+    "path": "...\\run\\tunnel\\20261108T013000Z.jsonl", "open": true,
+    "lines": 0, "errors": 0, "last_error": null,
+    "dropped": 0,                  // lines lost while the file was down (reopened every 5 s)
+    "queued": 0, "queue_max": 4096,
+    "queue_dropped": 0             // lines refused because the writer fell behind
   }
 }
 ```
@@ -235,7 +363,10 @@ heartbeat shown is the autopilot's, so the mode does not flip between them.
 
 One summary line every 10 s, e.g.
 
-    19:09:05 fleet | wifi 1.4 kB/s | rfd 1.3 kB/s | 1 drone 0.2s, 200 drone 0.9s, 2 boat 0.1s | rfd bad_crc 3
+    19:09:05 fleet | wifi 1.4 kB/s | rfd 1.3 kB/s | 1 drone 0.2s, 200 drone 0.9s, 2 boat 0.1s | ocs UAV1 bridge up hb synthesized | rfd bad_crc 3
+
+`ocs <vehicle> bridge up|DOWN hb companion|synthesized|none` is the adapter; after `none` comes
+the reason no heartbeat is going out.
 
 Link state changes (`link rfd: DOWN - ...`, `link rfd: open`) are logged **once per
 change**. The radio is reopened every 5 s while its port is missing or busy.
@@ -246,7 +377,9 @@ Everything is tested on loopback, with a scripted fake serial port and pyserial'
 `loop://`. Not yet seen live: a real RFD900ux on COM8; the boat's MAVProxy actually
 unicasting and broadcasting to a laptop running this; QGC accepting a UDP link on
 14570 and sending through `fleet_link`; `gcs_radio.py` and `gcs_laptop.py` against
-the outputs.
+the outputs; the OCS adapter's TUNNELs reaching Ekko's companion through the Cube,
+SET_MESSAGE_INTERVAL actually putting EXTENDED_SYS_STATE on the radio, and the fence dialog
+against a real ArduCopter 4.7 over the RFD (tested against a fake ArduPilot only).
 
 ## Files
 
@@ -257,6 +390,10 @@ the outputs.
 | `hub.py` | routing core: dedup, fan-out, learned routes, listen-only — no sockets or threads |
 | `endpoints.py` | the transports: UDP link, serial link (one owner thread), output sockets |
 | `fleet_link.py` | config, CLI, `/fleet` server, console summary |
+| `ocs_adapter.py`, `ocs_translate.py`, `ocs_heartbeat.py`, `rxl_codec.py` | the OCS adapter: bridge connection and per-message repeat/ACK policy, JSON <-> RXL translation, the stand-in heartbeat, the RXL wire codec |
+| `fence_upload.py` | the declared geofence onto the autopilot: FENCE_* reads, download, backup, upload, read-back, the arming rules — a state machine, no threads |
+| `tunnel_log.py` | the TUNNEL / robotx-dialect JSONL log (writer thread) |
+| `wsl_ip.py` | prints the WSL VM's eth0 IPv4, the HOST for `--sim-boat` (stdlib only, not used by fleet_link) |
 | `fleet.toml` | the default configuration |
 | `tests/` | `unittest`, loopback only |
 | `..\FLEET_LINK.cmd` | launcher |

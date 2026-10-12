@@ -23,6 +23,12 @@ exactly what a real vehicle does -- so the bridge cannot tell the difference,
 which is the point. Nothing about it is safe to leave running during a scored
 run, so it is off unless --inject is passed, and the page shows a banner
 whenever it is on.
+
+BENCH AUTO IS THE SAME KIND OF EXCEPTION. --bench-auto USV1,UAV1 publishes
+STATE_AUTO for those vehicles' STATE_MANUAL heartbeats, so a run can be declared
+and started with the real vehicles disarmed on a bench (rx_bridge/benchauto.py).
+It is a command-line flag only, the pages carry a banner while it is on, and it
+must never be passed at competition.
 """
 from __future__ import annotations
 
@@ -39,6 +45,7 @@ from urllib.parse import urlsplit
 
 import paho.mqtt.client as mqtt
 
+from rx_bridge import benchauto
 from rx_bridge.bridge import Bridge
 from rx_bridge.config import ConfigError, load
 from rx_bridge.proto import common_pb2, rx_common_pb2, rx_reports_pb2
@@ -274,6 +281,13 @@ def main(argv=None) -> int:
     ap.add_argument("--inject", action="store_true",
                     help="enable the fake-data buttons. Testing only -- the "
                          "page shows a banner while this is on.")
+    ap.add_argument("--bench-auto", default=None, metavar="VEHICLES",
+                    help="BENCH DRY RUN: publish STATE_AUTO for these "
+                         "comma-separated vehicle ids (e.g. USV1,UAV1) whenever "
+                         "they report STATE_MANUAL, so RoboCommand starts the "
+                         "run with the vehicles disarmed. STATE_KILLED is never "
+                         "touched. Testing only -- never at competition; the "
+                         "pages show a banner while this is on.")
     ap.add_argument("--local-broker", nargs="?", const=11883, type=int,
                     default=None, metavar="PORT",
                     help="run an in-process MQTT broker for the TEAM side on "
@@ -299,6 +313,13 @@ def main(argv=None) -> int:
         print("config: %s" % exc, file=sys.stderr)
         return 2
 
+    try:
+        bench_auto = (benchauto.resolve(args.bench_auto, cfg.vehicle_ids)
+                      if args.bench_auto is not None else ())
+    except ValueError as exc:
+        print("--bench-auto: %s" % exc, file=sys.stderr)
+        return 2
+
     logs: list[str] = []
 
     def log(m):
@@ -314,7 +335,7 @@ def main(argv=None) -> int:
                                         port=args.local_broker))
         _start_local_broker(cfg.team.host, cfg.team.port, log)
 
-    bridge = Bridge(cfg, log=log)
+    bridge = Bridge(cfg, log=log, bench_auto=bench_auto)
     bridge.start()
 
     injector = Injector(cfg) if args.inject else None

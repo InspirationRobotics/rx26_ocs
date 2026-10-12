@@ -13,8 +13,11 @@ Every socket here is on 127.0.0.1 with an OS-chosen port. Nothing binds 14550,
 """
 from __future__ import annotations
 
+import base64
 import http.client
+import importlib.util
 import json
+import re
 import socket
 import sys
 import tempfile
@@ -29,6 +32,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ocs_web import maproutes  # noqa: E402
 
 VENDOR = Path(maproutes.HERE) / "vendor" / "leaflet"
+STATIC = Path(maproutes.HERE) / "static"
+
+#: (the route, the file under ocs_web/static/, its Content-Type, the first bytes of a real one)
+LOGOS = (("/static/ti_logo.jpg", "ti_logo.jpg", "image/jpeg", b"\xff\xd8\xff"),
+         ("/static/asta_logo.png", "asta_logo.png", "image/png", b"\x89PNG\r\n\x1a\n"))
+#: The drone GUI embeds the same two images as data: URIs; present when the monorepo is checked out.
+DRONE_LOGOS = (Path(__file__).resolve().parents[2] / "Drone" / "rx26_uav" / "uav_groundstation"
+               / "uav_groundstation" / "team_logos.py")
 
 # Nothing listening: Linux refuses at once; Windows retries the SYN for ~2 s,
 # so inside the 0.7 s budget it surfaces as a connect timeout instead.
@@ -126,6 +137,36 @@ class TestRoute(StubTestCase):
                      "/vendor/leaflet/leaflet.js/", "/vendor/leaflet/LEAFLET.JS",
                      "/vendor/leaflet/images/layers.png"):
             self.assertIsNone(self.route(path), path)
+
+    def test_team_logos_exact_bytes_types_and_magic(self):
+        for path, name, ctype, magic in LOGOS:
+            with self.subTest(path):
+                code, body, got_type = self.route(path)
+                self.assertEqual((code, got_type), (200, ctype))
+                self.assertEqual(body, (STATIC / name).read_bytes())
+                self.assertTrue(body.startswith(magic), body[:8])
+                self.assertGreater(len(body), 1000)
+
+    def test_team_logos_are_a_whitelist_not_a_directory(self):
+        self.assertEqual({p for p in maproutes._VENDOR if p.startswith("/static")},
+                         {path for path, *_ in LOGOS})
+        for path in ("/static/", "/static", "/static/ti_logo.jpg/", "/static/TI_LOGO.JPG",
+                     "/static/ti_logo.jpeg", "/static/asta_logo.png.bak", "/static/nope.png",
+                     "/static/../server.py", "/static/%2e%2e/server.py", "/static/%74i_logo.jpg",
+                     "/static//ti_logo.jpg", "/static/asta_logo.png/../ti_logo.jpg"):
+            self.assertIsNone(self.route(path), path)
+
+    @unittest.skipUnless(DRONE_LOGOS.is_file(), "the drone GUI's team_logos.py is not checked out beside the OCS")
+    def test_team_logos_are_the_drones_images_byte_for_byte(self):
+        spec = importlib.util.spec_from_file_location("drone_team_logos", DRONE_LOGOS)
+        drone = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(drone)
+        self.assertEqual(len(drone.LOGOS), len(LOGOS))
+        for (name, uri), (path, fname, ctype, _magic) in zip(drone.LOGOS, LOGOS):
+            with self.subTest(name):
+                head, _, payload = uri.partition(",")
+                self.assertEqual(head, "data:%s;base64" % ctype)
+                self.assertEqual((STATIC / fname).read_bytes(), base64.b64decode(payload))
 
     def test_unrelated_paths_are_not_claimed(self):
         for path in ("/", "/index.html", "/api/state", "/nope", "/mapx"):
@@ -295,6 +336,16 @@ class TestRealHandler(StubTestCase):
         code, ctype, _ = self.get("/vendor/leaflet/leaflet.css")
         self.assertEqual((code, ctype), (200, "text/css; charset=utf-8"))
 
+    def test_team_logos_are_served_by_the_real_server(self):
+        for path, name, ctype, magic in LOGOS:
+            with self.subTest(path):
+                code, got_type, body = self.get(path)
+                self.assertEqual((code, got_type), (200, ctype))
+                self.assertEqual(body, (STATIC / name).read_bytes())
+                self.assertTrue(body.startswith(magic))
+        for path in ("/static/", "/static/nope.png", "/static/../server.py"):
+            self.assertEqual(self.get(path)[0], 404, path)
+
     def test_unknown_vendor_path_is_404(self):
         for path in ("/vendor/leaflet/LICENSE", "/vendor/leaflet/",
                      "/vendor/leaflet/../../server.py", "/vendor/nope.js"):
@@ -327,6 +378,55 @@ class TestRealHandler(StubTestCase):
         self.assertIn(b'id="fleet"', body)
         self.assertEqual(self.get("/index.html")[0], 200)
         self.assertEqual(self.get("/nope")[0], 404)
+
+
+class TestPagesCarryTheLogos(unittest.TestCase):
+    """Both operator pages put the two logos first in their header, on a white badge, from the whitelist."""
+
+    #: (file, the header's opening tag, the rule that lays the header out)
+    PAGES = (("index.html", '<div class="top">', r"\.top \{[^}]*\}"),
+             ("map.html", '<div id="top">', r"#top \{[^}]*\}"))
+
+    def page(self, name):
+        return (Path(maproutes.HERE) / name).read_text(encoding="utf-8")
+
+    def test_the_logos_are_the_first_thing_in_the_header(self):
+        for name, header, _rule in self.PAGES:
+            with self.subTest(name):
+                text = self.page(name)
+                self.assertEqual(text.count(header), 1)
+                self.assertEqual(text.count('<div class="logos">'), 1)
+                start = text.index(header) + len(header)
+                self.assertRegex(text[start:], r'\A\s*<div class="logos">')
+                self.assertLess(text.index('<div class="logos">'), text.index("<h1>"))
+                logos = text[start:text.index("</div>", start)]
+                self.assertEqual(re.findall(r'<img src="([^"]+)"', logos), [path for path, *_ in LOGOS])
+                self.assertIn('alt="Team Inspiration" title="Team Inspiration"', logos)
+                self.assertIn('alt="Advancing Science, Technology &amp; Art" '
+                              'title="Advancing Science, Technology &amp; Art"', logos)
+
+    def test_every_image_the_pages_ask_for_is_a_whitelisted_route(self):
+        cfg = maproutes.build_map_config(None, maproutes.DEFAULT_FLEET_URL)
+        for name, *_ in self.PAGES:
+            for src in re.findall(r'src="(/static/[^"]+)"', self.page(name)):
+                with self.subTest(name + " " + src):
+                    hit = maproutes.route(src, fleet_url=maproutes.DEFAULT_FLEET_URL, map_cfg=cfg)
+                    self.assertIsNotNone(hit)
+                    self.assertEqual(hit[0], 200)
+
+    def test_the_badge_is_white_in_both_themes_and_the_header_still_wraps(self):
+        for name, _header, rule in self.PAGES:
+            with self.subTest(name):
+                text = self.page(name)
+                self.assertEqual(text.count("--logo-bg:#ffffff"), 2)         # night and day, both white
+                self.assertRegex(text, r":root \{[^}]*--logo-bg:#ffffff")
+                self.assertRegex(text, r'html\[data-theme="day"\] \{[^}]*--logo-bg:#ffffff')
+                badge = re.search(r"\.logos \{[^}]*\}", text).group(0)
+                self.assertIn("background:var(--logo-bg)", badge)
+                self.assertIn("flex:none", badge)
+                self.assertRegex(text, r"\.logos img \{[^}]*height:26px")
+                # What keeps 320 px from overflowing: the header wraps its items, the logos do not shrink.
+                self.assertIn("flex-wrap:wrap", re.search(rule, text).group(0))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,7 @@
 # Windows launchers: cmd.exe mis-jumps to labels in LF-only batch files.
 *.cmd   text eol=crlf
 *.bat   text eol=crlf
+
+# The team logos: never let line-ending conversion touch image bytes.
+*.jpg binary
+*.png binary

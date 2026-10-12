@@ -22,6 +22,7 @@ WINDOWS TRAPS HANDLED HERE
 from __future__ import annotations
 
 import errno
+import ipaddress
 import logging
 import queue
 import socket
@@ -297,23 +298,57 @@ class DisabledLinkIO(LinkIO):
         return False
 
 
+def local_address_toward(host: str, port: int) -> str:
+    """The local address the OS would send from to reach host:port. A UDP connect()
+    transmits nothing, it only consults the routing table. Raises OSError when there
+    is no route."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((host, port))
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class UdpOutputIO(_Threaded, OutputIO):
     """One consumer port. Frames go to host:port from this socket's own ephemeral
     source port; whatever the consumer sends back arrives on this same socket, so
-    each consumer's replies are attributable to its output."""
+    each consumer's replies are attributable to its output.
+
+    `host` is loopback for every output in fleet.toml. The one exception is
+    `--sim-boat` (fleet_link.py), a simulated boat in WSL2: the socket then binds the
+    local address that routes to it -- a socket bound to 127.0.0.1 cannot send to any
+    other host, and a wildcard bind would leave the port that can key the radio open
+    on every interface, WiFi included."""
 
     def __init__(self, name: str, port: int, host: str = LOOPBACK):
         super().__init__(name)
         self.host = host
         self.port = port
+        self.local_host: Optional[str] = None      # where replies arrive, once open
         self._sock: Optional[socket.socket] = None
+
+    def _bind_address(self) -> str:
+        if _is_loopback(self.host):
+            return self.host
+        try:
+            return local_address_toward(self.host, self.port)
+        except OSError as e:
+            raise OSError("no route to %s: %s" % (self.host, e)) from e
 
     def open(self) -> None:
         try:
-            self._sock = _bind_udp(self.host, 0)
+            self._sock = _bind_udp(self._bind_address(), 0)
         except OSError as e:
             raise EndpointError("cannot open a socket for output %s: %s" % (self.name, e)) from e
-        self.local_port = self._sock.getsockname()[1]
+        self.local_host, self.local_port = self._sock.getsockname()[:2]
 
     def _release(self) -> None:
         if self._sock is not None:

@@ -39,16 +39,25 @@ page; without it they are gone and the endpoint returns 403. `--local-broker`
 defaults to **11883, not 1883** — Windows reserves 1883 in the Hyper-V range and
 the bind fails with `WinError 10013`.
 
-Ports: **37564** vehicle link · **8099** the page · **11883** dev broker.
+`--bench-auto USV1,UAV1` is the bench dry run: those vehicles' `STATE_MANUAL`
+heartbeats are published as `STATE_AUTO`, so RoboCommand starts a run with the
+vehicles disarmed. Command line only, orange banner on both pages, never at
+competition — `docs/TESTING.md` "Bench dry run".
 
-## Before you commit — four gates, in order
+Ports: **37564** vehicle link (TCP) · **37565** discovery beacon (UDP, OCS to the boat, broadcast — never on the course network; `docs/VEHICLE_LINK.md` "Discovery") · **8099** the page · **11883** dev broker.
+
+## Before you commit — five gates, in order
 
 | | Command | Expect |
 |---|---|---|
-| 1 | `python -m unittest discover -s tests -t .` | `Ran 121 tests`, `OK` |
-| 2 | `python bench_stage1.py` | `21/21` — the RoboCommand sequence, over MQTT |
-| 3 | `python bench_stage2.py` | `16/16` — the TCP vehicle link |
-| 4 | `python bench_stage3.py` | `21/21` — the two-vehicle Proof of Readiness rehearsal |
+| 1 | `.venv\Scripts\python.exe -m unittest discover -s tests -t .` | `Ran 450 tests`, `OK` |
+| 2 | `python -m unittest discover -s fleet/tests -t .` — **system** python | `Ran 522 tests`, `OK` — fleet_link, the radio adapter, the RXL codec, the fence upload, `--sim-boat` |
+| 3 | `python bench_stage1.py` | `21/21` — the RoboCommand sequence, over MQTT |
+| 4 | `python bench_stage2.py` | `16/16` — the TCP vehicle link |
+| 5 | `python bench_stage3.py` | `24/24` — the two-vehicle Proof of Readiness rehearsal, with the UAV fence handshake |
+
+Gates 1 and 3-5 run on `.venv`; gate 2 needs `pymavlink` and `pyserial`, which
+live only in the system Python 3.13.
 
 Stages 2 and 3 **import the boat's own `ocs_link.py`** out of `../Boat/rx26_asv`
 rather than a stand-in. That is the point: the frame format is duplicated across
@@ -61,8 +70,8 @@ Procedure, level by level: `docs/TESTING.md`.
 
 ## The hot path, and why it is in that order
 
-    vehicle report → staleness → governor → validate → sequence number
-                   → re-stamp sent_at from OUR clock → publish
+    vehicle report → [TCP] link preference → staleness → governor → validate
+                   → sequence number → re-stamp sent_at from OUR clock → publish
 
 Two orderings are load-bearing. **The governor runs before the sequence number**,
 so a dropped frame does not burn a seq and leave a hole that looks like a lost
@@ -72,6 +81,11 @@ timestamp survives only as the staleness measurement.
 
 Everything after the transport is deliberately transport-agnostic. That is why
 adding the TCP link did not touch `governor.py`, `seqstore.py` or `validate.py`.
+The one transport-aware rule, **the link preference**, runs first for the
+governor's reason: Ekko can be on the radio and WiFi at once, and a duplicate
+must neither reach the governor (a doubled rate) nor take a seq. It is per
+report kind — real beats synthesized, then `prefer`, and a kind only one link
+carries is never dropped. `docs/VEHICLE_LINK.md`.
 
 ## Never invent a value
 
@@ -123,12 +137,19 @@ newer robocommand revision, and read the diff when you do.
 | `rx_bridge/bridge.py` | the two connections and the rules between them |
 | `rx_bridge/runstate.py` | the run state machine — no I/O, all of the ordering rules |
 | `rx_bridge/active.py` | which vehicles go into the declaration |
-| `rx_bridge/framing.py` | the vehicle link's frame boundaries — **mirrored in `rx26_asv`** |
+| `rx_bridge/geofence.py` | the UAV geofence for the course in hand (`[[geofence.course]]` table, else the boundary inset by `[geofence] boundary_margin_m`) and the gate that refuses to declare a UAV whose autopilot has not been read back holding it (`ocs_fence`, `docs/VEHICLE_LINK.md`) — pure |
+| `rx_bridge/framing.py` | the vehicle link's frame boundaries — **mirrored in both vehicles' `ocs_link.py`** |
+| `rx_bridge/beacon.py` | the discovery beacon: which laptop addresses it broadcasts from (never loopback, link-local, a `never_on` subnet or the RoboCommand broker's /24), and what the boat does with it — pure build/parse/filter plus the sender thread the bridge starts with the TCP server |
+| `rx_bridge/linkpolicy.py` | which of a vehicle's two links the OCS listens to (per kind) and talks on (one, never both) — pure |
 | `rx_bridge/validate.py` | the NaN and UNKNOWN nets |
-| `ocs_web/` | the operator page, and `/map` — the fleet map (Leaflet vendored in `ocs_web/vendor/`, routes in `maproutes.py`; `--fleet-url` points its `/api/fleet` proxy at fleet_link) |
-| `fleet/` | `fleet_link`: owns the laptop's two MAVLink inputs (WiFi UDP 14550, RFD900ux COM8) and fans them out to loopback consumers; `GET 127.0.0.1:8098/fleet`. **System python, not `.venv`**; start with `FLEET_LINK.cmd`; see `fleet/README.md` |
-| `bridge.toml` | the fleet, the brokers, the tiers, the geofence |
-| `docs/` | testing procedure, the message contract, open questions for RoboNation |
+| `rx_bridge/benchauto.py` | the `--bench-auto` rewrite (MANUAL to AUTO, listed vehicles only, never KILLED) — the one deliberate exception to "never invent a value" |
+| `ocs_web/` | the operator page, and `/map` — the fleet map (Leaflet vendored in `ocs_web/vendor/`, routes in `maproutes.py`; `--fleet-url` points its `/api/fleet` proxy at fleet_link). The map also draws the course (RoboCommand), the declared UAV geofence and the fence Ekko's autopilot holds (read back by fleet_link), with a Geofence panel |
+| `fleet/` | `fleet_link`: owns the laptop's two MAVLink inputs (WiFi UDP 14550, RFD900ux COM8) and fans them out to loopback consumers; `GET 127.0.0.1:8098/fleet`. Also the **OCS adapter** (`ocs_adapter.py`: Ekko's RXL TUNNELs ⇄ the bridge, as MAVLink **sysid 250**), which also **writes the declared geofence to Ekko's autopilot** (`fence_upload.py`, `fence_upload = true`; disarmed only, old fence saved to `run/fence/`), and the **tunnel log** (`run/tunnel/*.jsonl`). `--sim-boat HOST:PORT` (simulation only, command line only, never at competition) mirrors `rfd` to the WSL2 Crusader sim and transmits its replies on the real radio. **System python, not `.venv`**; start with `FLEET_LINK.cmd`; see `fleet/README.md` |
+| `bridge.toml` | the fleet, the brokers, the tiers, the geofence, `prefer` and `link_prefer_s` |
+| `docs/VEHICLE_LINK.md` | the TCP 37564 contract: framing, `ocs_hello`, the link preference, `ocs_info`, the ReadinessConfirm rewrite |
+| `docs/EKKO_RADIO_LINK.md` | the radio side: every RXL message and byte, repeat/ACK policies, the stand-in heartbeat, every deviation from the catalogue |
+| `docs/VEHICLE_SIDE_PROPOSAL.md` | what the boat and Ekko would have to change — a proposal, nothing applied |
+| `docs/` | also: testing procedure, the message contract, open questions for RoboNation |
 
 ## Still open
 

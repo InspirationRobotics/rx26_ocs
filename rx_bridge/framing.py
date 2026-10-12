@@ -10,7 +10,7 @@ telemetry to lie.
 So every message on the vehicle link is:
 
     4 bytes   big-endian unsigned length N
-    N bytes   the protobuf payload
+    N bytes   the payload: UTF-8 JSON (an RxReport, an ocs_hello, or a downlink frame)
 
 THIS FORMAT IS DUPLICATED IN THE VEHICLE REPO. `crusader_groundstation/
 ocs_client.py` in rx26_asv carries the same two pieces of logic, deliberately

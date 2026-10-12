@@ -21,7 +21,7 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
     --go-bg:#183a26;   --go-line:#2f6b45;   --go-fg:#7fe0a4;
     --stop-bg:#3a1a1e; --stop-line:#6b2f35; --stop-fg:#ff9aa2;
     --banner-bg:#4a2410; --banner-line:#8a4a1a; --banner-fg:#ffb877;
-    --link:#7fb4ff; }
+    --link:#7fb4ff; --logo-bg:#ffffff; }
   html[data-theme="day"] { color-scheme: light;
     --bg:#ffffff; --fg:#0b0e12; --h1:#14496e; --h2:#3f4a55;
     --card:#eef1f4; --card-line:#8d99a6; --muted:#5a6672; --pre:#1f2a35;
@@ -31,10 +31,14 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
     --go-bg:#cfeedb;   --go-line:#0a6b2e;   --go-fg:#0a6b2e;
     --stop-bg:#f8d7d9; --stop-line:#a50f16; --stop-fg:#8c1015;
     --banner-bg:#ffd9b8; --banner-line:#a34a00; --banner-fg:#5c2600;
-    --link:#0b4f9a; }
+    --link:#0b4f9a; --logo-bg:#ffffff; }
   body { background:var(--bg); color:var(--fg); font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;
          margin:0; padding:14px 18px; }
   .top { display:flex; align-items:center; flex-wrap:wrap; gap:6px 14px; margin:0 0 10px }
+  /* The team's logos (dark line art): a white badge in BOTH themes, as on the boat and drone GUIs. */
+  .logos { display:flex; align-items:center; gap:6px; flex:none; background:var(--logo-bg);
+           border:1px solid var(--card-line); border-radius:6px; padding:2px 6px }
+  .logos img { height:26px; width:auto; display:block }
   h1 { font-size:15px; margin:0; letter-spacing:.08em; text-transform:uppercase; color:var(--h1) }
   .nav a { color:var(--link); text-decoration:none } .nav b { color:var(--fg) }
   h2 { font-size:12px; margin:18px 0 6px; letter-spacing:.08em; text-transform:uppercase; color:var(--h2) }
@@ -54,7 +58,7 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
   button:hover { background:var(--btn-hi) }
   button.go { border-color:var(--go-line); background:var(--go-bg); color:var(--go-fg) }
   button.stop { border-color:var(--stop-line); background:var(--stop-bg); color:var(--stop-fg) }
-  #banner { background:var(--banner-bg); border:1px solid var(--banner-line); color:var(--banner-fg);
+  #banner, #benchbanner { background:var(--banner-bg); border:1px solid var(--banner-line); color:var(--banner-fg);
             padding:6px 12px; border-radius:5px; margin-bottom:12px; display:none }
   pre { margin:0; max-height:150px; overflow:auto; color:var(--pre); font-size:12px }
   .muted { color:var(--muted) }
@@ -63,8 +67,10 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
 </style>
 
 <div id="banner">⚠ FAKE DATA INJECTION IS ENABLED — this OCS can publish heartbeats no vehicle sent.</div>
+<div id="benchbanner"></div>
 
 <div class="top">
+  <div class="logos"><img src="/static/ti_logo.jpg" alt="Team Inspiration" title="Team Inspiration" width="73" height="96"><img src="/static/asta_logo.png" alt="Advancing Science, Technology &amp; Art" title="Advancing Science, Technology &amp; Art" width="87" height="96"></div>
   <h1>OCS · <span id="team">…</span></h1>
   <span class="nav"><b>/</b> ↔ <a href="/map">/map</a></span>
   <button id="theme"></button>
@@ -75,22 +81,28 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
     <table>
       <tr><th>RoboCommand</th><td id="link-rc">—</td></tr>
       <tr><th>Team broker</th><td id="link-team">—</td></tr>
+      <tr><th title="UDP broadcast that tells the vehicles where this OCS is">Beacon</th>
+          <td id="link-beacon" style="white-space:normal; max-width:46ch">—</td></tr>
       <tr><th>Run</th><td id="run">—</td></tr>
       <tr><th>Course</th><td id="course">—</td></tr>
+      <tr><th title="the UAV geofence for this course, and whether each aircraft's autopilot was read back holding it">UAV fence</th>
+          <td id="uavfence" style="white-space:normal; max-width:46ch">—</td></tr>
     </table>
     <div style="margin-top:10px; display:flex; gap:8px">
       <button class="go" onclick="post('/api/declare')">Declare run</button>
       <button class="stop" onclick="post('/api/end')">End run</button>
     </div>
     <div id="activecount" class="muted" style="margin-top:6px"></div>
+    <div id="declblock" style="margin-top:6px; white-space:normal; max-width:46ch"></div>
     <div id="action" class="muted" style="margin-top:6px"></div>
   </div>
 
   <div class="card grow">
     <table>
       <tr><th>forwarded</th><th>rate</th><th>invalid</th><th>mistyped</th>
+          <th title="a copy another link had already delivered">not pref.</th>
           <th>stale</th><th>cmds</th><th>undeliv.</th></tr>
-      <tr id="counters"><td colspan="7" class="muted">—</td></tr>
+      <tr id="counters"><td colspan="8" class="muted">—</td></tr>
     </table>
   </div>
 </div>
@@ -157,6 +169,61 @@ function inject(vid, mode, on, fault) {
   post('/api/inject', {vehicle: vid, mode: mode, on: on, fault: fault || ''});
 }
 
+// A vehicle's hello can name its agent, and that string reaches innerHTML below.
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+
+// One link, three facts that must not be mistaken for one another: the socket
+// is up, something has been RELAYED on it (a hello is not a report), and that
+// was recent. An adapter -- the laptop-side radio bridge -- is up whether or not
+// the vehicle behind it is alive, so its socket alone proves nothing about the
+// vehicle: until it has relayed a report the line says so, in grey, like
+// "never heard".
+function linkState(l) {
+  const age = l.last_report_age_s;
+  if (age === null || age === undefined)
+    return l.adapter ? pill('idle', 'adapter up, vehicle silent')
+                     : pill('idle', 'connected, nothing reported');
+  const secs = age.toFixed(1) + ' s';
+  if (l.fresh) return pill('ok', 'fresh ' + secs);
+  return pill('warn', (l.adapter ? 'adapter up, vehicle silent ' : 'silent ') + secs);
+}
+
+// radio / wifi, in the snapshot's order. "active" is where a command would go
+// right now; "preferred" is the bridge.toml choice. Each can be a link that is
+// not connected, which is exactly when the difference matters.
+function linkLine(v, name) {
+  const l = (v.links || {})[name];
+  const tags = [];
+  if (v.prefer === name) tags.push(pill('idle', 'preferred'));
+  if (l && v.active_link === name) tags.push(pill('ok', 'active'));
+  if (!l) return `<div><b>${name}</b> <span class="muted">not connected</span> ${tags.join(' ')}</div>`;
+  // An adapter's own address is the laptop's loopback; the label names what it is.
+  const who = l.adapter ? `<b>${esc(l.label)}</b>`
+                        : `<b>${name}</b> <span class="muted">${esc(l.peer)}</span>`;
+  const synth = (l.synthesized || []).length
+    ? ` <span class="muted">synthesizes ${l.synthesized.map(esc).join(', ')}</span>` : '';
+  return `<div>${who} ${linkState(l)} ${tags.join(' ')}${synth}</div>`;
+}
+
+function linksCell(v) {
+  const names = Object.keys(v.links || {});
+  const lines = names.map(n => linkLine(v, n)).join('');
+  const connected = names.some(n => v.links[n]);
+  // No socket at all: say how it last reported, if it ever did (mqtt in a bench).
+  return lines + (!connected && v.link ? `<div class="muted">last report via ${esc(v.link)}</div>` : '');
+}
+
+// Reports dropped because another link had just delivered the same kind and
+// outranked this one (real over synthesized, then the preferred link).
+function dropsCell(v) {
+  const n = v.dropped_not_preferred || 0;
+  if (!n) return '<span class="muted">0</span>';
+  const kinds = Object.entries(v.dropped_not_preferred_by_kind || {})
+    .map(([k, c]) => `${esc(k)} ${c}`).join(', ');
+  return `${n} <span class="muted">${kinds}</span>`;
+}
+
 function vehicleCard(v, streaming, injectOn) {
   const hb = (v.report && v.report.heartbeat) || {};
   const silent = v.silent_s;
@@ -186,7 +253,9 @@ function vehicleCard(v, streaming, injectOn) {
     <div>${activeBox(v)} <b>${v.id}</b> <span class="muted">${v.type.replace('TYPE_','')}</span>
          ${v.relay_via ? `<span class="muted">via ${v.relay_via}</span>`:''} ${health}</div>
     <table style="margin-top:6px">
-      <tr><th>link</th><td>${v.link ? (v.peer ? v.link+' <span class="muted">'+v.peer+'</span>' : v.link) : '—'}</td></tr>
+      <tr><th>links</th><td style="white-space:normal">${linksCell(v)}</td></tr>
+      ${v.prefer || v.dropped_not_preferred
+        ? `<tr><th title="a copy another link had already delivered">not pref.</th><td>${dropsCell(v)}</td></tr>` : ''}
       <tr><th>published</th><td>${rateCell(v)}</td></tr>
       <tr><th>state</th><td>${hb.state || '—'}</td></tr>
       <tr><th>task</th><td>${hb.current_task || '—'}</td></tr>
@@ -205,6 +274,62 @@ function vehicleCard(v, streaming, injectOn) {
 
 function fmt(x) { return (x === undefined || x === null) ? '—' : Number(x).toFixed(1); }
 
+// The discovery beacon: which of this laptop's addresses the vehicles are being
+// told about. The skipped list matters as much as the sending one -- the course
+// network showing up there with its reason is the proof it is not being spoken on.
+function beaconCell(b) {
+  if (!b || !b.enabled)
+    return pill('idle', 'off') + ` <span class="muted">${esc((b && b.why) || '')}</span>`;
+  const on = b.sending_on || [];
+  let out = on.length
+    ? pill('ok', 'broadcasting') + ` <span class="muted">UDP ${b.port} from ${on.map(esc).join(', ')}</span>`
+    : pill('warn', 'no address') + ' <span class="muted">nothing eligible to broadcast from</span>';
+  if (b.errors)
+    out += ` ${pill('bad', b.errors + ' error' + (b.errors > 1 ? 's' : ''))} `
+         + `<span class="muted">${esc(b.last_error || '')}</span>`;
+  const skipped = (b.skipped || []).map(x => `${esc(x.addr)} (${esc(x.why)})`);
+  if (skipped.length) out += `<div class="muted">not from: ${skipped.join('; ')}</div>`;
+  return out;
+}
+
+// One aircraft's confirmation (`ocs_fence`, as the radio adapter sent it) against the fence
+// this OCS holds for the course. The gate that decides whether Ekko can be declared is in the
+// bridge (the reason is shown under the buttons); this line is the evidence it is judging.
+// "cleared" is a verified EMPTY polygon: the autopilot's fence was removed and read back
+// empty, which is what the adapter does when this OCS has no course at all.
+function confirmLine(v, c, maxAge) {
+  const name = `<b>${esc(v.id)}</b> `;
+  if (!c) return name + pill('idle', 'no confirmation yet');
+  const age = (c.age_s === null || c.age_s === undefined) ? null : c.age_s;
+  let tag;
+  if (!c.verified) tag = pill('warn', 'not verified');
+  else if (Array.isArray(c.polygon) && c.polygon.length === 0) tag = pill('idle', 'cleared');
+  else if (!c.matches_course_fence) tag = pill('warn', 'holds another polygon');
+  else if (age === null || age > maxAge) tag = pill('bad', 'stale');
+  else tag = pill('ok', 'confirmed');
+  const n = Array.isArray(c.polygon) && c.polygon.length ? `, ${c.polygon.length} vertices` : '';
+  return name + tag + ` <span class="muted">${esc(c.state || '—')}${n}, `
+    + (age === null ? 'age unknown' : Math.round(age) + ' s ago') + `</span>`
+    + (c.lockout ? ` ${pill('warn', 'will not arm here')}<div class="muted">${esc(c.lockout)}</div>` : '')
+    + (!c.verified && c.reason ? `<div class="muted">${esc(c.reason)}</div>` : '');
+}
+
+// The UAV geofence for the CURRENT course: where it came from and how many vertices -- or, when
+// there is none, why. With a course held and no fence the badge is red: the aircraft keeps whatever
+// fence it already has, so that case must not read as quiet.
+function fenceCell(s) {
+  const f = s.uav_geofence;
+  const held = !!(s.course && s.course.course_id);
+  let out = (f && f.length)
+    ? `<b>${esc(s.uav_geofence_source || '?')}</b> <span class="muted">${f.length - 1} vertices</span>`
+    : pill(held ? 'bad' : 'idle', 'none') + ` <span class="muted">${esc(s.uav_geofence_reason || '')}</span>`;
+  const max = s.fence_confirm_max_age_s || 180;
+  (s.vehicles || []).filter(v => v.type === 'TYPE_UAV').forEach(v => {
+    out += `<div>${confirmLine(v, (s.fence_confirm || {})[v.id], max)}</div>`;
+  });
+  return out;
+}
+
 async function refresh() {
   let s;
   try { s = await (await fetch('/api/state')).json(); }
@@ -216,6 +341,7 @@ async function refresh() {
     + ` <span class="muted">${ep.robocommand||''}</span>`;
   $('link-team').innerHTML = (s.links.team ? pill('ok','connected') : pill('bad','DOWN'))
     + ` <span class="muted">${ep.team||''}</span>`;
+  $('link-beacon').innerHTML = beaconCell(s.beacon);
 
   const r = s.run;
   $('run').innerHTML = pill(r.state==='RUNNING'?'ok':(r.state==='DECLARED'?'warn':'idle'), r.state)
@@ -230,7 +356,8 @@ async function refresh() {
     // Advisory, never blocking -- their frame is authoritative even when it
     // is odd. But the operator must not declare against a course we misread.
     + (cf.length ? ` ${pill('bad','suspect')}<div class="muted" style="margin-top:4px">`
-                   + cf.map(x=>`&bull; ${x}`).join('<br>') + '</div>' : '');
+                   + cf.map(x=>`&bull; ${esc(x)}`).join('<br>') + '</div>' : '');
+  $('uavfence').innerHTML = fenceCell(s);
 
   // RoboCommand holds RunStart until EVERY declared vehicle reports
   // STATE_AUTO -- with no timeout and no error, so naming the laggard is the
@@ -238,18 +365,27 @@ async function refresh() {
   // Below the handbook's floor the declaration cannot be made at all, so
   // say why on the button rather than letting it fail on click.
   const act = s.active || [], need = s.por_min_vehicles || 2;
+  // The bridge decides (run.may_declare is its whole verdict: state, the floor, and the UAV
+  // fence gate) and says why in words (run.declare_blocker). The endpoint refuses on its own,
+  // so this is the operator's explanation, not the safeguard.
+  const blocked = s.run.declare_blocker;
   const decl = document.querySelector('button.go');
   if (decl) {
     const ok = act.length >= need && (s.run.may_declare !== false);
     decl.disabled = !ok;
-    decl.title = act.length < need
-      ? `need at least ${need} active vehicles, have ${act.length}`
+    decl.title = blocked ? blocked
+      : act.length < need ? `need at least ${need} active vehicles, have ${act.length}`
       : `declare ${act.join(', ')}`;
   }
   $('activecount').innerHTML = act.length
     ? `${act.length} active: <b>${act.join(', ')}</b>`
       + (act.length < need ? ` ${pill('bad','need '+need)}` : '')
     : pill('bad','no active vehicles');
+  // The floor has its own pill above and the run state its own line; what is left is the
+  // reason that would otherwise be a disabled button with no explanation.
+  $('declblock').innerHTML = (blocked && act.length >= need && r.state !== 'DECLARED' && r.state !== 'RUNNING')
+    ? `${pill('bad','cannot declare')} <span class="muted">${esc(blocked.replace(/^cannot declare( -- )?/, ''))}</span>`
+    : '';
 
   const wait = s.awaiting_auto || [];
   if (r.state === 'DECLARED') {
@@ -260,10 +396,21 @@ async function refresh() {
 
   const c = s.counters;
   $('counters').innerHTML = `<td>${c.forwarded}</td><td>${c.dropped_rate}</td>
-    <td>${c.dropped_invalid}</td><td>${c.dropped_mistyped}</td><td>${c.stale}</td>
+    <td>${c.dropped_invalid}</td><td>${c.dropped_mistyped}</td>
+    <td>${c.dropped_not_preferred || 0}</td><td>${c.stale}</td>
     <td>${c.commands_routed}</td><td>${c.commands_undeliverable}</td>`;
 
   $('banner').style.display = s.inject.enabled ? 'block' : 'none';
+  // Bench dry run (--bench-auto): the OCS is telling RoboCommand a state the
+  // vehicles are not in. textContent, not innerHTML: ids come from the config.
+  const ba = s.bench_auto || {vehicles: [], substituted: {}};
+  $('benchbanner').style.display = ba.vehicles.length ? 'block' : 'none';
+  $('benchbanner').textContent = ba.vehicles.length
+    ? '⚠ BENCH AUTO IS ON — STATE_AUTO is published for ' + ba.vehicles.join(', ')
+      + ' while they report MANUAL (substituted: '
+      + ba.vehicles.map(v => v + ' ' + (ba.substituted[v] || 0)).join(', ')
+      + '). RoboCommand sees a state the vehicles are not in. Never at competition.'
+    : '';
   $('fleet').innerHTML = s.vehicles
     .map(v => vehicleCard(v, s.inject.streaming, s.inject.enabled)).join('');
 

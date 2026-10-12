@@ -7,21 +7,26 @@
 
 team_id = "ASTA"
 
-# UAV geofence, closed (first point == last point).
+# RETIRED -- the bridge no longer declares or sends this. The UAV geofence is per
+# COURSE now (four courses, four places) and is worked out when RoboCommand's
+# RxCourse arrives: a [[geofence.course]] entry at the bottom of this file if there
+# is one for that course, otherwise the course boundary pulled inward by
+# [geofence] boundary_margin_m. See the [geofence] section below and
+# rx_bridge/geofence.py.
+#
+# The key is kept ONLY because the drone repo's tools/scripts/check_config.py
+# (Drone/rx26_uav) still reads it, compares it with uav_params.yaml and fails
+# Ekko's rebuild when it is missing. Nothing in the OCS reads it. A drone-repo change
+# to drop that comparison will be proposed separately; until it lands, leave it.
 #
 # MUST stay above every [section] and [[array]] header -- a bare key after one
 # belongs to that table, so `uav_geofence` under [tiers] parses as
-# tiers.uav_geofence and is silently ignored.
+# tiers.uav_geofence and is silently ignored (and check_config.py would then see
+# no fence at all).
 #
-# PLACEHOLDER, but at the right venue. RoboNation's test_server publishes a
-# course at Singapore (1.2803, 103.8557) -- an earlier draft of this file had a
-# box around Sarasota, which would have declared a geofence on the wrong
-# continent. This is a ~200 m box around their course corners so the bench is
-# realistic; it is still NOT the competition geofence and must be replaced.
-#
-# Their test_server rejects a declaration outright if any vehicle_id starts
-# with "UAV" and the fence has fewer than 4 points:
-#   rc_test/test_server.py:104  len(decl.uav_geofence) < 4  -> ValueError
+# A ~200 m box around RoboNation's test-course corners at Singapore (1.2803,
+# 103.8557) -- larger than the ALPHA boundary, which is why it is no longer a
+# declarable fence.
 uav_geofence = [
     [1.28010, 103.85520],
     [1.28010, 103.85625],
@@ -51,8 +56,23 @@ relay_via = "USV1"          # submerged; Crusader carries its reports
 stale_ms = 10000.0
 
 [[vehicle]]
-id = "UAV1"                 # BabyDragon
+id = "UAV1"                 # Ekko
 type = "TYPE_UAV"
+# Ekko talks to the OCS over the RFD radio (the laptop-side fleet_link adapter,
+# which says `ocs_hello link=radio`) AND may also be on team WiFi. When both are
+# up the choice is made per report KIND: a kind both links deliver is taken from
+# the radio and WiFi's copy dropped -- except that a kind the adapter declares it
+# SYNTHESIZES (its hello's `synthesized`, e.g. ["heartbeat"]) never outranks Ekko's
+# own report, whichever link that came on. A kind only one link carries (WiFi's
+# task reports, IncidentAck, Readiness) is never dropped. The OCS sends everything
+# down the radio -- falling back to WiFi if the radio goes quiet for [limits]
+# link_prefer_s. Crusader has no preference: it only has WiFi.
+prefer = "radio"
+# Both vehicle clients republish a top-level key they do not know to
+# /crsd/ocs_command or /uav/ocs_command and carry on (see docs/VEHICLE_LINK.md),
+# so `ocs_info` (the course, and for a UAV the declared geofence) is safe to
+# send to every vehicle. Set send_info = false on any vehicle whose client is
+# found to choke on it.
 
 [team]
 # Our broker. On the bench this is the OCS itself; the vehicles publish here.
@@ -68,18 +88,35 @@ port = 1883
 # reachable from nothing but the laptop itself. That failure looks exactly like
 # a vehicle that will not connect.
 #
-# The vehicle needs THIS machine's address on the team subnet; there is no
-# discovery. Give the OCS a static address on the team NIC or a DHCP reservation
-# on the team router, and set ocs_host to match in the boat's
-# crusader_bringup/config/crusader_params.yaml. (The handbook's ban on static
-# addressing applies only to the RoboCommand-facing interface, not to our own
-# team network.)
+# The vehicle needs THIS machine's address on the team subnet. The boat finds it
+# from the [discovery] beacon below (ocs_host: "auto"), so nobody types it; a
+# vehicle client with a fixed address (Ekko's today) still needs this machine to
+# keep one -- a static address on the team NIC or a DHCP reservation on the team
+# router. (The handbook's ban on static addressing applies only to the
+# RoboCommand-facing interface, not to our own team network.)
 #
 # 37564 is clear of the Jetson's own ports: 8090 ground_station, 8080/8081 the
 # viewers it embeds.
 host = "0.0.0.0"
 port = 37564
 enabled = true
+
+[discovery]
+# A UDP beacon that tells the vehicles where [tcp] is, so the boat's ocs_host can
+# be "auto" instead of this laptop's address (which has been 192.168.100.107,
+# 192.168.8.107 and 192.168.1.75). What it sends, where it never sends and what
+# the boat does with it: rx_bridge/beacon.py and docs/VEHICLE_LINK.md "Discovery".
+#
+# Off unless enabled = true: a config without this section must not start
+# broadcasting. Sent from every local address except loopback, link-local,
+# anything inside never_on, and anything in the same /24 as [robocommand] host --
+# the course network is never spoken on.
+enabled = true
+port = 37565              # UDP; paired with [tcp] port. Both sides must agree.
+interval_s = 1.0          # at most 2.0: the boat forgets a beacon after 5 s
+# Setting never_on REPLACES this default; keep all four course subnets in it.
+never_on = ["192.168.65.0/24", "192.168.66.0/24",
+            "192.168.67.0/24", "192.168.68.0/24"]   # Alpha, Bravo, Charlie, Delta
 
 [robocommand]
 # The simulated RoboNation server. See README.md for why this is on its own
@@ -101,7 +138,51 @@ rate = 5.0                # messages/second, metered per vehicle -- the
                           # question the USV repo left open
 heartbeat_reserve = 2.0   # tokens only heartbeats may spend
 stale_ms = 1000.0         # default; per-vehicle overrides above win
+link_prefer_s = 3.0       # a vehicle on two links (see `prefer` above): a report
+                          # is dropped while the other link delivered the same
+                          # kind within this long and outranks it (real over
+                          # synthesized, then `prefer`), and a link silent
+                          # longer than this stops being "fresh" when the OCS
+                          # picks where to send
 
 [paths]
 seq_store = "run/seq.json"
 wire_log  = "run/wire"
+
+[geofence]
+# The UAV geofence is per course. When RoboCommand's RxCourse is accepted the OCS
+# declares, and tells Ekko, one of these -- "table, else the boundary":
+#
+#   1. a [[geofence.course]] entry below whose course_id matches -- used ONLY if
+#      every vertex is inside the course boundary (or within 0.5 m of it). An entry
+#      that is outside is refused with the vertex named, and the course gets NO
+#      fence: it never silently falls back to (2).
+#   2. otherwise the course boundary shrunk inward by boundary_margin_m. Needs a
+#      simple convex boundary, and a margin small enough not to collapse it; if
+#      not, no fence and a finding on the page saying what to do.
+#
+# There is deliberately no entry for ALPHA: the box in `uav_geofence` above is
+# larger than the ALPHA boundary, so it would be refused. ALPHA uses (2).
+
+boundary_margin_m = 2.0   # Chosen so the declared vertices are strictly inside the
+                          # boundary, never on it, where a float-rounding validation
+                          # could reject them. Chase's to change.
+
+confirm_max_age_s = 180   # A UAV is not declared unless its autopilot was read back
+                          # holding this course's fence within this many seconds
+                          # (the radio adapter re-verifies every 60 s). The gate:
+                          # docs/VEHICLE_LINK.md "ocs_fence".
+
+# Example -- a hand-drawn fence for one course. Closed (first == last), every vertex
+# inside that course's boundary. Uncomment and edit; course_id is as RoboCommand
+# sends it. A TOML trap: keep every [[geofence.course]] BELOW this [geofence]
+# header and keep top-level keys above all headers.
+#
+# [[geofence.course]]
+# course_id = "BRAVO"
+# uav_geofence = [
+#     [1.28010, 103.85520],
+#     [1.28010, 103.85625],
+#     [1.28110, 103.85625],
+#     [1.28010, 103.85520],
+# ]

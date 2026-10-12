@@ -26,6 +26,16 @@ because they come from hardware or software states you cannot ask for:
   --mistype   report a vehicle_type that contradicts the config, the signature
               of a reporter copy-pasted from one vehicle to another
 
+A fake UAV is not declarable on heartbeats alone. The OCS will not declare an aircraft
+until its autopilot is KNOWN to hold the course's geofence (docs/VEHICLE_LINK.md,
+`ocs_fence`), and that confirmation travels on the TCP vehicle link, not on the MQTT
+topic these heartbeats use. `--ocs-tcp` plays the radio adapter's part for it: it
+connects to the bridge, says hello as `--vehicle`, answers every `ocs_info` that carries
+a fence with a verified `ocs_fence` (and re-confirms every 60 s, as the adapter does), and
+answers "no course" with a verified empty polygon -- "cleared".
+
+    python fake_vehicle.py --vehicle UAV1 --type TYPE_UAV --ocs-tcp 127.0.0.1:37564
+
 Run each and watch the bridge refuse the frame. A safety net you have never
 seen catch anything is a safety net you are guessing about.
 
@@ -37,11 +47,16 @@ seen catch anything is a safety net you are guessing about.
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import socket
+import threading
 import time
+from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
+from rx_bridge.framing import FrameReader, encode
 from rx_bridge.proto import common_pb2, rx_common_pb2, rx_reports_pb2
 
 # Sarasota, near enough for a bench. The boat drives a slow circle so that every
@@ -49,6 +64,85 @@ from rx_bridge.proto import common_pb2, rx_common_pb2, rx_reports_pb2
 # the bugs (frozen cache, stale forwarding) this is meant to surface.
 LAT0, LON0 = 27.3364, -82.5307
 RADIUS_DEG = 0.0004
+
+
+def _rfc3339() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+class FenceAdapter(threading.Thread):
+    """The radio adapter's half of the geofence handshake, over the TCP vehicle link.
+
+    Not a vehicle and not a report source: its heartbeats still go over MQTT. It opens a
+    socket as `vehicle` (hello, link "radio"), reads `ocs_info`, and answers with an
+    `ocs_fence` -- the OPEN polygon it was told, verified, read back "now" -- the way
+    fleet_link does after it has written and re-read the autopilot's fence. A fence it is
+    told is "held" for as long as it runs; re-confirmed every REVERIFY_S so the OCS's
+    freshness limit keeps being met. Reconnects until stopped.
+    """
+
+    REVERIFY_S = 60.0
+
+    def __init__(self, vehicle: str, host: str, port: int) -> None:
+        super().__init__(daemon=True, name="fence-adapter")
+        self.vehicle, self.host, self.port = vehicle, host, port
+        self.halt = threading.Event()
+        self.polygon: list | None = None      # what the "autopilot" holds (open), or None
+        self.sock: socket.socket | None = None
+
+    def _send(self, obj: dict) -> None:
+        self.sock.sendall(encode(json.dumps(obj).encode("utf-8")))
+
+    def _confirm(self, reason: str) -> None:
+        self._send({"ocs_fence": {
+            "vehicle_id": self.vehicle, "state": "done", "polygon": self.polygon,
+            "verified": True, "verified_at": _rfc3339(), "reason": reason,
+            "lockout": None}})
+        print("  ocs_fence: %s" % reason)
+
+    def _on_info(self, info: dict) -> None:
+        if "uav_geofence" not in info:
+            return                                  # not told a fence: not for an aircraft
+        fence = info["uav_geofence"]
+        if fence:                                   # closed -> the open polygon it writes
+            self.polygon = [[p["latitude"], p["longitude"]] for p in fence[:-1]]
+            self._confirm("written and read back: %d vertices" % len(self.polygon))
+        elif info.get("course") is None:            # no course at all: clear it
+            self.polygon = []
+            self._confirm("cleared and read back empty")
+        # a course whose fence was refused: leave whatever is there standing
+
+    def run(self) -> None:
+        while not self.halt.is_set():
+            try:
+                self.sock = socket.create_connection((self.host, self.port), timeout=5)
+                self.sock.settimeout(1.0)
+                self._send({"ocs_hello": {"vehicle_id": self.vehicle, "link": "radio",
+                                          "agent": "fake_vehicle"}})
+                print("fence adapter: connected to %s:%d as %s"
+                      % (self.host, self.port, self.vehicle))
+                reader, last = FrameReader(), time.monotonic()
+                while not self.halt.is_set():
+                    try:
+                        chunk = self.sock.recv(4096)
+                    except socket.timeout:
+                        chunk = None
+                    if chunk == b"":
+                        break
+                    for payload in reader.feed(chunk or b""):
+                        msg = json.loads(payload.decode("utf-8"))
+                        if "ocs_info" in msg:
+                            self._on_info(msg["ocs_info"])
+                            last = time.monotonic()
+                    if self.polygon is not None and time.monotonic() - last >= self.REVERIFY_S:
+                        self._confirm("re-read: still holding %d vertices" % len(self.polygon))
+                        last = time.monotonic()
+            except (OSError, ValueError) as exc:
+                print("fence adapter: %s -- retrying" % exc)
+            finally:
+                if self.sock is not None:
+                    self.sock.close()
+            self.halt.wait(2.0)
 
 
 def main() -> int:
@@ -70,7 +164,13 @@ def main() -> int:
                          "signature of a copy-pasted reporter")
     ap.add_argument("--state", default="STATE_AUTO",
                     choices=["STATE_KILLED", "STATE_MANUAL", "STATE_AUTO"])
+    ap.add_argument("--ocs-tcp", metavar="HOST:PORT", default=None,
+                    help="play the radio adapter's part in the geofence handshake over "
+                         "the OCS's TCP vehicle link (127.0.0.1:37564): answer ocs_info "
+                         "with ocs_fence, so a fake UAV can be declared. UAV only.")
     args = ap.parse_args()
+    if args.ocs_tcp and args.vtype != "TYPE_UAV":
+        ap.error("--ocs-tcp is the aircraft's fence handshake; --type must be TYPE_UAV")
 
     topic = "team/robotx/%s/%s/report" % (args.team, args.vehicle)
 
@@ -79,6 +179,11 @@ def main() -> int:
     client.connect(args.host, args.port, 15)
     client.loop_start()
     print("publishing %.1f Hz to %s on %s:%d" % (args.rate, topic, args.host, args.port))
+    adapter = None
+    if args.ocs_tcp:
+        host, _, port = args.ocs_tcp.rpartition(":")
+        adapter = FenceAdapter(args.vehicle, host or "127.0.0.1", int(port))
+        adapter.start()
 
     period = 1.0 / args.rate
     t0 = time.time()
@@ -145,6 +250,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n%d heartbeats sent" % n)
     finally:
+        if adapter is not None:
+            adapter.halt.set()
         client.loop_stop()
         client.disconnect()
     return 0

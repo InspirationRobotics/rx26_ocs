@@ -6,6 +6,7 @@ agree with itself; `encode` asks pymavlink to pack a real message.
 """
 from __future__ import annotations
 
+import collections
 import importlib.util
 import logging
 import socket
@@ -189,3 +190,145 @@ def free_tcp_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def tunnel_frame(payload_type: int, data: bytes, *, sysid: int = 200, compid: int = 191,
+                 target: int = 0, target_comp: int = 0, seq: int = 0,
+                 declared_len: int = None) -> bytes:
+    """A TUNNEL frame built by pymavlink (independent of fleet's own builder)."""
+    padded = data + bytes(128 - len(data))
+    return encode("tunnel", target, target_comp, payload_type,
+                  len(data) if declared_len is None else declared_len, padded,
+                  sysid=sysid, compid=compid, seq=seq)
+
+
+def make_hub(*, rfd_accept: bool = True, with_wifi: bool = False, clock: Clock = None):
+    """A Hub with fake links ("rfd" serial, optionally "wifi" udp) and NO outputs, on a fake
+    clock. Returns (hub, clock, rfd, wifi)."""
+    clock = clock or Clock()
+    rfd = FakeLink("rfd", "serial", needs_addr=False, stream=True, accept=rfd_accept)
+    wifi = FakeLink("wifi", "udp", needs_addr=True, stream=False) if with_wifi else None
+    cfg = load_config(DEFAULT_CONFIG)
+    hub = Hub(DIALECT, [rfd] + ([wifi] if wifi else []), [], cfg.vehicle_names(), clock=clock,
+              wall=lambda: 1.7e9)
+    return hub, clock, rfd, wifi
+
+
+class FakeAutopilot:
+    """ArduPilot's side of the fence dialog, as MissionItemProtocol_Fence plays it: PARAM_REQUEST_READ
+    answered with PARAM_VALUE, a fence download answered item by item, an upload driven by its own
+    MISSION_REQUEST_INTs (re-requested about once a second) and committed only when complete.
+
+    pymavlink decodes everything sent to it and encodes every reply, so each exchange also checks
+    fleet's hand-packed layouts against an independent implementation. Knobs: `drop_ours` loses
+    our next frame(s) of a type before they arrive, `drop_replies` loses its own next reply of a
+    type, `nack` rejects every upload with that MAV_MISSION_RESULT, `nack_without_polygon_bit`
+    rejects one while FENCE_TYPE lacks bit 4 (as Ekko's bring-up notes), `shift_m` commits every
+    vertex that far north (a readback mismatch), `silent_missions` answers no mission traffic."""
+
+    def __init__(self, *, params=None, fence=None, sysid=1, compid=1):
+        self.params = dict({"FENCE_TYPE": 7.0, "FENCE_ENABLE": 0.0, "FENCE_AUTOENABLE": 0.0}
+                           if params is None else params)
+        self.fence = [dict(i) for i in (fence or [])]   # {command, param1, lat, lon}
+        self.mav = ap.MAVLink(None, srcSystem=sysid, srcComponent=compid)
+        self.dec = ap.MAVLink(None)
+        self.out = []                                    # raw reply frames, oldest first
+        self.heard = []                                  # every decoded message of ours (dropped ones too)
+        self.drop_ours = collections.Counter()
+        self.drop_replies = collections.Counter()
+        self.nack = None
+        self.nack_without_polygon_bit = True
+        self.shift_m = 0.0
+        self.silent_missions = False
+        self.on_count = None                             # called when an upload's MISSION_COUNT arrives
+        self.uploads = 0                                 # completed (committed) uploads
+        self._recv = None                                # an upload in progress: [item or None]
+        self._recv_from = None
+        self._last_req = 0.0
+
+    def names(self):
+        return [m.get_type() for m in self.heard]
+
+    # ---- what we send it
+    def hear(self, raw, now):
+        msg = self.dec.decode(bytearray(raw))
+        self.heard.append(msg)
+        name = msg.get_type()
+        if self.drop_ours[name]:
+            self.drop_ours[name] -= 1
+            return
+        src = (msg.get_srcSystem(), msg.get_srcComponent())
+        if name == "PARAM_REQUEST_READ":
+            pid = msg.param_id
+            if pid in self.params:
+                self._reply("PARAM_VALUE", "param_value", pid.encode(), self.params[pid], 9, 900, 1)
+            return
+        if getattr(msg, "mission_type", None) != 1 or self.silent_missions:
+            return
+        if name == "MISSION_REQUEST_LIST":
+            self._reply("MISSION_COUNT", "mission_count", *src, len(self.fence), 1)
+        elif name == "MISSION_REQUEST_INT":
+            if msg.seq < len(self.fence):
+                i = self.fence[msg.seq]
+                self._reply("MISSION_ITEM_INT", "mission_item_int", *src, msg.seq, 0, i["command"], 0, 0,
+                            i["param1"], 0, 0, 0, int(round(i["lat"] * 1e7)), int(round(i["lon"] * 1e7)), 0, 1)
+            else:
+                self._reply("MISSION_ACK", "mission_ack", *src, 13, 1)
+        elif name == "MISSION_COUNT":
+            if self.on_count:
+                self.on_count()
+            nack = self.nack
+            if nack is None and self.nack_without_polygon_bit and not int(self.params.get("FENCE_TYPE", 0)) & 4:
+                nack = 1
+            if nack is not None:
+                self._reply("MISSION_ACK", "mission_ack", *src, nack, 1)
+                return
+            if msg.count == 0:                       # MissionItemProtocol: nothing to request, clear and ACK
+                self.fence, self._recv = [], None
+                self.uploads += 1
+                self._reply("MISSION_ACK", "mission_ack", *src, 0, 1)
+                return
+            self._recv, self._recv_from = [None] * msg.count, src
+            self._request(now)
+        elif name == "MISSION_ITEM_INT" and self._recv is not None and src == self._recv_from:
+            nxt = self._recv.index(None)
+            if msg.seq != nxt:
+                return
+            self._recv[nxt] = {"command": msg.command, "param1": msg.param1,
+                               "lat": msg.x * 1e-7 + self.shift_m / 111195.0, "lon": msg.y * 1e-7}
+            if None in self._recv:
+                self._request(now)
+                return
+            self.fence, self._recv = self._recv, None
+            self.uploads += 1
+            self._reply("MISSION_ACK", "mission_ack", *src, 0, 1)
+
+    def tick(self, now):
+        """ArduPilot re-requests a missing upload item about once a second."""
+        if self._recv is not None and now - self._last_req >= 1.0:
+            self._request(now)
+
+    def set_param(self, name, value):
+        """A parameter set from QGC: ArduPilot broadcasts the new PARAM_VALUE."""
+        self.params[name] = value
+        self._reply("PARAM_VALUE", "param_value", name.encode(), value, 9, 900, 1)
+
+    def _request(self, now):
+        self._last_req = now
+        self._reply("MISSION_REQUEST_INT", "mission_request_int", *self._recv_from, self._recv.index(None), 1)
+
+    def _reply(self, name, encoder, *args):
+        if self.drop_replies[name]:
+            self.drop_replies[name] -= 1
+            return
+        self.mav.seq = (self.mav.seq + 1) & 0xFF
+        self.out.append(bytes(getattr(self.mav, encoder + "_encode")(*args).pack(self.mav)))
+
+    def take(self):
+        out, self.out = self.out, []
+        return out
+
+
+def fence_items(polygon):
+    """An autopilot fence holding exactly this (open) polygon."""
+    return [{"command": 5001, "param1": float(len(polygon)), "lat": lat, "lon": lon} for lat, lon in polygon]

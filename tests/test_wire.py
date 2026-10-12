@@ -53,7 +53,7 @@ def usv_heartbeat(*, nan: bool = False, unknown_task: bool = False):
 
 
 def uav_heartbeat(*, no_phase: bool = False):
-    """BabyDragon. Airborne, so altitude is real and depth is not.
+    """Ekko. Airborne, so altitude is real and depth is not.
 
     `no_phase` is the failure this exists to catch: a reporter that filled in
     every other field and left flight_phase at its zero value.

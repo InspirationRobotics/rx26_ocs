@@ -28,19 +28,38 @@ adopting a newer robocommand revision, and you read the diff when you do.
 
 ---
 
-## 1. Unit tests — 1 second
+## 1. Unit tests — about 25 seconds
 
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-**Expect:** `Ran 121 tests` then `OK`.
+**Expect:** `Ran 356 tests` then `OK`.
 
 Config validation, sequence-store durability, the rate governor, the run state
-machine, the wire format, the vehicle link's frame boundaries, and the fleet map
-page's routes (`/map`, the vendored Leaflet files, the `/api/fleet` proxy against
-a stub and against nothing listening). If this
+machine, the wire format, the vehicle link's frame boundaries, `ocs_hello` and
+the per-kind link preference, `ocs_info`, the ReadinessConfirm seq rewrite, and
+the fleet map page's routes (`/map`, the vendored Leaflet files, the
+`/api/fleet` proxy against a stub and against nothing listening). If this
 fails, nothing below is worth running.
+
+---
+
+## 1b. fleet_link and the radio adapter — 10 seconds
+
+**On the system Python, not `.venv`** — `fleet_link` needs `pymavlink` and
+`pyserial`, which are only installed there:
+
+```powershell
+python -m unittest discover -s fleet/tests -t .
+```
+
+**Expect:** `Ran 419 tests` then `OK`.
+
+MAVLink framing and CRC, routing, the `/fleet` schema, the RXL codec (every
+message, every length check, checked against the pinned protobuf when `.venv`
+is present), JSON ⇄ RXL translation, the stand-in heartbeat, the adapter's
+repeat/ACK policies and the tunnel log. Loopback only: no radio, no COM8.
 
 ---
 
@@ -247,6 +266,56 @@ server. The active set is what prevents that.
 
 ---
 
+## 3d. Bench dry run — real vehicles disarmed, run still starts
+
+RoboCommand starts a run only when **every declared vehicle reports
+`STATE_AUTO`**, and Crusader and Ekko report it only when armed and in an
+autonomous mode. On the bench they are disarmed, so a declared run never
+starts. `--bench-auto` lets the OCS publish `STATE_AUTO` in place of the
+`STATE_MANUAL` the listed vehicles actually send — nothing else:
+
+- exactly `STATE_MANUAL` → `STATE_AUTO`, for the listed vehicles only.
+  `STATE_KILLED`, `STATE_UNKNOWN`, `STATE_AUTO`, every other field and every
+  other report kind pass through untouched
+- applied after the link preference, staleness and the governor and before
+  validation, so validation checks what is published
+- command line only (never `bridge.toml`); an id not in the fleet is a startup
+  error (exit 2)
+- loud: a `WARNING: BENCH AUTO` console line and a `bench_auto` event at the
+  head of the wire log; an orange banner on `/` and `/map`; `bench_auto`
+  (`vehicles`, `substituted` per vehicle) in `/api/state`; every substituted
+  frame's `tx` line in the wire log is annotated `BENCH-AUTO STATE_MANUAL ->
+  STATE_AUTO` (the vehicle's own `veh` line keeps the MANUAL it sent)
+- **never at competition.** It makes RoboCommand see a state the vehicle is not
+  in; it scores as though the vehicle were armed
+
+Procedure. If the OCS is already running, close its `OCS (ocs_web)` window
+first — `OCS.cmd` ignores its arguments when something already answers on 8099.
+Then, in PowerShell from the `OCS` folder:
+
+```powershell
+.\OCS.cmd --bench-auto "USV1,UAV1"
+```
+
+Wait until both vehicles show active and the page says `COURSE_RX` (may
+declare), press **Declare**, and RoboCommand's RunStart arrives within a second
+or two. **End run** when done; the OCS is ready to declare again. Restart
+`.\OCS.cmd` without the flag to leave bench mode.
+
+What the OCS still does for real during a dry run, because it is the normal
+relay and does not know the vehicles are disarmed: the declaration sends each
+declared vehicle an advisory `standby_auto` (and Ekko `ocs_info`), and RunStart
+is relayed to every configured vehicle — Ekko's over the radio, repeated until
+ACKed or 600 s (`docs/EKKO_RADIO_LINK.md`). Both are advisory and a vehicle RC
+has not armed must ignore them.
+
+Observed 2026-10-10 (Crusader over WiFi, Ekko over the RFD adapter, both
+disarmed): declaration seq 3 at 16:16:02.87; first substituted heartbeats
+0.16 s and 0.27 s later; RoboCommand's RunStart (`run_id` 1, matching
+`declaration_seq` 3) arrived 3 ms after the second; `RUNNING` at once.
+
+---
+
 ## 4. Against RoboNation's real stack — the one that counts
 
 ### 4a. Start their server *on the sim box*
@@ -332,9 +401,21 @@ running.**
 `test_server.py:104` rejects the declaration if any `vehicle_id` starts with
 `"UAV"` and `uav_geofence` has fewer than 4 points.
 
-**The geofence in `bridge.toml` is a placeholder** — a box around their test
-course in Singapore. Their server only counts points, so it will accept a fence
-anywhere on Earth without complaint. Replace it with the real one.
+**The UAV geofence is per course, and worked out from the course.** The top-level
+`uav_geofence` in `bridge.toml` is retired (the drone repo's `check_config.py` still
+reads it; the OCS does not). When the course arrives the OCS declares a
+`[[geofence.course]]` entry for it if there is one, otherwise the boundary pulled in by
+`[geofence] boundary_margin_m` (2 m). Their server only counts points, so it will accept a
+fence anywhere on Earth -- the check that matters is on the page: *UAV fence* names its
+source and vertex count, and a course finding says so loudly when no fence could be made.
+
+**A UAV is not declared until its autopilot is read back holding that fence.** The radio
+adapter sends an `ocs_fence` after it has written and re-read Ekko's fence; without a fresh
+(180 s) one that matches, *Declare run* is disabled and says why, and `POST /api/declare`
+refuses. For a fake UAV on the bench run
+`python fake_vehicle.py --vehicle UAV1 --type TYPE_UAV --ocs-tcp 127.0.0.1:37564`
+(system or `.venv` python, in `OCS`): it plays the adapter's half over the TCP link. The
+`--inject` buttons publish over MQTT and cannot carry the confirmation.
 
 **Windows reserves port 1883.** Binding a broker there fails with
 `WinError 10013`, which is why `--local-broker` defaults to 11883. To see the
@@ -424,7 +505,12 @@ and it lives on the sim box, not here.**
   is still synthesized — nothing has yet come from a Pixhawk, over WiFi, on a
   Jetson. `ros2 run crusader_groundstation ocs_client` with real topics flowing
   is the step that has not been taken.
-- **The UUV and UAV have no client at all.** Only `crusader_groundstation` in
-  rx26_asv has one; Graey and BabyDragon still report nothing.
+- **The UUV has no client at all.** Graey still reports nothing. Ekko has two
+  paths, neither yet seen carrying a real heartbeat here: its own WiFi client
+  (`uav_groundstation` `ocs_client`, heartbeats only) and the laptop-side radio
+  adapter in `fleet_link`, which builds a stand-in heartbeat from the
+  autopilot's MAVLink until Ekko speaks RXL itself — see
+  [EKKO_RADIO_LINK.md](EKKO_RADIO_LINK.md) and
+  [VEHICLE_SIDE_PROPOSAL.md](VEHICLE_SIDE_PROPOSAL.md).
 - The UUV's submerged heartbeat is unresolved — see
   [ROBONATION_QUESTIONS.md](ROBONATION_QUESTIONS.md) Q1.

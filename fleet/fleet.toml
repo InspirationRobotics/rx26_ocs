@@ -72,3 +72,84 @@ radio = [51]                # RFD900ux RADIO_STATUS
 boat = "Crusader"
 drone = "Ekko"
 radio = "RFD900ux"
+
+# ---------------------------------------------------------- the tunnel log
+# Every MAVLink TUNNEL and every robotx-dialect (RXL_*, 42xxx) frame, both directions,
+# one JSON object per line, flushed per line. NOTHING else is logged -- everything else
+# is in the drone's own flight log. One file per fleet_link start: <dir>/<UTC>.jsonl.
+# A relative dir is relative to the OCS folder; run/ is gitignored.
+
+[tunnel_log]
+enabled = true
+dir = "run/tunnel"
+
+# ------------------------------------------------------------- the OCS adapter
+# Ekko's radio link to the RoboCommand bridge (rx_bridge, inside ocs_web). For each
+# radio vehicle fleet_link opens ONE ordinary vehicle-link TCP connection to the bridge,
+# says who it is, and translates: uplink RXL TUNNELs -> RxReports, RxCommands and the
+# course / UAV geofence -> RXL TUNNELs on the radio. ocs_web not running is normal; the
+# adapter redials. Switch it off with enabled = false or --ocs-bridge NONE.
+# Spec for the drone side: OCS/docs/EKKO_RADIO_LINK.md.
+
+[ocs]
+enabled = true
+bridge = "127.0.0.1:37564"   # = [tcp] port in bridge.toml
+sysid = 250                  # the OCS's own MAVLink id: QGC on this laptop is 255, gcs_radio 254
+compid = 190
+# reconnect_min_s = 1        # redial backoff, doubling up to the max
+# reconnect_max_s = 10
+# zone_ttl_s = 3600          # safety expiry of a keep-out zone (the real end is ALL_CLEAR or the next run)
+# moving_ttl_s = 30          # a moving-object alert not refreshed for this long is no longer repeated
+# retry_give_up_s = 600      # an un-ACKed RUN_START / ALL_CLEAR / ASSISTANCE_REQUEST is dropped (and counted)
+# fence_backup_dir = "run/fence"   # an autopilot's fence is saved here before fence_upload replaces it
+
+[[ocs.radio_vehicle]]
+vehicle_id = "UAV1"          # = [[vehicle]] id in bridge.toml
+type = "TYPE_UAV"
+companion_sysid = 200        # sends the RXL TUNNELs, receives ours (mav_source_system in uav_params.yaml)
+autopilot_sysid = 1          # its MAVLink on the radio is what the stand-in heartbeat is built from
+link = "rfd"                 # the only link the adapter ever transmits on for this vehicle
+# Write the declared geofence (bridge.toml uav_geofence, arriving in ocs_info) to the autopilot as
+# an inclusion polygon, so QGC shows it and the autopilot enforces what was declared. Disarmed
+# only; FENCE_* params are read, never written; the autopilot's previous fence is saved to
+# run/fence/ first; held while polygon fencing can engage and the aircraft is outside the polygon
+# (it would block arming). It REPLACES whatever fence the autopilot holds -- set false to keep a
+# local test fence on Ekko. See fleet/fence_upload.py.
+fence_upload = true
+# Write it EVEN when Ekko is outside the polygon with FENCE_ENABLE 1, i.e. accept that Ekko will
+# NOT ARM there (pre-arm "Vehicle breaching") -- Chase, 2026-10-10: the Singapore fence must show
+# in QGC from the San Diego bench. Never covers FENCE_ENABLE 0 with auto-enable on (Ekko could
+# still arm and meet the fence after takeoff): that stays held. false = hold instead.
+# AT THE COMPETITION set this false: there a fence that excludes the launch platform should stop
+# the run being declared (it is never confirmed), not be written and leave Ekko unable to arm.
+fence_may_block_arming = true
+# The bridge has heard NO course from RoboCommand since it started (ocs_info "course": null): clear
+# Ekko's fence (after 20 s, disarmed, old fence saved) so the team can fly on the bench without a
+# RoboCommand server -- Chase, 2026-10-10. A course whose fence the bridge REFUSED leaves the old
+# fence in place instead (a leftover fence stops arming on the wrong course; a cleared one would not).
+fence_clear_without_course = true
+# HAE = AMSL + this. COPIED from the aircraft's own ocs_client (uav_params.yaml:
+# geoid_separation_m), which says: -24.6 is SARASOTA, Singapore is different, check it
+# against the actual course before the competition. Keep it equal to the aircraft's. Left
+# out, no stand-in heartbeat is sent at all (an altitude cannot be derived without it).
+# TODO(Chase): -24.6 is wrong for BOTH San Diego and Singapore (it is the aircraft's Sarasota
+#   value). Left as it is on purpose: the value is your call, and it must stay equal to
+#   uav_params.yaml's. GPS_RAW_INT.alt_ellipsoid (the receiver's own height above the
+#   ellipsoid, i.e. HAE directly) would remove the need for a geoid constant altogether; it
+#   is a message the adapter would have to ask the autopilot for, as it does EXTENDED_SYS_STATE.
+geoid_separation_m = -24.6
+# rate_hz = 2.0              # the handbook's mandated heartbeat rate; = ocs_client.rate_hz
+# (EXTENDED_SYS_STATE -- the flight phase -- is in no stream group on ArduCopter 4.7, so while the
+#  stand-in speaks and it is not arriving, the adapter asks the autopilot for it at 1 Hz with
+#  SET_MESSAGE_INTERVAL: at most once per 10 s, the rule and interval of gcs_radio.py. See
+#  /fleet ocs.vehicles.<id>.heartbeat.flight_state_request.)
+# phase_fallback = false     # true: when EXTENDED_SYS_STATE is not on the radio, derive
+#                            #   flight_phase from armed + height above home (the aircraft's own
+#                            #   fallback, airborne_alt_m below). OFF by default: that field is
+#                            #   relayed to Garuda for Network Remote ID, so a heuristic is opt-in.
+# airborne_alt_m = 1.0
+# companion_fresh_s = 2.0    # an RXL HEARTBEAT from the companion this young replaces the stand-in
+# pose_timeout_s = 1.0       # input freshness, as in uav_params.yaml ocs_client; stale = no heartbeat
+# attitude_timeout_s = 1.0
+# status_timeout_s = 2.5     # the autopilot HEARTBEAT is 1 Hz on the radio
+# flight_timeout_s = 2.5     # EXTENDED_SYS_STATE, if something asked for it
