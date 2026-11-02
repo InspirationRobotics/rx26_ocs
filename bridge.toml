@@ -73,6 +73,12 @@ prefer = "radio"
 # so `ocs_info` (the course, and for a UAV the declared geofence) is safe to
 # send to every vehicle. Set send_info = false on any vehicle whose client is
 # found to choke on it.
+#
+# registration = "..."      # Ekko's CAAS registration, stamped on every heartbeat
+#                           # as Heartbeat.uav_registration. RoboCommand wants it only
+#                           # when the team has more than one UAV registered. Blank:
+#                           # the field stays blank. A heartbeat carrying a different
+#                           # one is dropped as misconfigured (counter "misreg.").
 
 [team]
 # Our broker. On the bench this is the OCS itself; the vehicles publish here.
@@ -149,20 +155,46 @@ link_prefer_s = 3.0       # a vehicle on two links (see `prefer` above): a repor
 seq_store = "run/seq.json"
 wire_log  = "run/wire"
 
+[uav]
+# pilot_callsign: what the call-sign box next to Declare starts with. It goes out as
+# RunDeclaration.uav_pilot_callsign whenever an aircraft is declared: the pilot's
+# MyDroneFleets call sign for THIS run, first name + UAPL number. Per run, so it is
+# typed on the page; blank here means the box starts empty and Declare stays off
+# until someone types it.
+pilot_callsign = ""
+
 [geofence]
 # The UAV geofence is per course. When RoboCommand's RxCourse is accepted the OCS
 # declares, and tells Ekko, one of these -- "table, else the boundary":
 #
 #   1. a [[geofence.course]] entry below whose course_id matches -- used ONLY if
-#      every vertex is inside the course boundary (or within 0.5 m of it). An entry
-#      that is outside is refused with the vertex named, and the course gets NO
-#      fence: it never silently falls back to (2).
-#   2. otherwise the course boundary shrunk inward by boundary_margin_m. Needs a
-#      simple convex boundary, and a margin small enough not to collapse it; if
-#      not, no fence and a finding on the page saying what to do.
+#      every vertex, and every point along every edge, is inside the course or its
+#      UAV transit area (within 0.5 m). An entry that is outside is refused with
+#      the vertex or edge named, and the course gets NO fence: it never silently
+#      falls back to (2).
+#   2. otherwise the course boundary -- joined with RxCourse.uav_transit_area when
+#      the two share an edge -- shrunk inward by boundary_margin_m. Needs a simple
+#      convex shape and a margin small enough not to collapse it; if not, no fence
+#      and a finding on the page saying what to do (a transit area that cannot be
+#      joined leaves a course-only fence, and says so).
 #
 # There is deliberately no entry for ALPHA: the box in `uav_geofence` above is
 # larger than the ALPHA boundary, so it would be refused. ALPHA uses (2).
+#
+# Before every declaration with an aircraft the OCS also applies RoboCommand's own
+# check (their test server's geofence_problems): at least 4 points, closed, every
+# point along every edge within the course or transit area to 1 m, and a ceiling
+# above 0 and at most ceiling_limit_hae_m. RoboCommand REFUSES SILENTLY -- no reply,
+# the run just never starts -- so the OCS refuses first, in words, on the page.
+
+max_altitude_hae_m = 40.0 # RunDeclaration.uav_geofence_max_altitude_hae_m: the UAV
+                          # ceiling, metres above the WGS84 ellipsoid (HAE, not AMSL).
+                          # PROPOSED 2026-10-31, Chase to confirm. Must cover Ekko's
+                          # real ceiling, home HAE + FENCE_ALT_MAX (12 m), with room;
+                          # check GPS_RAW_INT.alt_ellipsoid at home on the day.
+                          # Removing the key blocks every declaration with an aircraft.
+ceiling_limit_hae_m = 50.0  # The most RoboCommand accepts: their test server's
+                          # MAX_UAV_ALTITUDE_HAE_M. Handbook 5.3.3 says 60 m AMSL.
 
 boundary_margin_m = 2.0   # Chosen so the declared vertices are strictly inside the
                           # boundary, never on it, where a float-rounding validation

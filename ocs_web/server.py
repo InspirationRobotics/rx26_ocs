@@ -13,7 +13,7 @@ Endpoints:
     GET  /api/state        everything, as JSON (the page polls this)
     GET  /api/fleet        fleet_link's /fleet, proxied (or {"error": ...})
     GET  /api/map-config   map centre and the vehicle-GUI links
-    POST /api/declare      publish the RunDeclaration
+    POST /api/declare      publish the RunDeclaration ({"callsign": ...} for an aircraft)
     POST /api/active       force a vehicle in/out of the declaration
     POST /api/end          end the run
     POST /api/inject       publish one fake heartbeat as a chosen vehicle
@@ -237,7 +237,10 @@ def make_handler(bridge: Bridge, injector: Injector | None, logs: list, *,
             body = json.loads(self.rfile.read(n) or b"{}") if n else {}
 
             if self.path == "/api/declare":
-                self._json({"result": bridge.declare()})
+                # The pilot's call sign from the page's box; absent -> bridge.toml's.
+                sign = body.get("callsign")
+                self._json({"result": bridge.declare(
+                    None if sign is None else str(sign))})
             elif self.path == "/api/end":
                 self._json({"result": bridge.end()})
             elif self.path == "/api/active":

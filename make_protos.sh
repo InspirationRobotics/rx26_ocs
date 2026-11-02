@@ -14,7 +14,7 @@
 # Bump REV on purpose, read the diff, re-run the conformance test, commit.
 set -euo pipefail
 
-REV="${REV:-f6457fa47489647a8650c1d3eb74efa84ce4b84a}"
+REV="${REV:-8fc09f295fe266ad8106cc0344a3e4d57f844359}"
 REPO="https://github.com/robonation/robocommand.git"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

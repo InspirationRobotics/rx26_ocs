@@ -64,6 +64,19 @@ DEFAULT_CONFIRM_MAX_AGE_S = 180.0
 #: count as inside it: the width of a hand-typed coordinate, not of a mistake.
 TABLE_TOLERANCE_M = 0.5
 
+#: How far a vertex where the course meets its transit area may sit off the straight
+#: line through its neighbours and still be no corner. The two rings share the seam's
+#: endpoints but their other edges were surveyed separately, so the "corner" a union
+#: leaves there is rounding, not shape -- 4 mm on the test server's Course Alpha. Left
+#: in, it reads as a reflex corner and the convex inset refuses the whole union.
+_SEAM_TOL_M = 0.05
+
+#: RoboCommand's limits for a declared UAV fence, as its test server applies them
+#: (robocommand@8fc09f2, RobotX_2026/rc_test/test_server.py `geofence_problems`).
+RC_TOLERANCE_M = 1.0
+RC_EDGE_STEP_M = 0.5
+RC_MAX_CEILING_HAE_M = 50.0
+
 #: A confirmation's polygon must match the fence to this, per coordinate. About
 #: 0.1 m; ArduPilot stores 1e-7 deg, so a faithful read-back is well inside it.
 MATCH_TOL_DEG = 1e-6
@@ -295,13 +308,28 @@ def _inset(pts, margin: float):
 
 # ---- the fence for one course -----------------------------------------------
 
-def for_course(course_id: str, corners, table, margin_m: float) -> CourseFence:
+def _valid_ll(points) -> bool:
+    # Not merely NaN: a position off the globe would turn into metres the arithmetic
+    # below happily overflows, and a fence made of NaN is worse than none.
+    return all(math.isfinite(a) and math.isfinite(b) and abs(a) <= 90.0 and abs(b) <= 180.0
+               for a, b in points)
+
+
+def for_course(course_id: str, corners, table, margin_m: float, transit=()) -> CourseFence:
     """The UAV geofence for a course: the table entry, else the boundary inset.
 
     corners   [(lat, lon), ...] as RoboCommand sent them -- open or closed, either
               winding.
     table     {course_id: closed ((lat, lon), ...)} from `[[geofence.course]]`.
     margin_m  `[geofence] boundary_margin_m`.
+    transit   RxCourse.uav_transit_area, the same way, or empty. RoboCommand accepts a
+              fence anywhere in the course OR this area, which is where Ekko takes off
+              and lands; a course-only fence leaves the launch point outside it.
+
+    With a transit area that shares a whole edge with the course, the inset is of the
+    two together; when they cannot be joined (no shared edge, or not convex together)
+    the course alone is inset as before and `source` says the transit area was left
+    out. A table entry is checked against course and transit area together.
 
     Returns a CourseFence; `polygon` is None, with `reason`, whenever the answer
     is "no fence". Never raises on a bad course: a frame we cannot make a fence
@@ -309,10 +337,8 @@ def for_course(course_id: str, corners, table, margin_m: float) -> CourseFence:
     """
     cid = course_id or "?"
     corners = [(float(a), float(b)) for a, b in corners]
-    if any(not (math.isfinite(a) and math.isfinite(b) and abs(a) <= 90.0 and abs(b) <= 180.0)
-           for a, b in corners):
-        # Not merely NaN: a position off the globe would turn into metres the
-        # arithmetic below happily overflows, and a fence made of NaN is worse than none.
+    transit = [(float(a), float(b)) for a, b in transit]
+    if not _valid_ll(corners):
         return CourseFence(cid, reason="the course boundary has a corner that is not a "
                                        "valid latitude/longitude (not a number, or out of range)")
     if not corners:
@@ -320,15 +346,33 @@ def for_course(course_id: str, corners, table, margin_m: float) -> CourseFence:
     frame = _Frame(sum(a for a, _ in corners) / len(corners),
                    sum(b for _, b in corners) / len(corners))
     ring = _distinct([frame.xy(a, b) for a, b in corners])
+    left_out = None
+    tring = []
+    if transit and not _valid_ll(transit):
+        left_out = "it has a point that is not a valid latitude/longitude"
+    elif transit:
+        tring = _distinct([frame.xy(a, b) for a, b in transit])
+        if len(tring) < 3:
+            left_out = "it has only %d distinct point(s)" % len(tring)
+            tring = []
 
     entry = table.get(course_id)
     if entry is not None:
-        return _from_table(cid, entry, ring, frame)
+        return _from_table(cid, entry, [ring] + ([tring] if tring else []), frame)
 
     if len(ring) < 3:
         return CourseFence(cid, reason=(
             "the course boundary has only %d distinct corner(s), not enough to "
             "inset: add a [[geofence.course]] entry for %s" % (len(ring), cid)))
+    if tring:
+        union, left_out = _union(ring, tring)
+        if union is not None:
+            inset, why, _kind = _inset(union, margin_m)
+            if inset is not None:
+                open_ring = [frame.ll(x, y) for x, y in inset]
+                return CourseFence(cid, tuple(open_ring) + (open_ring[0],),
+                                   source="course + transit area inset %s m" % fmt_m(margin_m))
+            left_out = "course and transit area together: %s" % why
     inset, why, kind = _inset(ring, margin_m)
     if inset is None:
         advice = ("lower [geofence] boundary_margin_m or add a" if kind == "margin"
@@ -336,22 +380,60 @@ def for_course(course_id: str, corners, table, margin_m: float) -> CourseFence:
         return CourseFence(cid, reason="%s: %s [[geofence.course]] entry for %s"
                                        % (why, advice, cid))
     open_ring = [frame.ll(x, y) for x, y in inset]
-    return CourseFence(cid, tuple(open_ring) + (open_ring[0],),
-                       source="course boundary inset %s m" % fmt_m(margin_m))
+    source = "course boundary inset %s m" % fmt_m(margin_m)
+    if left_out:
+        source += ("; transit area NOT included (%s) -- add a [[geofence.course]] entry "
+                   "to use it" % left_out)
+    return CourseFence(cid, tuple(open_ring) + (open_ring[0],), source=source)
 
 
-def _from_table(cid: str, entry, ring, frame: _Frame) -> CourseFence:
-    """A `[[geofence.course]]` entry, if and only if it is inside the boundary."""
+def _union(ring, tring):
+    """(the course and its transit area as one ring, None), or (None, why not).
+
+    Only the shape RoboCommand's courses have: two simple rings sharing one whole edge.
+    Both are wound counter-clockwise, so the transit area runs the shared edge a -> b
+    the other way, b -> a. Walk the course from b all the way round to a, then the
+    transit area from just after a to just before b: the seam is gone, and its two
+    endpoints go too when the boundary runs straight through them (_SEAM_TOL_M).
+    """
+    course = ring if _signed_area(ring) > 0 else ring[::-1]
+    area = tring if _signed_area(tring) > 0 else tring[::-1]
+    n, m = len(course), len(area)
+    same = lambda p, q: math.hypot(p[0] - q[0], p[1] - q[1]) <= _SEAM_TOL_M  # noqa: E731
+    for i in range(n):
+        a, b = course[i], course[(i + 1) % n]
+        for j in range(m):
+            if same(area[j], b) and same(area[(j + 1) % m], a):
+                out = [course[(i + 1 + k) % n] for k in range(n)]
+                out += [area[(j + 2 + k) % m] for k in range(m - 2)]
+                for k in (n - 1, 0):                          # a, then b
+                    p, q, r = out[k - 1], out[k], out[(k + 1) % len(out)]
+                    span = (r[0] - p[0], r[1] - p[1])
+                    run = (q[0] - p[0], q[1] - p[1])
+                    L = math.hypot(*span)
+                    if (L > 0 and abs(_cross(*span, *run)) / L <= _SEAM_TOL_M
+                            and run[0] * span[0] + run[1] * span[1] > 0):
+                        del out[k]
+                return out, None
+    return None, "it shares no whole edge with the course boundary"
+
+
+def _from_table(cid: str, entry, areas, frame: _Frame) -> CourseFence:
+    """A `[[geofence.course]]` entry, if and only if all of it -- every point along every
+    edge, as RoboCommand checks it -- lies inside the course or the transit area."""
+    ring = areas[0]
     if len(ring) < 3:
         return CourseFence(cid, reason=(
             "the table fence for %s cannot be checked: the course boundary has only "
             "%d distinct corner(s)" % (cid, len(ring))))
+    where = "the course boundary" if len(areas) == 1 else "the course and transit area"
+
+    def outside_by(p) -> float:
+        return min(0.0 if _inside(p, a) else _dist_to_ring(p, a) for a in areas)
+
     outside = []
     for i, (lat, lon) in enumerate(entry[:-1], start=1):
-        p = frame.xy(lat, lon)
-        if _inside(p, ring):
-            continue
-        d = _dist_to_ring(p, ring)
+        d = outside_by(frame.xy(lat, lon))
         if d > TABLE_TOLERANCE_M:
             outside.append((i, lat, lon, d))
     if outside:
@@ -359,12 +441,98 @@ def _from_table(cid: str, entry, ring, frame: _Frame) -> CourseFence:
         more = "" if len(outside) == 1 else " (and %d more vertices outside)" % (
             len(outside) - 1)
         return CourseFence(cid, reason=(
-            "the [[geofence.course]] entry for %s is outside the course boundary: "
+            "the [[geofence.course]] entry for %s is outside %s: "
             "vertex %d [%s, %s] is %.1f m outside it%s -- no fence for this course "
             "until the entry is fixed or removed"
-            % (cid, i, repr(lat), repr(lon), d, more)))
+            % (cid, where, i, repr(lat), repr(lon), d, more)))
+    # Every vertex inside is not every edge inside: one across a notch leaves.
+    pts = [frame.xy(lat, lon) for lat, lon in entry]
+    for i, (p, q) in enumerate(zip(pts, pts[1:]), start=1):
+        steps = max(1, math.ceil(math.dist(p, q) / RC_EDGE_STEP_M))
+        worst = max(outside_by((p[0] + (q[0] - p[0]) * k / steps, p[1] + (q[1] - p[1]) * k / steps))
+                    for k in range(steps + 1))
+        if worst > TABLE_TOLERANCE_M:
+            return CourseFence(cid, reason=(
+                "the [[geofence.course]] entry for %s leaves %s along edge %d-%d, by "
+                "%.1f m -- no fence for this course until the entry is fixed or removed"
+                % (cid, where, i, i + 1 if i < len(pts) - 1 else 1, worst)))
     return CourseFence(cid, tuple((float(a), float(b)) for a, b in entry),
                        source="table: %s" % cid)
+
+
+# ---- RoboCommand's own check of a declaration -------------------------------
+
+def rc_declaration_problems(fence, corners, transit, ceiling_m,
+                            max_ceiling_m: float = RC_MAX_CEILING_HAE_M) -> list[str]:
+    """Why RoboCommand would refuse a declaration with a UAV; empty when it would not.
+
+    A TRANSCRIPTION of the test server's `geofence_problems` (see RC_* above), not a
+    re-derivation: the same sphere, origin, sampling and wording, so the page and their
+    log say the same thing. It has to exist because RoboCommand answers a refused
+    declaration with nothing at all -- the run just never starts.
+
+    fence     the closed uav_geofence about to be declared; None judges the ceiling
+              alone (there is no fence to declare, and the caller says why)
+    corners   RxCourse.corners; transit RxCourse.uav_transit_area (may be empty)
+    ceiling_m uav_geofence_max_altitude_hae_m, or None when there is none to send
+    """
+    def closed(pts):
+        pts = [(float(a), float(b)) for a, b in pts]
+        return pts + pts[:1] if pts and pts[0] != pts[-1] else pts
+
+    rings = [r for r in (closed(corners), closed(transit)) if len(r) >= 4]
+    problems = []
+    fence = None if fence is None else closed(fence)
+    if fence is None:
+        pass
+    elif len(fence) < 4:
+        problems.append("uav_geofence has %d point(s), needs at least 4" % len(fence))
+    elif rings:
+        origin = rings[0][0]
+        r_earth = 6371000.0
+
+        def xy(p):
+            return (math.radians(p[1] - origin[1]) * r_earth * math.cos(math.radians(origin[0])),
+                    math.radians(p[0] - origin[0]) * r_earth)
+
+        def outside_by(p, ring) -> float:
+            x, y = p
+            inside = False
+            for (x1, y1), (x2, y2) in zip(ring, ring[1:]):
+                if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+                    inside = not inside
+            if inside:
+                return 0.0
+            best = math.inf
+            for (ax, ay), (bx, by) in zip(ring, ring[1:]):
+                dx, dy = bx - ax, by - ay
+                t = 0.0 if dx == dy == 0 else max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy)
+                                                         / (dx * dx + dy * dy)))
+                best = min(best, math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy)))
+            return best
+
+        areas = [[xy(p) for p in ring] for ring in rings]
+        pts = [xy(p) for p in fence]
+        worst, where = 0.0, None
+        for i, (a, b) in enumerate(zip(pts, pts[1:])):
+            steps = max(1, math.ceil(math.dist(a, b) / RC_EDGE_STEP_M))
+            for k in range(steps + 1):
+                q = (a[0] + (b[0] - a[0]) * k / steps, a[1] + (b[1] - a[1]) * k / steps)
+                out = min(outside_by(q, area) for area in areas)
+                if out > worst:
+                    worst = out
+                    where = ("point %d" % (i + 1) if k == 0 else "point %d" % (i + 2)
+                             if k == steps else "edge %d-%d" % (i + 1, i + 2))
+        if worst > RC_TOLERANCE_M:
+            problems.append("uav_geofence leaves the course and transit area by %.1f m at %s"
+                            % (worst, where))
+    if ceiling_m is None:
+        problems.append("uav_geofence_max_altitude_hae_m is not set: [geofence] "
+                        "max_altitude_hae_m in bridge.toml")
+    elif not 0 < ceiling_m <= max_ceiling_m:
+        problems.append("uav_geofence_max_altitude_hae_m is %g: it must be above 0 and at most %g"
+                        % (ceiling_m, max_ceiling_m))
+    return problems
 
 
 # ---- the gate on declaring an aircraft --------------------------------------

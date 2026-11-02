@@ -34,7 +34,7 @@ adopting a newer robocommand revision, and you read the diff when you do.
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-**Expect:** `Ran 356 tests` then `OK`.
+**Expect:** `Ran 498 tests` then `OK`.
 
 Config validation, sequence-store durability, the rate governor, the run state
 machine, the wire format, the vehicle link's frame boundaries, `ocs_hello` and
@@ -54,7 +54,7 @@ fails, nothing below is worth running.
 python -m unittest discover -s fleet/tests -t .
 ```
 
-**Expect:** `Ran 419 tests` then `OK`.
+**Expect:** `Ran 523 tests` then `OK`.
 
 MAVLink framing and CRC, routing, the `/fleet` schema, the RXL codec (every
 message, every length check, checked against the pinned protobuf when `.venv`
@@ -102,7 +102,7 @@ To see just the summary:
 .venv\Scripts\python.exe bench_stage2.py
 ```
 
-**Expect:** every line `PASS`, ending `16/16 checks passed`.
+**Expect:** every line `PASS`, ending `18/18 checks passed`.
 
 Stage 1 exercises the bridge over MQTT. This one exercises the **TCP link the
 vehicles actually use** — and it does it by importing the boat's own client,
@@ -129,6 +129,8 @@ $env:RX26_ASV = "C:\path\to\rx26_asv"
 | `B8` | One frame split across two writes arrives once — not twice, not never |
 | `B9b` | A command for USV1 does **not** go down UUV1's socket |
 | `B12b` | 20 heartbeats queued during an outage produce **one** frame on reconnect |
+| `B13` | A numbered task report from the boat's own `ocs_link` comes back `acknowledged` (the broker's PUBACK) |
+| `B14` | A report resent after a lost receipt is answered from the first copy, **not** published twice |
 
 `B7` and `B8` are the ones that matter most. TCP does not preserve message
 boundaries, and a client that reads whatever `recv()` happens to return works
@@ -242,7 +244,7 @@ different machine — delete `run/seq.json`. Nothing else rewinds them.
 .venv\Scripts\python.exe bench_stage3.py
 ```
 
-**Expect:** every line `PASS`, ending `21/21 checks passed`.
+**Expect:** every line `PASS`, ending `25/25 checks passed`.
 
 This is the one shaped like the submission. Handbook 3.1 asks for rc-test
 logs of a 3.4.10 run start sequence with **at least two vehicles** in the
@@ -386,6 +388,86 @@ Trim the `[[vehicle]]` blocks to **only the vehicles that will actually report**
 - [ ] Their log has **no** `[ERROR]` lines
 - [ ] Your page reaches `RUNNING` with a `run_id`
 - [ ] Your Commands pane shows the RunStart routed to each vehicle
+
+With UAV1 declared (8fc09f2), also:
+
+- [ ] Their log has `[geofence] ASTA: UAV geofence and ceiling OK` before `[auto-start]`.
+      A refusal is `[ERROR] ... RunDeclaration for ASTA refused: <why>` and **nothing
+      else**: no reply, no RunStart. The OCS page should have refused first, in words
+- [ ] The page's UAV fence line says `course + transit area inset ...` and shows the
+      ceiling; the call-sign box next to Declare was filled in
+- [ ] A task report sent during the run shows in **Task reports to RoboCommand** as
+      `acknowledged` (their broker's PUBACK), not just `published`
+
+### 4e. The sim box's own screen — rc_watch and the narrated tests
+
+The sim box (192.168.65.2, user `inspiration`) runs RoboNation's broker and test server
+at 8fc09f2 in `~/robocommand-8fc09f2/RobotX_2026`, plus **rc_watch** beside them:
+`OCS/rc_watch.compose.yml` copied there as `docker-compose.override.yml`, so
+`docker compose up -d` starts all three. The page is `http://192.168.65.2:8088` (Firefox
+on the box shows it): one live line per vehicle for heartbeats, a big amber card per
+task report, blue for requests, green for commands, red for a refusal read from their
+log, and the course, transit area and declared fence on a map.
+
+`OCS/rc_box_tests.py` (copied to `~/rcwatch/`) announces each test on that page --
+what is being done, what should happen, a countdown, then PASS or FAIL judged from
+what actually crossed the broker -- and drives it with their own `test_client` as
+team `TEST`, so a live OCS (team `ASTA`) is never answered by it:
+
+```
+ssh inspiration@192.168.65.2 python3 ~/rcwatch/rc_box_tests.py
+```
+
+B1 course carries the transit area · B2 no ceiling, refused silently · B3 fence
+outside, refused · B4 complete declaration, RunStart · B5 UAV registration in the
+heartbeat · B6 a task report among heartbeats · B7 MovingObjectAlert radius.
+7/7 on 2026-10-31. Updating `rc_watch.py` needs `docker restart rc-watch`, not a build.
+
+**Our OCS, end to end, on the same screen.** `OCS/rc_e2e.py` runs on the laptop (the
+one wired to the box) and puts our whole chain in front of the test server as team
+`ASTA`: its own ocs_web on a copy of `bridge.toml` (run state in a temp folder, vehicle
+link on loopback, no beacon, so no real vehicle joins), USV1 on the **boat's own
+`ocs_link.py`**, and UAV1 doing Ekko's fence read-back. Each step is announced on the
+box's page the same way. A step about RoboCommand's side is judged there by the watcher.
+A step about our side (the OCS's refusal, the PUBACK, what reached the boat) is judged
+on the laptop and posted to the page with the evidence. Narration goes over one ssh
+session (`rc_watch.py relay`) because the page takes steps from the box only; RoboCommand's
+alert comes from their `test_client` over a second one. Laptop, Windows PowerShell, in `OCS\`:
+
+```
+.venv\Scripts\python.exe rc_e2e.py
+```
+
+E1 course + transit area + a fence UAV1 holds · E2 no call sign, our OCS refuses and
+RoboCommand hears nothing · E3 with one, fence accepted and RunStart · E4 our OCS is
+RUNNING · E5 both heartbeats at 2 Hz · E6 a boat DockingReport reaches RoboCommand ·
+E7 our OCS shows it acknowledged (PUBACK) · E8 MovingObjectAlert, 7 m keep-out · E9 the
+boat's `ocs_link.py` receives it, radius intact. 9/9 on 2026-10-31. While it runs, our
+side is at `http://127.0.0.1:8099`; `--hold 300` keeps everything up 5 min afterwards.
+It refuses to start if an OCS, a vehicle link or fleet_link is already up on the laptop
+(it would drive it).
+
+### 4f. The real boat, through our live OCS — receipts and the OCS tile
+
+rc_e2e stands the boat's code up on the laptop; this is the boat itself. The live OCS
+(`$env:OCS_NO_FLEET = "1"` then `.\OCS.cmd --local-broker --bench-auto USV1,UAV1`: no
+fleet_link, whose adapter would take the UAV1 slot), the real Crusader on WiFi, and a
+stand-in UAV1 (`rc_e2e.Vehicle("UAV1", "TYPE_UAV", ...)` on 127.0.0.1:37564; it does
+Ekko's fence read-back). Each report is one `RoboCommandReport` on
+`/crsd/robocommand/report` in the boat's `asv` container (kind `docking`, body
+`{"bay_id": N}`), exactly what a BT leaf publishes. Where to look:
+
+| Step | OCS page (:8099) | Boat GUI (:8150) | Box page (:8088) |
+|---|---|---|---|
+| Report before Declare | **Task reports to RoboCommand**: grey `held`, "not declared" | **Reports** tab: red "held by the OCS: not declared ..." | nothing new: RoboCommand gets nothing before a declaration |
+| Declare USV1 + UAV1 | Run `RUNNING`; RunStart under **Commands** | Reports: `rx ocs_directive` (standby_auto), `rx run_start` | blue REQUEST `run_declaration`, green COMMAND `run_start`; ASTA/USV1 and ASTA/UAV1 at 2.0 Hz |
+| Report during the run | green `acknowledged`, seq N | Reports: green "acknowledged by RoboCommand, seq N" | amber TASK REPORT `docking`, ASTA/USV1 seq N |
+| Report while the OCS is gone | page: red **OCS UNREACHABLE** banner | **OCS** tile `DOWN · 1 without a receipt`; row "queued: no OCS link yet" | nothing until the OCS is back |
+| ... after it is back | `acknowledged`, and the run resumed `RUNNING` from `run/seq.json` | tile `UP`; the same row turns green, acknowledged | amber TASK REPORT, seq N |
+
+All five passed on 2026-10-31 (seq 8432 and 8657). The outage was the OCS stopped
+and restarted: from the boat that is a lost link that ends in a reset. A WiFi drop
+that sends no reset is not covered: neither end has a liveness timeout yet.
 
 ---
 

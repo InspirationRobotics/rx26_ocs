@@ -1133,7 +1133,7 @@ class TestFleetCard(BridgeCase):
         els = self.page()
         header = re.search(r"<tr><th>forwarded</th>.*?</tr>", self.PAGE.read_text(encoding="utf-8"), re.S)
         self.assertEqual(els["counters"].count("<td>"), header.group(0).count("<th"))
-        self.assertRegex(self.text(els["counters"]), r"^\d+ \d+ \d+ \d+ 1 \d+ \d+ \d+$")
+        self.assertRegex(self.text(els["counters"]), r"^\d+ \d+ \d+ \d+ \d+ 1 \d+ \d+ \d+$")
         self.assertIn("UAV1", els["fleet"])
         self.assertIn("radio via fleet_link", els["fleet"])
 

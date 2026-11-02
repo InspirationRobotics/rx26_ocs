@@ -18,6 +18,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -51,6 +52,9 @@ type = "TYPE_UAV"
 prefer = "radio"
 {uav_extra}
 
+[uav]
+pilot_callsign = "{callsign}"
+
 [team]
 host = "127.0.0.1"
 port = 1
@@ -82,9 +86,14 @@ class FakeMqtt:
 
     def __init__(self) -> None:
         self.published: list[tuple[str, bytes, int]] = []
+        self.mids: list[int] = []
 
     def publish(self, topic, payload, qos=0, **_kw):
+        """Like paho: an MQTTMessageInfo-alike carrying the mid that a PUBACK (the
+        bridge's on_publish) will name. rc 0 is MQTT_ERR_SUCCESS."""
         self.published.append((topic, payload, qos))
+        self.mids.append(len(self.mids) + 1)
+        return SimpleNamespace(mid=self.mids[-1], rc=0)
 
     def loop_stop(self):
         pass
@@ -149,12 +158,14 @@ ROBONATION_TEST_COURSE = [(1.280329, 103.8556869), (1.2804716, 103.8554529),
                           (1.280329, 103.8556869)]
 
 
-def course_bytes(cid: str = "ALPHA", freq: int = 25000, corners=None) -> bytes:
+def course_bytes(cid: str = "ALPHA", freq: int = 25000, corners=None, transit=()) -> bytes:
     c = rx_course_pb2.RxCourse()
     c.course_id = cid
     c.pinger_freq_hz = freq
     for lat, lon in (BOX if corners is None else corners):
         c.corners.add(latitude=lat, longitude=lon)
+    for lat, lon in transit:
+        c.uav_transit_area.add(latitude=lat, longitude=lon)
     return c.SerializeToString()
 
 
@@ -279,6 +290,18 @@ class VehicleClient:
             pass
 
 
+def with_ceiling(block: str, ceiling) -> str:
+    """A test's `[geofence]` block with `max_altitude_hae_m` in it, unless the test
+    set one itself or asked for none. Inserted under the test's own `[geofence]`
+    header when it has one: TOML refuses the same table twice."""
+    if ceiling is None or "max_altitude_hae_m" in block:
+        return block
+    line = "max_altitude_hae_m = %r" % float(ceiling)
+    if "[geofence]" in block:
+        return block.replace("[geofence]", "[geofence]\n" + line, 1)
+    return "[geofence]\n%s\n%s" % (line, block)
+
+
 class BridgeCase(unittest.TestCase):
     """A Bridge on an ephemeral TCP port with recording stand-ins for both brokers."""
 
@@ -289,6 +312,11 @@ class BridgeCase(unittest.TestCase):
     #: section and any `[[geofence.course]]` entries. Bare keys here would belong to
     #: the last table, which is why it is a block of its own.
     geofence = ""
+    #: What a declaration with an aircraft must carry besides the fence (8fc09f2):
+    #: `[geofence] max_altitude_hae_m` (None leaves it out) and `[uav]
+    #: pilot_callsign`. Test values, set so the existing tests still declare Ekko.
+    ceiling: float | None = 40.0
+    callsign = "Test UA0000"
     #: Vehicle ids for the bridge's bench dry-run switch (empty: off).
     bench_auto: tuple = ()
 
@@ -305,8 +333,8 @@ class BridgeCase(unittest.TestCase):
         cfg_path = tmp / "bridge.toml"
         cfg_path.write_text(CONFIG.format(
             team=TEAM, usv_extra=self.usv_extra, uav_extra=self.uav_extra,
-            limits=self.limits, geofence=self.geofence,
-            seq=(tmp / "seq.json").as_posix(),
+            limits=self.limits, geofence=with_ceiling(self.geofence, self.ceiling),
+            callsign=self.callsign, seq=(tmp / "seq.json").as_posix(),
             wire=(tmp / "wire").as_posix()), encoding="utf-8")
         bridge = Bridge(load(cfg_path), log=lambda m: self.logs.append(str(m)),
                         bench_auto=self.bench_auto)

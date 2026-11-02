@@ -137,11 +137,13 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
   /* ---- fences: course boundary (RoboCommand), the UAV geofence declared for this course, and
      what the autopilot holds (read back by fleet_link). CSS beats Leaflet's SVG attributes. */
   path.fence-course { stroke:var(--dim); stroke-width:2; stroke-dasharray:2 6; fill:none }
+  path.fence-transit { stroke:var(--dim); stroke-width:1.5; stroke-dasharray:1 4; fill:var(--dim); fill-opacity:.08 }
   path.fence-declared { stroke:var(--v-drone); stroke-width:2; stroke-dasharray:9 6; fill:none }
   path.fence-fc { stroke:var(--v-drone); stroke-width:4; stroke-opacity:.9; fill:var(--v-drone); fill-opacity:.14 }
   path.fence-fc.excl { stroke:var(--bad); fill:var(--bad) }
   .sw { display:inline-block; width:20px; height:0; vertical-align:middle; margin:0 4px 0 2px }
   .sw.course { border-top:2px dotted var(--dim) }
+  .sw.transit { border-top:6px solid var(--dim); opacity:.35 }
   .sw.decl { border-top:2px dashed var(--v-drone) }
   .sw.fc { border-top:4px solid var(--v-drone) }
 
@@ -184,6 +186,7 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
     <section>
       <h2>Geofence</h2>
       <div id="flegend" class="dim"><span class="sw course"></span>course (RoboCommand) ·
+        <span class="sw transit"></span>UAV transit area (RoboCommand) ·
         <span class="sw decl"></span>declared for this course ·
         <span class="sw fc"></span>on the autopilot (read back)</div>
       <div id="fences" class="dim">—</div>
@@ -446,17 +449,20 @@ const llOf = p => validFix(p && p.latitude, p && p.longitude);
 function fenceData(d) {
   const st = d.state || {};
   const course = st.course && Array.isArray(st.course.corners) ? st.course.corners.map(llOf).filter(Boolean) : [];
+  // RxCourse.uav_transit_area (8fc09f2): where the aircraft may fly besides the course itself.
+  const transit = st.course && Array.isArray(st.course.uav_transit_area)
+    ? st.course.uav_transit_area.map(llOf).filter(Boolean) : [];
   const declared = Array.isArray(st.uav_geofence) ? st.uav_geofence.map(llOf).filter(Boolean) : [];
   const vs = (d.fleet && d.fleet.ocs && d.fleet.ocs.vehicles) || {};
   const uploads = Object.keys(vs).sort().filter(id => vs[id] && vs[id].fence_upload)
                         .map(id => ({id, f: vs[id].fence_upload}));
-  return {course, declared, uploads, source: st.uav_geofence_source, reason: st.uav_geofence_reason,
+  return {course, transit, declared, uploads, source: st.uav_geofence_source, reason: st.uav_geofence_reason,
           confirms: st.fence_confirm || {}, maxAge: num(st.fence_confirm_max_age_s) || 180};
 }
 
 function drawFences(fd) {
   if (!HAVE_MAP) return;
-  const key = JSON.stringify([fd.course, fd.declared, fd.uploads.map(u => [u.id, u.f.autopilot_shapes])]);
+  const key = JSON.stringify([fd.course, fd.transit, fd.declared, fd.uploads.map(u => [u.id, u.f.autopilot_shapes])]);
   if (key === fenceKey) return;              // redraw only on change: no flicker, no churn
   fenceKey = key;
   fenceLayer.clearLayers();
@@ -478,6 +484,8 @@ function drawFences(fd) {
   }));
   if (fd.course.length >= 3)
     add(L.polygon(fd.course, {className: 'fence-course'}), 'course boundary (RoboCommand)', fd.course);
+  if (fd.transit.length >= 3)
+    add(L.polygon(fd.transit, {className: 'fence-transit'}), 'UAV transit area (RoboCommand)', fd.transit);
   if (fd.declared.length >= 3)
     add(L.polygon(fd.declared, {className: 'fence-declared'}), 'UAV geofence, declared for this course', fd.declared);
   fenceBounds = pts.length ? L.latLngBounds(pts) : null;
@@ -498,6 +506,8 @@ function fencesHtml(fd, d) {
              : n ? (n - (closed ? 1 : 0)) + ' vertices' + (fd.source ? ' <span class="dim">(' + esc(fd.source) + ')</span>' : '')
                  : pill(fd.course.length ? 'bad' : 'idle', 'none') + (fd.reason ? ' <span class="dim">' + esc(fd.reason) + '</span>' : ''))
            + field('course', !d.state ? '—' : fd.course.length ? fd.course.length + ' corners' : 'not received')
+           + field('transit area', !d.state || !fd.course.length ? '—'
+                   : fd.transit.length ? fd.transit.length + ' points' : 'none in RxCourse')
            + '</div>');
   // What the radio adapter told the OCS it read back (`ocs_fence`) -- the evidence the declare gate
   // judges. Not the same thing as the autopilot row below, which is fleet_link's own read.

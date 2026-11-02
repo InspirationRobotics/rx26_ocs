@@ -63,7 +63,10 @@ pinned RoboNation table and every coordinate against ±90/±180, and raises a pl
 `RxlError` — never `struct.error`, never a half-read dict (`rxl_codec.py:24-30`).
 Every encoder **refuses** a value that does not fit its field rather than
 truncating it. Enums are RoboNation's numbers (`rx_bridge/gen`, revision
-`f6457fa`). lat/lon are i32 × 1e-7 deg throughout.
+`8fc09f2`). lat/lon are i32 × 1e-7 deg throughout. MovingObjectAlert's
+`keep_out_radius_m` (new in 8fc09f2) has **no byte** in 0x24: the adapter logs
+`keep_out_radius_m=… NOT relayed over the radio` once per radius. Add it when Task 4
+Disruptive is attempted.
 
 | id | name | dir | bytes | layout (offset: field) |
 |---|---|---|---|---|

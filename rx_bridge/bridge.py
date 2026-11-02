@@ -73,6 +73,10 @@ REPORT_KINDS = tuple(
 #: run produces a handful; the cap is only so a long-lived process cannot grow
 #: this without bound.
 _SEQ_MAP_MAX = 256
+#: How many numbered vehicle reports are remembered for answering a resend.
+_RECEIPTED_MAX = 500
+#: How many receipts wait for a socket to take them (_flush_receipts).
+_RECEIPTS_OWED_MAX = 200
 
 
 class HeartbeatRate:
@@ -116,6 +120,8 @@ class Counters:
     dropped_rate: int = 0
     dropped_invalid: int = 0
     dropped_mistyped: int = 0
+    #: Aircraft heartbeats carrying a uav_registration other than bridge.toml's.
+    dropped_misregistered: int = 0
     stale: int = 0
     commands_routed: int = 0
     commands_undeliverable: int = 0
@@ -206,11 +212,39 @@ class Bridge:
         #: keeps it, "received_at": time.time(), "link": which link carried it}. Kept
         #: per vehicle, newest wins. The gate reads it (_uav_gate); never forwarded.
         self._fence_confirms: dict[str, dict] = {}
+        #: The declaration_seq a course change arrived under, while DECLARED or
+        #: RUNNING; None otherwise. Cleared by the next declaration or by ending.
+        self._course_changed_since: int | None = None
+        #: The vehicles the last declaration named, for "all declared AUTO". Empty
+        #: after a restart restores a run: the store keeps no vehicle list.
+        self._declared: tuple[str, ...] = ()
+        #: When every declared vehicle was last seen to become STATE_AUTO, or None.
+        self._all_auto_since: float | None = None
+        #: Task reports (every kind but heartbeat) with what became of each, newest
+        #: last: held before a declaration, dropped, published, acknowledged by
+        #: RoboCommand's broker. The page's answer to "did my report get there".
+        self.task_reports: deque[dict] = deque(maxlen=50)
+        #: MQTT mid -> its task_reports entry, until the broker's PUBACK; plus the
+        #: mids acknowledged before we could file them (publish() returns first).
+        self._awaiting_ack: dict[int, dict] = {}
+        self._early_acks: deque[int] = deque(maxlen=64)
+        #: (vehicle, its own seq, its sent_at in ns) -> the task_reports entry, for a
+        #: report that came in numbered on the vehicle link. ocs_link sends such a
+        #: report again after a reconnect until it has a final `ocs_receipt`; the
+        #: resend is answered from here and never published twice. In memory only:
+        #: a resend that crosses an OCS restart is published again.
+        self._receipted: OrderedDict[tuple[str, int, int], dict] = OrderedDict()
+        #: (entry, link) receipts owed, sent by _flush_receipts outside the lock.
+        self._receipts_owed: list[tuple[dict, str | None]] = []
 
         # What the web page reads. Decoded with protobuf's own MessageToDict
         # rather than a hand-written field list, so every field the handbook
         # defines shows up and a new one from RoboNation appears on its own.
         self.latest: dict[str, dict] = {}       # vehicle_id -> last report
+        #: vehicle_id -> the RobotState its last HEARTBEAT carried. latest[] holds
+        #: task reports too, and a vehicle must not read as "not AUTO" just because
+        #: its last frame was a DockingReport.
+        self.last_state: dict[str, str] = {}
         self.recent: deque[dict] = deque(maxlen=50)   # commands in, newest first
         self.course: dict = {}
         self.links = {"robocommand": False, "team": False}
@@ -250,6 +284,7 @@ class Bridge:
         self.rc.on_connect = self._on_rc_connect
         self.rc.on_disconnect = self._on_rc_disconnect
         self.rc.on_message = self._on_rc_message
+        self.rc.on_publish = self._on_rc_publish
 
         self.team = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
@@ -418,6 +453,18 @@ class Bridge:
             self.wire.frame("rx", msg.topic, msg.payload,
                             note="unexpected topic -- ignored")
 
+    def _on_rc_publish(self, _client, _ud, mid, _reason=None, _props=None) -> None:
+        """RoboCommand's broker acknowledged a QoS 1 publish (paho also calls this
+        when a QoS 0 heartbeat leaves, which nothing is waiting for)."""
+        with self._lock:
+            entry = self._awaiting_ack.pop(mid, None)
+            if entry is None:
+                self._early_acks.append(mid)
+            else:
+                _acknowledged(entry)
+                self._owe_receipt(entry)
+        self._flush_receipts()
+
     def _handle_course(self, payload: bytes) -> None:
         topic = self.cfg.rc_course_sub()
         course = rx_course_pb2.RxCourse()
@@ -441,7 +488,8 @@ class Bridge:
         # it beside the others, where the operator is looking before declaring.
         fence = geofence.for_course(
             course.course_id, [(c.latitude, c.longitude) for c in course.corners],
-            self._fence_table, self.cfg.geofence_margin_m)
+            self._fence_table, self.cfg.geofence_margin_m,
+            [(p.latitude, p.longitude) for p in course.uav_transit_area])
         if fence.polygon is None and self.cfg.has_uav():
             findings.append("UAV geofence: " + (fence.reason or "none"))
         decoded = _decode(course)
@@ -452,6 +500,13 @@ class Bridge:
             # fence is a function of the course, so it changed exactly when the
             # course did.
             changed = _without_sent_at(decoded) != _without_sent_at(self.course)
+            # RxCourse is republished whenever it changes (8fc09f2), including after
+            # we declared: the declaration then names a fence for the old course. Only
+            # a course that REPLACES one we held counts -- the first after a restart
+            # is not a change, we just never saw the one before.
+            if (changed and self.course and self.machine.state.name in ("DECLARED", "RUNNING")
+                    and self._course_changed_since is None):
+                self._course_changed_since = self.machine.declaration_seq
             self.course_findings = findings
             # The course and its fence move together, so a vehicle that connects
             # in this instant is never told one course with the other's fence.
@@ -475,6 +530,11 @@ class Bridge:
             self.log("COURSE SUSPECT: %s -- accepted anyway; check before "
                      "declaring" % detail)
             self.wire.event("course_suspect", detail)
+        if changed and self._course_changed_since is not None:
+            self.log("COURSE CHANGED since declaration seq=%s -- end and re-declare: the "
+                     "declared UAV geofence is the old course's" % self._course_changed_since)
+            self._run_event("course_changed", "since declaration seq=%s"
+                            % self._course_changed_since)
         if changed:
             # Information only -- the vehicle decides what, if anything, to do.
             # The new fence is already in place (above), so every aircraft is told
@@ -761,7 +821,8 @@ class Bridge:
                                     vehicle, conn.link,
                                     " DROPPED %s" % why if why else ""), obj)
         if why is None:
-            self._ingest_report(report, via="tcp")
+            self._ingest_report(report, via="tcp", link=conn.link)
+            self._flush_receipts()
         return vehicle or None
 
     def _bad_vehicle_frame(self, payload: bytes, conn: Conn, exc) -> None:
@@ -939,8 +1000,11 @@ class Bridge:
             # the socket that came up, not on the vehicle's best link: a fresh
             # WiFi client is not served by a snapshot that went down the radio.
             self._send_info([vid], "%s link up" % link, link=link)
+            # A report that was this socket's first frame was receipted before the
+            # socket was filed under its vehicle, so that receipt is still owed.
+            self._flush_receipts()
 
-    def _ingest_report(self, report, *, via: str) -> None:
+    def _ingest_report(self, report, *, via: str, link: str | None = None) -> None:
         """The hot path, from either transport.
 
         Everything from here down is deliberately transport-agnostic: staleness,
@@ -960,6 +1024,24 @@ class Bridge:
         self.counters.last_seen[vehicle] = now
         self.counters.last_via[vehicle] = via
         body = report.WhichOneof("body")
+        # A task report the vehicle numbered itself. ocs_link sends one again after a
+        # reconnect until this end has receipted it: the same report twice. The
+        # resend is answered with what became of the first and never published
+        # again -- before the governor, so it spends no rate token and no seq.
+        origin = (None, link)
+        if body != "heartbeat" and report.seq:
+            origin = ((vehicle, report.seq, report.sent_at.ToNanoseconds()), link)
+            with self._lock:
+                first = self._receipted.get(origin[0])
+            if first is not None:
+                self.log("%s sent its report seq=%d again: answered %s, not republished"
+                         % (vehicle, report.seq, first["verdict"]))
+                self.wire.event("resend", "%s seq=%d %s" % (vehicle, report.seq,
+                                                             first["verdict"]))
+                with self._lock:
+                    self._receipts_owed.append((first, link))
+                self._flush_receipts()
+                return
         # Before the gate below: the bridge is correctly silent toward
         # RoboCommand until we declare, but the operator still needs to see the
         # fleet then -- that is the window in which a sick vehicle can still be
@@ -970,11 +1052,14 @@ class Bridge:
         # snapshot, _note_auto_edge) must see one or the other, never the draft
         # in the middle of this vehicle's own publish.
         with self._lock:
-            self.latest[vehicle] = _decode(report)
-            if not self.machine.may_report():
-                return  # pre-declaration silence is correct, not an error
-
+            self._remember(vehicle, report)
             is_hb = body == "heartbeat"
+            if not self.machine.may_report():
+                if not is_hb:
+                    self._track(vehicle, body, report.seq, "held",
+                                "not declared: RoboCommand gets nothing before a declaration",
+                                origin)
+                return  # pre-declaration silence is correct, not an error
 
             if report.HasField("sent_at"):
                 age_ms = (now - report.sent_at.ToNanoseconds() / 1e9) * 1000.0
@@ -991,6 +1076,9 @@ class Bridge:
             if not self._gov[vehicle].allow(time.monotonic(), heartbeat=is_hb):
                 self.counters.dropped_rate += 1
                 self.wire.event("rate_drop", "%s %s" % (vehicle, body))
+                if not is_hb:
+                    self._track(vehicle, body, report.seq, "dropped",
+                                "over the 5/s rate cap (governor)", origin)
                 return
 
             # A heartbeat that disagrees with the config about what kind of
@@ -1013,6 +1101,23 @@ class Bridge:
                     self.log("DROP: " + detail)
                     self.wire.event("mistyped", detail)
                     return
+                # uav_registration (8fc09f2) is stamped here, once, so every source
+                # of an aircraft's heartbeats -- its own client, the radio, the
+                # adapter's stand-in -- carries the one in bridge.toml. A reporter
+                # sending a DIFFERENT one is misconfigured, and Garuda relays these
+                # for Network Remote ID: dropped like a mistyped one, not published.
+                if spec.is_uav:
+                    sent = report.heartbeat.uav_registration
+                    if sent and sent != spec.registration:
+                        self.counters.dropped_misregistered += 1
+                        detail = "%s sent uav_registration %r but bridge.toml has %s" % (
+                            vehicle, sent, repr(spec.registration) if spec.registration
+                            else "none")
+                        self.log("DROP: " + detail)
+                        self.wire.event("misregistered", detail)
+                        return
+                    if spec.registration:
+                        report.heartbeat.uav_registration = spec.registration
 
             # BENCH AUTO (benchauto.py): the one rewrite of a vehicle's own value,
             # chosen by the operator on the command line. After the gates above
@@ -1026,6 +1131,9 @@ class Bridge:
                 detail = "; ".join(str(f) for f in findings)
                 self.log("DROP %s: %s" % (vehicle, detail))
                 self.wire.event("invalid", detail)
+                if not is_hb:
+                    self._track(vehicle, body, report.seq, "dropped", "invalid: " + detail,
+                                origin)
                 return
 
             # The vehicle's own seq, if it put one on the report (0 if not).
@@ -1043,16 +1151,22 @@ class Bridge:
                 self._count_bench_auto(vehicle, bench_from)
             if is_hb:
                 self.hb_rate.record(vehicle, now)
+                entry = None
             else:
                 self._remember_seq(vehicle, seq, own_seq, body)
+                entry = self._track(vehicle, body, own_seq, "published",
+                                    "seq=%d, awaiting the broker's PUBACK" % seq, origin)
+                entry["seq"] = seq
             # Record it again now that seq and sent_at are ours, so the page
             # shows the frame RoboCommand actually received rather than the
             # vehicle's draft of it. The earlier write above is what keeps a
             # dropped or pre-declaration frame visible at all.
-            self.latest[vehicle] = _decode(report)
+            self._remember(vehicle, report)
 
         topic = self.cfg.rc_report_topic(vehicle)
-        self.rc.publish(topic, payload, qos=0 if is_hb else 1)
+        info = self.rc.publish(topic, payload, qos=0 if is_hb else 1)
+        if entry is not None:
+            self._await_ack(entry, info)
         note = "seq=%d %s%s" % (seq, body,
                                 " (vehicle seq=%d)" % own_seq if own_seq else "")
         if bench_from:
@@ -1061,6 +1175,82 @@ class Bridge:
                         decoded=lambda: _wire_dict(report))
         if is_hb:
             self._note_auto_edge()
+
+    def _track(self, vehicle: str, kind: str, own_seq: int, verdict: str,
+               detail: str, origin: tuple = (None, None)) -> dict:
+        """File what became of one task report, for the page. Caller holds the lock.
+
+        `origin` is (resend key, vehicle link) from _ingest_report: a report the
+        vehicle numbered is remembered for answering its resend, and a verdict that
+        is already final (held, dropped) owes the vehicle its receipt now. A
+        published one owes it from _await_ack."""
+        entry = {"at": time.time(), "vehicle": vehicle, "kind": kind,
+                 "vehicle_seq": own_seq or None, "seq": None, "verdict": verdict,
+                 "detail": detail}
+        self.task_reports.append(entry)
+        key, link = origin
+        if key is not None:
+            entry["link"] = link
+            self._receipted[key] = entry
+            while len(self._receipted) > _RECEIPTED_MAX:
+                self._receipted.popitem(last=False)
+            if verdict != "published":
+                self._receipts_owed.append((entry, link))
+        return entry
+
+    def _await_ack(self, entry: dict, info) -> None:
+        """Hold a published task report until RoboCommand's broker acknowledges it.
+        paho keeps a QoS 1 message published with the link down and sends it on
+        reconnect, so "queued" is not "lost" -- but it is not "there" either."""
+        with self._lock:
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                entry["detail"] = "seq=%d, queued: no RoboCommand link (%s)" % (
+                    entry["seq"], mqtt.error_string(info.rc))
+            if info.mid in self._early_acks:
+                self._early_acks.remove(info.mid)
+                _acknowledged(entry)
+            else:
+                self._awaiting_ack[info.mid] = entry
+                while len(self._awaiting_ack) > 200:       # a link down for a long time
+                    self._awaiting_ack.pop(next(iter(self._awaiting_ack)))
+            self._owe_receipt(entry)
+        self._flush_receipts()
+
+    def _owe_receipt(self, entry: dict) -> None:
+        """Caller holds the lock."""
+        if "link" in entry:
+            self._receipts_owed.append((entry, entry["link"]))
+
+    def _flush_receipts(self) -> None:
+        """Send the receipts owed, outside the lock: a vehicle socket slow to drain
+        must not stall the hot path for every vehicle. One that no socket took stays
+        owed -- a socket's first frame is handled before tcpserver files the socket
+        under its vehicle -- and goes when that link comes up (_on_link_change)."""
+        with self._lock:
+            owed, self._receipts_owed = self._receipts_owed, []
+        kept = [(entry, link) for entry, link in owed if not self._send_receipt(entry, link)]
+        if kept:
+            with self._lock:
+                self._receipts_owed[:0] = kept
+                del self._receipts_owed[:-_RECEIPTS_OWED_MAX]
+
+    def _send_receipt(self, entry: dict, link: str | None) -> bool:
+        """`ocs_receipt`: what became of one numbered task report, as it stands now, on
+        `link`, the one it (or its resend) came in on. Never over the radio -- RXL has
+        no message for it. False if no socket took it. A receipt that never arrives
+        costs nothing: the vehicle sends the report again after a reconnect and is
+        answered from _receipted. Final verdicts are acknowledged, held and dropped."""
+        if link is None or link == "radio":
+            return True
+        obj = {"ocs_receipt": {"vehicle_seq": entry["vehicle_seq"], "kind": entry["kind"],
+                               "verdict": entry["verdict"], "seq": entry["seq"],
+                               "detail": entry["detail"]}}
+        body = json.dumps(obj).encode("utf-8")
+        if self._send_to_vehicle(entry["vehicle"], body, link) is None:
+            return False
+        self._wire_to_vehicle(entry["vehicle"], link, body, obj, "ocs_receipt %s seq=%d"
+                              % (entry["verdict"], entry["vehicle_seq"]))
+        return True
 
     def _count_bench_auto(self, vehicle: str, original: str) -> None:
         """One frame of `vehicle` was published as AUTO. Caller holds the lock.
@@ -1179,30 +1369,43 @@ class Bridge:
         declaration reports STATE_AUTO -- with no timeout and no error, so a
         fleet stuck one vehicle short looks exactly like a broken link to
         their server. This names the vehicle, which turns a silent wait into
-        something the operator can act on.
+        something the operator can act on. Judged on the vehicles the last
+        declaration named; every configured one when there is none to go by (before
+        declaring, or after a restart restored the run without its vehicle list).
         """
-        out = []
-        for spec in self.cfg.vehicles:
-            hb = (self.latest.get(spec.id) or {}).get("heartbeat") or {}
-            if hb.get("state") != "STATE_AUTO":
-                out.append(spec.id)
-        return out
+        return [vid for vid in self._declared or self.cfg.vehicle_ids
+                if self.last_state.get(vid) != "STATE_AUTO"]
+
+    def _any_uav(self, ids) -> bool:
+        return any(self.cfg.vehicle(v).is_uav for v in ids)
+
+    def _remember(self, vehicle: str, report) -> None:
+        """latest[] for the page, and for a heartbeat the state awaiting_auto judges by.
+        Caller holds the lock."""
+        decoded = _decode(report)
+        self.latest[vehicle] = decoded
+        if "heartbeat" in decoded:
+            self.last_state[vehicle] = decoded["heartbeat"].get("state", "")
 
     def _note_auto_edge(self) -> None:
         """Log the moment the fleet becomes fully AUTO, once.
 
         That instant is when RunStart becomes their side's responsibility. If
-        it does not arrive after this line, the problem is not our fleet.
+        it does not arrive after this line, the problem is not our fleet --
+        though since 8fc09f2 RoboCommand may also hold RunStart for Garuda's
+        clearance and the course manager's approval, so a wait is not a fault.
         """
         with self._lock:      # latest[] is rewritten under it -- see _ingest_report
             waiting = self.awaiting_auto()
             if not waiting and not self._all_auto:
                 self._all_auto = True
+                self._all_auto_since = time.time()
                 self.log("all declared vehicles report STATE_AUTO -- RunStart is "
                          "now RoboCommand's move")
-                self.wire.event("all_auto", ", ".join(self.cfg.vehicle_ids))
+                self.wire.event("all_auto", ", ".join(self._declared or self.cfg.vehicle_ids))
             elif waiting and self._all_auto:
                 self._all_auto = False
+                self._all_auto_since = None
                 self.log("no longer all AUTO -- waiting on %s" % ", ".join(waiting))
 
     def active_ids(self, now: float | None = None) -> tuple[str, ...]:
@@ -1292,11 +1495,14 @@ class Bridge:
         fence gate. declare() asks it before it builds anything and the page's
         button asks it every poll (snapshot `run.may_declare` and
         `run.declare_blocker`), so the button and the endpoint cannot disagree --
-        the endpoint refuses on its own, whatever the page showed.
+        the endpoint refuses on its own, whatever the page showed. The one thing
+        the page holds is the pilot's call sign, judged only when given -- so the
+        button's verdict is everything but that, and the page checks its box.
         """
         return self._check_declare(now)[0]
 
-    def _check_declare(self, now: float | None = None) -> tuple[str | None, tuple[str, ...]]:
+    def _check_declare(self, now: float | None = None, callsign: str | None = None
+                       ) -> tuple[str | None, tuple[str, ...]]:
         """(declare_blocker, the active set it was judged on). One call, so the
         set the gate looked at is exactly the set a declaration then names."""
         with self._lock:
@@ -1322,10 +1528,28 @@ class Bridge:
                        ", ".join(active) or "nothing")
                 ), active
 
-            problems = self._uav_gate(active, now)
+            problems = self._rc_rules(active, callsign) + self._uav_gate(active, now)
             if problems:
                 return "cannot declare -- " + "; ".join(problems), active
             return None, active
+
+    def _rc_rules(self, active, callsign: str | None) -> list[str]:
+        """What RoboCommand itself refuses a declaration with an aircraft for, and
+        refuses SILENTLY -- no reply, the run just never starts: its rules on the
+        fence and the ceiling (geofence.rc_declaration_problems), then a blank
+        pilot call sign when one is given. Empty for a declaration without an
+        aircraft. Caller holds the lock."""
+        if not self._any_uav(active):
+            return []
+        out = geofence.rc_declaration_problems(
+            self._fence.polygon,            # None: _uav_gate says why there is none
+            _latlons(self.course.get("corners")),
+            _latlons(self.course.get("uav_transit_area")),
+            self.cfg.geofence_ceiling_hae_m, self.cfg.geofence_ceiling_limit_hae_m)
+        if callsign is not None and not callsign.strip():
+            out.append("the UAV pilot's call sign is blank: type it next to Declare "
+                       "(MyDroneFleets: first name + UAPL number)")
+        return out
 
     def _uav_gate(self, active, now: float) -> list[str]:
         """One problem per declared aircraft whose autopilot is not KNOWN to hold
@@ -1345,10 +1569,14 @@ class Bridge:
                 out.append(why)
         return out
 
-    def declare(self) -> str:
-        """Publish the RunDeclaration. This is what creates the obligations."""
+    def declare(self, callsign: str | None = None) -> str:
+        """Publish the RunDeclaration. This is what creates the obligations.
+
+        `callsign` is the page's box; None falls back to `[uav] pilot_callsign`.
+        Only a declaration with an aircraft carries it and the ceiling."""
+        callsign = (self.cfg.uav_pilot_callsign if callsign is None else callsign).strip()
         with self._lock:
-            blocked, active = self._check_declare()
+            blocked, active = self._check_declare(callsign=callsign)
             if blocked:
                 return blocked
 
@@ -1370,6 +1598,10 @@ class Bridge:
             decl.task3_tier = tier.Value(self.cfg.tiers[2])
             decl.task4_tier = tier.Value(self.cfg.tiers[3])
             _fill_fence(decl, self._fence.polygon)
+            if self._any_uav(active):
+                # Both checked by _rc_rules above: set, in range, not blank.
+                decl.uav_geofence_max_altitude_hae_m = self.cfg.geofence_ceiling_hae_m
+                decl.uav_pilot_callsign = callsign
 
             # Nothing in a declaration has an honest UNKNOWN: there are no
             # per-vehicle exemptions to inherit here, only four tiers that must
@@ -1385,6 +1617,9 @@ class Bridge:
             # A new run needs its own readiness edge, or the "all AUTO"
             # line from the previous run suppresses this run's.
             self._all_auto = False
+            self._all_auto_since = None
+            self._declared = tuple(active)
+            self._course_changed_since = None
             self.seqs.save_run(self.machine.state.name,
                                self.machine.declaration_seq, self.machine.run_id)
 
@@ -1408,6 +1643,7 @@ class Bridge:
         with self._lock:
             v = self.machine.on_end()
             if v.ok:
+                self._course_changed_since = None
                 self.seqs.save_run(self.machine.state.name,
                                    self.machine.declaration_seq, self.machine.run_id)
         if v.ok:
@@ -1470,7 +1706,26 @@ class Bridge:
                         # fence gate -- and, when it is false, the reason in words.
                         # null reason = declarable. The page's button reads these.
                         "may_declare": blocked is None,
-                        "declare_blocker": blocked},
+                        "declare_blocker": blocked,
+                        # A course that replaced the one we declared on: the
+                        # declaration_seq it arrived under, or null. End, re-declare.
+                        "course_changed_since": self._course_changed_since,
+                        # When every declared vehicle became STATE_AUTO, or null.
+                        # RoboCommand may hold RunStart past it (Garuda, the course
+                        # manager), so the page counts, it does not time out.
+                        "all_auto_since": self._all_auto_since,
+                        "declared": list(self._declared)},
+                # What a declaration with an aircraft carries besides the fence. The
+                # call sign here is only the default for the page's box.
+                "uav": {"in_declaration": self._any_uav(active_now),
+                        "ceiling_hae_m": self.cfg.geofence_ceiling_hae_m,
+                        "ceiling_limit_hae_m": self.cfg.geofence_ceiling_limit_hae_m,
+                        "pilot_callsign": self.cfg.uav_pilot_callsign,
+                        "registration": {v.id: v.registration for v in self.cfg.vehicles
+                                         if v.is_uav}},
+                # Every task report (not heartbeats) and what became of it, newest
+                # first: held / dropped / published / acknowledged by the broker.
+                "task_reports": [dict(e) for e in reversed(self.task_reports)],
                 "course": self.course,
                 "course_findings": list(self.course_findings),
                 # The UAV geofence for the CURRENT course (closed, RunDeclaration's own JSON
@@ -1494,11 +1749,7 @@ class Bridge:
                     "vehicles": list(self.bench_auto),
                     "substituted": c.bench_auto_counts(self.bench_auto),
                 },
-                "awaiting_auto": [
-                    v.id for v in self.cfg.vehicles
-                    if ((self.latest.get(v.id) or {}).get("heartbeat") or {})
-                    .get("state") != "STATE_AUTO"
-                ],
+                "awaiting_auto": self.awaiting_auto(),
                 "vehicles": [
                     {"id": v.id, "type": v.type, "relay_via": v.relay_via,
                      "stale_ms": self.cfg.stale_ms_for(v.id),
@@ -1536,6 +1787,7 @@ class Bridge:
                              "dropped_rate": c.dropped_rate,
                              "dropped_invalid": c.dropped_invalid,
                              "dropped_mistyped": c.dropped_mistyped,
+                             "dropped_misregistered": c.dropped_misregistered,
                              "dropped_not_preferred":
                                  sum(c.dropped_not_preferred.values()),
                              "stale": c.stale,
@@ -1749,6 +2001,18 @@ def _wire_dict(msg) -> dict:
     set: this is a record of what was ON the wire, not of the schema's defaults.
     """
     return json_format.MessageToDict(msg, preserving_proto_field_name=True)
+
+
+def _latlons(points) -> list[tuple[float, float]]:
+    """[(lat, lon)] from a decoded repeated LatLng; [] when the field is absent."""
+    return [(p.get("latitude", 0.0), p.get("longitude", 0.0)) for p in points or ()]
+
+
+def _acknowledged(entry: dict) -> None:
+    """A task report's PUBACK arrived: RoboCommand's broker has it."""
+    entry["verdict"] = "acknowledged"
+    entry["acked_at"] = time.time()
+    entry["detail"] = "seq=%d, RoboCommand's broker acknowledged it (PUBACK)" % entry["seq"]
 
 
 def _without_sent_at(course: dict) -> dict:

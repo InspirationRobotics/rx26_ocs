@@ -24,7 +24,7 @@ from pathlib import Path
 
 from .beacon import (DEFAULT_INTERVAL_S, DEFAULT_NEVER_ON, DEFAULT_PORT,
                      MAX_INTERVAL_S, is_port)
-from .geofence import DEFAULT_CONFIRM_MAX_AGE_S, DEFAULT_MARGIN_M
+from .geofence import DEFAULT_CONFIRM_MAX_AGE_S, DEFAULT_MARGIN_M, RC_MAX_CEILING_HAE_M
 
 #: TaskTier names from common.proto. TIER_UNKNOWN is deliberately absent: it is
 #: the proto3 zero value, never a legal thing to declare.
@@ -104,6 +104,12 @@ class Vehicle:
     #: client that cannot tolerate a top-level key it does not know.
     send_info: bool = True
 
+    #: UAV only: its CAAS registration, which RoboCommand wants in
+    #: Heartbeat.uav_registration when the team has more than one UAV registered
+    #: (Garuda relays UAV heartbeats for Network Remote ID). The bridge stamps it
+    #: on every heartbeat, whichever link brought it. Blank: the field stays blank.
+    registration: str = ""
+
     @property
     def allow_unknown(self) -> tuple[str, ...]:
         return _ALLOW_UNKNOWN_BY_TYPE[self.type]
@@ -163,6 +169,21 @@ class Config:
     #: ((course_id, ((lat, lon), ...)), ...). A tuple of pairs because the config
     #: is frozen; `geofence_table` is the dict.
     geofence_courses: tuple[tuple[str, tuple[tuple[float, float], ...]], ...] = ()
+    #: `[geofence] max_altitude_hae_m`: the ceiling declared with an aircraft
+    #: (RunDeclaration.uav_geofence_max_altitude_hae_m), metres above the WGS84
+    #: ellipsoid. No default: it is the team's decision, and RoboCommand refuses a
+    #: declaration with an aircraft and no ceiling -- silently -- so without one the
+    #: bridge refuses to declare an aircraft at all.
+    geofence_ceiling_hae_m: float | None = None
+    #: `[geofence] ceiling_limit_hae_m`: the most RoboCommand accepts. Their test
+    #: server refuses above 50 m HAE (MAX_UAV_ALTITUDE_HAE_M); handbook 5.3.3 says
+    #: 60 m AMSL. The stricter one until RoboNation says otherwise.
+    geofence_ceiling_limit_hae_m: float = RC_MAX_CEILING_HAE_M
+    #: `[uav] pilot_callsign`: what the page's call-sign box starts with --
+    #: RunDeclaration.uav_pilot_callsign, the pilot's MyDroneFleets call sign (first
+    #: name + UAPL number). Per run, so the page can change it; blank blocks a
+    #: declaration with an aircraft in it.
+    uav_pilot_callsign: str = ""
 
     rate: float = 5.0
     heartbeat_reserve: float = 2.0
@@ -307,6 +328,16 @@ def _vehicles(raw: dict) -> tuple[Vehicle, ...]:
             raise ConfigError(
                 f"vehicle {vid}: send_info = {send_info!r} must be true or false"
             )
+        registration = entry.get("registration", "")
+        if not isinstance(registration, str):
+            raise ConfigError(
+                f"vehicle {vid}: registration = {registration!r} must be a string"
+            )
+        if registration.strip() and vtype != "TYPE_UAV":
+            raise ConfigError(
+                f"vehicle {vid}: registration is for aircraft only (Heartbeat."
+                f"uav_registration); {vid} is {vtype}"
+            )
 
         out.append(
             Vehicle(
@@ -316,6 +347,7 @@ def _vehicles(raw: dict) -> tuple[Vehicle, ...]:
                 stale_ms=float(stale) if stale is not None else None,
                 prefer=prefer,
                 send_info=send_info,
+                registration=registration.strip(),
             )
         )
 
@@ -400,6 +432,36 @@ def _number(section: dict, key: str, default: float, where: str) -> float:
             or not math.isfinite(v) or not v > 0):
         raise ConfigError(f"{where}.{key} = {v!r} must be a number above 0")
     return float(v)
+
+
+def _ceiling(raw: dict) -> tuple[float | None, float]:
+    """`[geofence]` max_altitude_hae_m and ceiling_limit_hae_m: (ceiling or None, limit).
+
+    The ceiling is checked against the limit here, at load, as well as before every
+    declaration: a value RoboCommand will refuse is a config error, not a run that
+    silently never starts."""
+    section = raw.get("geofence", {})
+    if not isinstance(section, dict):
+        raise ConfigError("[geofence] is not a table")
+    limit = _number(section, "ceiling_limit_hae_m", RC_MAX_CEILING_HAE_M, "geofence")
+    if "max_altitude_hae_m" not in section:
+        return None, limit
+    ceiling = _number(section, "max_altitude_hae_m", 0.0, "geofence")
+    if ceiling > limit:
+        raise ConfigError(
+            f"geofence.max_altitude_hae_m = {ceiling:g} is above ceiling_limit_hae_m = "
+            f"{limit:g}: RoboCommand refuses the declaration, and says nothing")
+    return ceiling, limit
+
+
+def _callsign(raw: dict) -> str:
+    section = raw.get("uav", {})
+    if not isinstance(section, dict):
+        raise ConfigError("[uav] is not a table")
+    sign = section.get("pilot_callsign", "")
+    if not isinstance(sign, str):
+        raise ConfigError(f"uav.pilot_callsign = {sign!r} must be a string")
+    return sign.strip()
 
 
 def _geofence(raw: dict) -> tuple[float, float, tuple]:
@@ -488,6 +550,7 @@ def load(path: str | Path) -> Config:
     except (TypeError, ValueError):
         raise ConfigError("uav_geofence (retired) is not a list of [lat, lon] pairs") from None
     margin_m, confirm_max_age_s, courses = _geofence(raw)
+    ceiling, ceiling_limit = _ceiling(raw)
 
     limits = raw.get("limits", {})
     paths = raw.get("paths", {})
@@ -509,6 +572,9 @@ def load(path: str | Path) -> Config:
         geofence_margin_m=margin_m,
         geofence_confirm_max_age_s=confirm_max_age_s,
         geofence_courses=courses,
+        geofence_ceiling_hae_m=ceiling,
+        geofence_ceiling_limit_hae_m=ceiling_limit,
+        uav_pilot_callsign=_callsign(raw),
         rate=float(limits.get("rate", 5.0)),
         heartbeat_reserve=float(limits.get("heartbeat_reserve", 2.0)),
         stale_ms=float(limits.get("stale_ms", 1000.0)),

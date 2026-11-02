@@ -309,6 +309,40 @@ def main() -> int:
           "20 reports queued during the outage produced %d frames on reconnect "
           "-- latest-wins, not a backlog" % sent_after)
 
+    print("\nB13-B14  receipts: a numbered task report is answered, a resend not republished")
+    receipts: list[dict] = []
+    sent: list[dict] = []
+    link.on_receipt, link.on_sent = receipts.append, sent.append
+
+    def docked() -> int:
+        return len([r for r in rc.reports if r.WhichOneof("body") == "docking"])
+
+    docked0 = docked()
+    vseq = link.send_report({"team_id": TEAM, "vehicle_id": "USV1", "sent_at": rfc3339(),
+                             "docking": {"bay_id": 2}})
+    settle(1.5)
+    verdicts = [r["verdict"] for r in receipts if r["vehicle_seq"] == vseq]
+    # "published" comes first unless the PUBACK beat the bridge to registering the mid.
+    check("B13", verdicts[-1:] == ["acknowledged"] and link.unreceipted == 0,
+          "the boat's report seq=%d was receipted %s; %d still wait for one"
+          % (vseq, verdicts, link.unreceipted))
+
+    # The acknowledged receipt is lost on the way: the boat still holds the report, so
+    # its next connection sends it again (ocs_link _requeue), and the OCS must answer
+    # that from the first -- not publish it twice.
+    link._unreceipted[vseq] = next(f for f in sent if f.get("seq") == vseq)
+    n_receipts = len(verdicts)
+    bridge.tcp.stop()
+    settle(1.0)
+    bridge.tcp.start()
+    settle(7.0)                            # past the client's 5 s retry
+    verdicts = [r["verdict"] for r in receipts if r["vehicle_seq"] == vseq]
+    resent = len([f for f in sent if f.get("seq") == vseq])
+    check("B14", resent == 2 and docked() - docked0 == 1
+          and verdicts[n_receipts:] == ["acknowledged"] and link.unreceipted == 0,
+          "sent %d times, RoboCommand got it %d time(s), the resend was answered %s"
+          % (resent, docked() - docked0, verdicts[n_receipts:]))
+
     link.stop()
     bridge.stop()
 

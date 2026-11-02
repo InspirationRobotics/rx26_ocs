@@ -60,12 +60,16 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
   button.stop { border-color:var(--stop-line); background:var(--stop-bg); color:var(--stop-fg) }
   #banner, #benchbanner { background:var(--banner-bg); border:1px solid var(--banner-line); color:var(--banner-fg);
             padding:6px 12px; border-radius:5px; margin-bottom:12px; display:none }
+  #deadbanner { background:var(--stop-bg); border:1px solid var(--stop-line); color:var(--stop-fg);
+                padding:6px 12px; border-radius:5px; margin-bottom:12px; display:none; font-weight:bold }
+  html[data-ocs="unreachable"] body > :not(#deadbanner) { opacity:.4 }
   pre { margin:0; max-height:150px; overflow:auto; color:var(--pre); font-size:12px }
   .muted { color:var(--muted) }
   details summary { cursor:pointer; color:var(--h2) }
   details pre { max-height:260px; margin-top:6px }
 </style>
 
+<div id="deadbanner"></div>
 <div id="banner">⚠ FAKE DATA INJECTION IS ENABLED — this OCS can publish heartbeats no vehicle sent.</div>
 <div id="benchbanner"></div>
 
@@ -88,9 +92,11 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
       <tr><th title="the UAV geofence for this course, and whether each aircraft's autopilot was read back holding it">UAV fence</th>
           <td id="uavfence" style="white-space:normal; max-width:46ch">—</td></tr>
     </table>
-    <div style="margin-top:10px; display:flex; gap:8px">
-      <button class="go" onclick="post('/api/declare')">Declare run</button>
+    <div style="margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+      <button class="go" onclick="post('/api/declare', {callsign: $('callsign').value})">Declare run</button>
       <button class="stop" onclick="post('/api/end')">End run</button>
+      <input id="callsign" placeholder="UAV pilot call sign" size="18" style="display:none"
+             title="RunDeclaration.uav_pilot_callsign: the pilot's MyDroneFleets call sign for this run, first name + UAPL number">
     </div>
     <div id="activecount" class="muted" style="margin-top:6px"></div>
     <div id="declblock" style="margin-top:6px; white-space:normal; max-width:46ch"></div>
@@ -100,15 +106,19 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
   <div class="card grow">
     <table>
       <tr><th>forwarded</th><th>rate</th><th>invalid</th><th>mistyped</th>
+          <th title="aircraft heartbeats carrying a uav_registration other than bridge.toml's">misreg.</th>
           <th title="a copy another link had already delivered">not pref.</th>
           <th>stale</th><th>cmds</th><th>undeliv.</th></tr>
-      <tr id="counters"><td colspan="8" class="muted">—</td></tr>
+      <tr id="counters"><td colspan="9" class="muted">—</td></tr>
     </table>
   </div>
 </div>
 
 <h2>Fleet</h2>
 <div id="fleet" class="row"></div>
+
+<h2>Task reports to RoboCommand</h2>
+<div class="card"><table id="treports"><tr><td class="muted">none yet</td></tr></table></div>
 
 <h2>Commands from RoboCommand</h2>
 <div class="card"><table id="cmds"><tr><td class="muted">nothing yet</td></tr></table></div>
@@ -324,16 +334,64 @@ function fenceCell(s) {
     ? `<b>${esc(s.uav_geofence_source || '?')}</b> <span class="muted">${f.length - 1} vertices</span>`
     : pill(held ? 'bad' : 'idle', 'none') + ` <span class="muted">${esc(s.uav_geofence_reason || '')}</span>`;
   const max = s.fence_confirm_max_age_s || 180;
-  (s.vehicles || []).filter(v => v.type === 'TYPE_UAV').forEach(v => {
+  const uavs = (s.vehicles || []).filter(v => v.type === 'TYPE_UAV');
+  uavs.forEach(v => {
     out += `<div>${confirmLine(v, (s.fence_confirm || {})[v.id], max)}</div>`;
   });
+  // What a declaration with an aircraft carries besides the polygon. No ceiling: RoboCommand
+  // refuses the declaration and says nothing, so the bridge will not declare an aircraft.
+  const u = s.uav || {};
+  if (uavs.length) {
+    out += `<div>ceiling ` + (u.ceiling_hae_m != null
+      ? `<b>${u.ceiling_hae_m} m HAE</b> <span class="muted">(at most ${u.ceiling_limit_hae_m})</span>`
+      : pill('bad', 'not set') + ` <span class="muted">[geofence] max_altitude_hae_m in bridge.toml</span>`)
+      + ` <span class="muted">· registration ${uavs.map(v => esc(v.id) + ' '
+          + esc((u.registration || {})[v.id] || 'none')).join(', ')}</span></div>`;
+  }
   return out;
+}
+
+// What became of each task report: held (not declared yet), dropped (and why), published
+// (handed to the RoboCommand link, no PUBACK yet) or acknowledged (their broker has it).
+const VERDICT = {acknowledged: 'ok', published: 'warn', held: 'idle', dropped: 'bad'};
+function taskReportRows(list) {
+  return list.length ? list.map(t => `<tr>
+      <td>${new Date(t.at*1000).toLocaleTimeString()}</td><td><b>${esc(t.vehicle)}</b></td>
+      <td><b>${esc(t.kind)}</b></td><td>${pill(VERDICT[t.verdict] || 'idle', t.verdict)}</td>
+      <td class="muted" style="white-space:normal">${esc(t.detail)}</td></tr>`).join('')
+    : '<tr><td class="muted">none yet: only task reports are listed here, never heartbeats</td></tr>';
+}
+
+// The one number a moving-object alert or keep-out zone is about. A radius left out is shown
+// as left out: the schema's 5 m default is RoboCommand's to apply, not ours to display.
+function commandDetail(k) {
+  const b = k.body || {};
+  if (b.moving_object_alert) {
+    const r = b.moving_object_alert.keep_out_radius_m;
+    return r != null ? `keep-out ${r} m` : 'keep-out radius NOT SENT';
+  }
+  if (b.keep_out_zone && b.keep_out_zone.radius_m != null) return `radius ${b.keep_out_zone.radius_m} m`;
+  return '';
+}
+let callsignSeeded = false;
+
+// A page whose OCS has died or hung keeps whatever it last drew -- a vehicle
+// "connected" an hour after the OCS went away. Say so, and dim it all.
+let lastOk = null;
+function unreachable(on) {
+  document.documentElement.setAttribute('data-ocs', on ? 'unreachable' : 'up');
+  $('deadbanner').style.display = on ? 'block' : 'none';
+  if (on) $('deadbanner').textContent = '⚠ OCS UNREACHABLE — nothing on this page has updated since '
+    + (lastOk ? new Date(lastOk).toLocaleTimeString() : 'it was opened')
+    + '. The vehicles, links and run below are as they were then, not now.';
 }
 
 async function refresh() {
   let s;
   try { s = await (await fetch('/api/state')).json(); }
-  catch (e) { $('link-rc').innerHTML = pill('bad','OCS unreachable'); return; }
+  catch (e) { $('link-rc').innerHTML = pill('bad','OCS unreachable'); unreachable(true); return; }
+  lastOk = Date.now();
+  unreachable(false);
 
   $('team').textContent = s.team_id;
   const ep = s.endpoints || {};
@@ -346,7 +404,11 @@ async function refresh() {
   const r = s.run;
   $('run').innerHTML = pill(r.state==='RUNNING'?'ok':(r.state==='DECLARED'?'warn':'idle'), r.state)
     + (r.declaration_seq!=null ? ` <span class="muted">decl_seq=${r.declaration_seq}</span>`:'')
-    + (r.run_id!=null ? ` <span class="muted">run_id=${r.run_id}</span>`:'');
+    + (r.run_id!=null ? ` <span class="muted">run_id=${r.run_id}</span>`:'')
+    // RxCourse is republished when it changes; the declaration then names the old fence.
+    + (r.course_changed_since!=null
+       ? `<div>${pill('bad','COURSE CHANGED')} <span class="muted">since declaration seq `
+         + `${r.course_changed_since}: end and re-declare</span></div>` : '');
 
   const cf = s.course_findings || [];
   $('course').innerHTML = (s.course && s.course.course_id
@@ -369,12 +431,19 @@ async function refresh() {
   // fence gate) and says why in words (run.declare_blocker). The endpoint refuses on its own,
   // so this is the operator's explanation, not the safeguard.
   const blocked = s.run.declare_blocker;
+  // The call sign is the one input the page holds: the bridge's verdict is everything else,
+  // and the endpoint judges the box's value again when Declare is pressed.
+  const u = s.uav || {}, cs = $('callsign');
+  if (!callsignSeeded && u.pilot_callsign !== undefined) { cs.value = u.pilot_callsign; callsignSeeded = true; }
+  cs.style.display = u.in_declaration ? '' : 'none';
+  const needSign = u.in_declaration && !cs.value.trim();
   const decl = document.querySelector('button.go');
   if (decl) {
-    const ok = act.length >= need && (s.run.may_declare !== false);
+    const ok = act.length >= need && (s.run.may_declare !== false) && !needSign;
     decl.disabled = !ok;
     decl.title = blocked ? blocked
       : act.length < need ? `need at least ${need} active vehicles, have ${act.length}`
+      : needSign ? 'type the UAV pilot call sign first'
       : `declare ${act.join(', ')}`;
   }
   $('activecount').innerHTML = act.length
@@ -389,14 +458,22 @@ async function refresh() {
 
   const wait = s.awaiting_auto || [];
   if (r.state === 'DECLARED') {
+    // No timeout is invented: RoboCommand may hold RunStart past "all AUTO" for Garuda's
+    // clearance or the course manager's approval (8fc09f2), and says nothing while it does.
+    const since = r.all_auto_since != null ? Math.max(0, Math.round(s.now - r.all_auto_since)) : null;
     $('run').innerHTML += wait.length
       ? ` <span class="muted">waiting on ${wait.join(', ')} to reach AUTO</span>`
-      : ` ${pill('ok','all AUTO')} <span class="muted">RunStart is theirs to send</span>`;
+      : ` ${pill('ok','all AUTO' + (since != null ? ' for ' + since + ' s' : ''))} <span class="muted">`
+        + `RunStart is theirs to send; they may also be holding for Garuda's clearance or the `
+        + `course manager</span>`;
   }
+
+  $('treports').innerHTML = taskReportRows(s.task_reports || []);
 
   const c = s.counters;
   $('counters').innerHTML = `<td>${c.forwarded}</td><td>${c.dropped_rate}</td>
     <td>${c.dropped_invalid}</td><td>${c.dropped_mistyped}</td>
+    <td>${c.dropped_misregistered || 0}</td>
     <td>${c.dropped_not_preferred || 0}</td><td>${c.stale}</td>
     <td>${c.commands_routed}</td><td>${c.commands_undeliverable}</td>`;
 
@@ -419,6 +496,7 @@ async function refresh() {
       <td><b>${k.which}</b></td><td>seq=${k.seq}</td>
       <td>${k.delivered ? pill('ok','→ '+(k.targets.join(', ')||'—'))
                         : pill('bad','undeliverable: '+(k.detail||''))}</td>
+      <td class="muted">${esc(commandDetail(k))}</td>
     </tr>`).join('') : '<tr><td class="muted">nothing yet</td></tr>';
 
   $('log').textContent = (s.log||[]).join('\n');
@@ -444,4 +522,6 @@ paintThemeButton(themeNow());
 
 refresh();
 setInterval(refresh, 500);
+// A hung OCS fails no fetch; it just never answers.
+setInterval(() => { if (lastOk && Date.now() - lastOk > 3000) unreachable(true); }, 1000);
 </script>

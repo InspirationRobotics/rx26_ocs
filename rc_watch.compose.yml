@@ -1,0 +1,24 @@
+# rc_watch beside RoboNation's test server. Copied to the box as
+# <robocommand>/RobotX_2026/docker-compose.override.yml, which `docker compose` merges
+# with their docker-compose.yml on its own -- so `docker compose up -d` starts the broker,
+# their test server and this watcher together, and their files stay untouched.
+#
+# Host networking: the watcher reaches the broker on 127.0.0.1:1883 (their published
+# port), serves the page on :8088 to the box's own screen and the course network, and
+# sees a test driver on the box as 127.0.0.1 -- the only address allowed to drive tests.
+# The script itself is mounted from ~/rcwatch, so updating it needs a restart, not a build.
+services:
+  rc-watch:
+    build:
+      context: .
+      dockerfile: rc_test/Dockerfile
+    container_name: rc-watch
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - broker
+    volumes:
+      - ./logs:/app/logs:ro
+      - ${HOME}/rcwatch:/app/watch
+    command: ["python", "/app/watch/rc_watch.py", "--broker", "127.0.0.1", "--port", "1883",
+              "--http", "8088", "--logs", "/app/logs", "--record", "/app/watch"]

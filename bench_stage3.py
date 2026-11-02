@@ -81,7 +81,17 @@ stale_ms = 1000.0
 [paths]
 seq_store = "{seq}"
 wire_log  = "{wire}"
+
+# What a declaration with an aircraft carries besides the fence (8fc09f2). Test
+# values: the call sign is nobody's.
+[uav]
+pilot_callsign = "{callsign}"
+
+[geofence]
+max_altitude_hae_m = {ceiling}
 """
+CALLSIGN = "Bench UA0000"
+CEILING = 40.0
 
 
 class Vehicle:
@@ -154,6 +164,7 @@ def main() -> int:
     cfg_path = work / "bridge.toml"
     cfg_path.write_text(
         CONFIG.format(team=TEAM, host=HOST, port=PORT, tcp=TCP_PORT,
+                      callsign=CALLSIGN, ceiling=CEILING,
                       seq=(work / "seq.json").as_posix(),
                       wire=(work / "wire").as_posix()),
         encoding="utf-8")
@@ -229,6 +240,14 @@ def main() -> int:
           and sent_fence == list(bridge._fence.polygon),
           "RoboCommand got the COURSE's fence, closed (%d points) -- the one the aircraft holds"
           % len(sent_fence))
+    decl = rc.requests[-1].run_declaration if rc.requests else None
+    check("C3f", decl is not None and decl.HasField("uav_geofence_max_altitude_hae_m")
+          and decl.uav_geofence_max_altitude_hae_m == CEILING
+          and decl.uav_pilot_callsign == CALLSIGN,
+          "with an aircraft in it, the declaration carries the ceiling (%s m HAE) and the "
+          "pilot's call sign (%r) -- without them RoboCommand refuses it, silently"
+          % ((decl.uav_geofence_max_altitude_hae_m, decl.uav_pilot_callsign) if decl
+             else (None, None)))
 
     print("\nC4  the standby-auto directive reaches the declared vehicles")
     settle(1.0)

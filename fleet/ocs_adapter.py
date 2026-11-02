@@ -537,6 +537,7 @@ class RadioVehicle:
         self.tx_refused = self.tx_no_route = self.not_for_vehicle = self.unknown_frames = 0
         self.encode_errors = 0
         self.last_encode_error: Optional[str] = None
+        self._radius_not_relayed: set = set()       # keep-out radii already said to be dropped
         self.refusals: collections.Counter = collections.Counter()      # reason (no values) -> count
         self.directives: collections.Counter = collections.Counter()
         # uplink
@@ -814,6 +815,15 @@ class RadioVehicle:
             self._on_run_start(out.info["run_id"])
         elif out.msg_id == rx.ALL_CLEAR:
             self._cancel_covered(out.info["affected"])
+        elif out.msg_id == rx.MOVING_OBJECT_ALERT and out.info.get("keep_out_radius_m") is not None:
+            # RXL 0x24 predates keep_out_radius_m and has no byte for it. Said once per
+            # radius: the alert repeats while the object moves. Add the byte when Task 4
+            # Disruptive is attempted (Task 4 is TIER_NONE in bridge.toml today).
+            r = out.info["keep_out_radius_m"]
+            if r not in self._radius_not_relayed:
+                self._radius_not_relayed.add(r)
+                log.warning("ocs %s: MOVING_OBJECT_ALERT keep_out_radius_m=%g NOT relayed over the "
+                            "radio - RXL 0x24 has no byte for it", self.cfg.vehicle_id, r)
         self._add(out, now)
 
     @contextlib.contextmanager

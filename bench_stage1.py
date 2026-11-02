@@ -243,6 +243,12 @@ team_id = "{team}"
 id = "{vehicle}"
 type = "TYPE_USV"
 
+[tcp]
+# Off: stage 1 is RoboCommand over MQTT. Left at its default (0.0.0.0:37564), a live
+# boat dialling this laptop joined as a second USV1 and doubled every count
+# (2026-10-31: A7, A8, A9, A10b failed).
+enabled = false
+
 [team]
 host = "{host}"
 port = {port}

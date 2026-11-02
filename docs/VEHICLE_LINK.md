@@ -108,6 +108,13 @@ whose `team` equals its own `team_id` and whose source is not on a course networ
 - `ocs_host: "<ip>"` is exactly today's behaviour: dial that address, no listener.
 - Never pointed at a course network: a fallback entry there is dropped at startup
   and `tools/scripts/check_config.py` fails the YAML.
+- **A taken beacon port is tried again every 5 s** (`LISTEN_RETRY_S`) and logged
+  once, not on every try. Until it binds, the boat runs on its fallback hosts and the
+  GUI's OCS tooltip reads `beacon listener on UDP 37565 NOT RUNNING (<why>; retrying)`.
+  2026-10-31: a hand-run `ocs_client` held the port while the launch respawned its
+  own, and the respawned one never listened again, even after the other was gone.
+  Two `ocs_client`s are a fault in themselves: each takes the other's USV1 socket
+  several times a second (`USV1 reconnected on wifi, closing stale ...` in the log).
 
 **Two OCS laptops on one network.** Both beacon. A boat with no connection takes
 whichever it heard last when it retries and keeps it until the link drops; nothing
@@ -172,7 +179,8 @@ recognised by its top-level key before the report parse and never treated as a r
 
 `seq` is optional. If the vehicle puts its own non-zero `seq` on a report the
 bridge keeps it (as the report's "own seq") before overwriting `seq` with the
-OCS's — that is what makes the ReadinessConfirm rewrite below possible.
+OCS's — that is what makes the ReadinessConfirm rewrite below possible, and a
+numbered task report is answered with an [`ocs_receipt`](#ocs_receipt--what-became-of-a-numbered-task-report).
 
 ### Report kinds
 
@@ -448,6 +456,35 @@ with no socket is logged as `NOT DELIVERED`. The radio adapter does not put it
 on the air (there is no RXL message for it) and counts it under
 `directives_ignored`.
 
+### `ocs_receipt` — what became of a numbered task report
+
+```json
+{"ocs_receipt": {"vehicle_seq": 1792345601, "kind": "docking", "verdict": "acknowledged",
+                 "seq": 34, "detail": "seq=34, RoboCommand's broker acknowledged it (PUBACK)"}}
+```
+
+For every task report that carries the vehicle's own `seq` (heartbeats never get
+one), on the link it came in on, never the radio (no RXL message). `seq` is the
+OCS's RoboCommand seq, `null` until it is published. Verdicts:
+
+| `verdict` | Final? | Meaning |
+|---|---|---|
+| `held` | yes | no run declared: RoboCommand gets nothing before a declaration |
+| `dropped` | yes | over the rate cap, or invalid; `detail` says which |
+| `published` | no | sent to RoboCommand, its PUBACK not back yet (or no RoboCommand link) |
+| `acknowledged` | yes | RoboCommand's broker returned the PUBACK |
+
+Usually `published` then `acknowledged`; a PUBACK that beats the bridge's own
+bookkeeping gives `acknowledged` alone. `_track`, `_await_ack`, `_send_receipt`.
+
+**A resend is answered, not republished.** The boat's `ocs_link` keeps each
+report until a final receipt and sends it again on its next connection — only
+once this OCS has sent it a receipt, so an OCS that cannot answer one never sees a
+resend. The bridge files every numbered report under (vehicle, own seq, `sent_at`)
+and answers a repeat from what became of the first, wire-logging a `resend`
+event. A restarted node numbers from the clock (`_first_seq`), so a new report
+never repeats an old key; the same seq with a new `sent_at` is a new report.
+
 ## What the page and the snapshot show
 
 `Bridge.snapshot()` (`bridge.py:1216-1306`), per vehicle:
@@ -478,7 +515,7 @@ vehicle silent"** — its socket says nothing about the vehicle. The console
 
 Wire log (`run/wire/*.jsonl`): uplink frames as `veh tcp://in/<link>`, downlink
 as `vtx tcp://<vehicle>/<link>` (or the MQTT command topic), each with
-`decoded`; events `link_up`, `link_down`, `hello_refused`, `ocs_info`,
+`decoded`; events `link_up`, `link_down`, `hello_refused`, `ocs_info`, `resend`,
 `standby_auto`, `readiness_seq`, `readiness_mismatch`, `undecodable`, `geofence` /
 `geofence_none` (a course was accepted and what its fence is), `fence_ignored`. An
 `ocs_fence` is logged as `veh tcp://in/<link>` with its decoded body.
@@ -495,6 +532,8 @@ as `vtx tcp://<vehicle>/<link>` (or the MQTT command topic), each with
   and the bridge's `_seq_map` both die with their process. A ReadinessConfirm
   for a report relayed before a restart is relayed unchanged by the bridge
   and refused (loudly) by the adapter.
+- **So is the resend memory.** The last 500 numbered reports (`_receipted`) die
+  with the bridge: a resend that crosses an OCS restart is published again.
 - **A confirm is rewritten for the link that carried the report but routed by
   `send_order`.** If the READINESS came over the radio and the radio has since
   gone stale, the confirm goes down WiFi carrying the adapter's seq, which Ekko's

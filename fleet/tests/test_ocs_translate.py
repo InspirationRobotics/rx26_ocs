@@ -115,7 +115,17 @@ class MovingObjectAlert(unittest.TestCase):
         name, msg = decoded(out)
         self.assertEqual((name, msg["heading_deg"], msg["speed_mps"], msg["affected"]),
                          ("MOVING_OBJECT_ALERT", 270.0, 2.5, [1, 3]))
-        self.assertEqual((out.key, out.info), (("moving",), {"affected": [1, 3]}))
+        self.assertEqual((out.key, out.info),
+                         (("moving",), {"affected": [1, 3], "keep_out_radius_m": None}))
+
+    def test_the_keep_out_radius_is_kept_for_the_log_but_has_no_byte_on_the_radio(self):
+        body = {"position": SINGAPORE, "heading_deg": 270.0, "speed_mps": 2.5}
+        with_r = tr.command_to_outgoing({"seq": 12, "moving_object_alert": dict(body, keep_out_radius_m=7.0)})
+        without = tr.command_to_outgoing({"seq": 12, "moving_object_alert": body})
+        self.assertEqual(with_r.info["keep_out_radius_m"], 7.0)
+        self.assertEqual(with_r.payload, without.payload)       # RXL 0x24 is 13 bytes either way
+        with self.assertRaises(tr.Refusal):
+            tr.command_to_outgoing({"seq": 12, "moving_object_alert": dict(body, keep_out_radius_m="NaN")})
 
     def test_protobuf_omits_zero_heading_speed_and_the_list_of_types(self):
         out = tr.command_to_outgoing({"seq": 12, "moving_object_alert": {"position": SINGAPORE}})

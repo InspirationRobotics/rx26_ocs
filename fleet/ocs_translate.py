@@ -334,10 +334,15 @@ def command_to_outgoing(cmd: dict, *, default_vehicle_id: Optional[str] = None,
             hdg = number(field(body, "heading_deg"), "moving_object_alert.heading_deg", default=0.0)
             spd = number(field(body, "speed_mps"), "moving_object_alert.speed_mps", default=0.0)
             types = _types(field(body, "affected_vehicle_types"))
+            # keep_out_radius_m (8fc09f2) has no byte in RXL 0x24: carried in `info` so the
+            # adapter can say it was not relayed. Absent stays None -- the 5 m schema default
+            # is RoboCommand's to apply, not this side's to invent.
+            raw_r = field(body, "keep_out_radius_m")
+            radius = None if raw_r is None else number(raw_r, "moving_object_alert.keep_out_radius_m")
             return Outgoing(rx.MOVING_OBJECT_ALERT,
                             rx.pack_moving_object_alert(lat=lat, lon=lon, heading_deg=hdg, speed_mps=spd,
                                                         affected=types),
-                            ("moving",), seq, {"affected": types})
+                            ("moving",), seq, {"affected": types, "keep_out_radius_m": radius})
         ours = integer(field(body, "report_seq"), "readiness_confirm.report_seq", default=0)
         node = node_of_vehicle_id(field(body, "vehicle_id") or field(cmd, "vehicle_id")
                                   or default_vehicle_id or "")
