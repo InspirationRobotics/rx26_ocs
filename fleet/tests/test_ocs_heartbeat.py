@@ -85,8 +85,9 @@ class WhatItSends(unittest.TestCase):
             self.assertEqual((hb["flight_phase"], source), (phase, "autopilot"), landed)
 
     def test_state_is_AUTO_only_when_armed_in_an_autonomous_mode(self):
-        for base, mode, want in ((ARMED, GUIDED, "STATE_AUTO"), (ARMED, LOITER, "STATE_AUTO"),
-                                 (ARMED, STABILIZE, "STATE_MANUAL"), (DISARMED, GUIDED, "STATE_MANUAL")):
+        for base, mode, want in ((ARMED, GUIDED, "STATE_AUTO"), (ARMED, LOITER, "STATE_MANUAL"),
+                                 (ARMED, STABILIZE, "STATE_MANUAL"), (DISARMED, GUIDED, "STATE_AUTO"),
+                                 (DISARMED, LOITER, "STATE_MANUAL"), (DISARMED, STABILIZE, "STATE_MANUAL")):
             s = synth()
             feed(s, base=base, mode=mode)
             self.assertEqual(s.build(100.0)[0]["state"], want, (base, mode))

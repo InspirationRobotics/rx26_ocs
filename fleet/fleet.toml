@@ -137,8 +137,8 @@ fence_clear_without_course = true
 #   uav_params.yaml's. GPS_RAW_INT.alt_ellipsoid (the receiver's own height above the
 #   ellipsoid, i.e. HAE directly) would remove the need for a geoid constant altogether; it
 #   is a message the adapter would have to ask the autopilot for, as it does EXTENDED_SYS_STATE.
-geoid_separation_m = -24.6
-# rate_hz = 2.0              # the handbook's mandated heartbeat rate; = ocs_client.rate_hz
+geoid_separation_m = 5.9      # Singapore, measured 6 Nov 2026 from GPS2_RAW on Ekko.
+# rate_hz = 2.0             # the handbook's mandated heartbeat rate; = ocs_client.rate_hz
 # (EXTENDED_SYS_STATE -- the flight phase -- is in no stream group on ArduCopter 4.7, so while the
 #  stand-in speaks and it is not arriving, the adapter asks the autopilot for it at 1 Hz with
 #  SET_MESSAGE_INTERVAL: at most once per 10 s, the rule and interval of gcs_radio.py. See

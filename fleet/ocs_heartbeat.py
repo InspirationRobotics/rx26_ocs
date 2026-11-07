@@ -74,8 +74,11 @@ _PHASE_BY_LANDED = {
 
 #: heartbeat_core.py:52-55 -- modes in which an armed ArduCopter is flying itself. Anything
 #: else, and anything at all while disarmed, is STATE_MANUAL. STATE_UNKNOWN is never sent.
+#: LOITER is NOT here (Chris, 6 Nov 2026): it is flown on the sticks, and the handbook's
+#: STATE_AUTO means "autonomous and ready" -- a pilot taking over into Loiter must show as
+#: MANUAL on MyDroneFleets. Ekko's own heartbeat_core.py still lists it.
 AUTONOMOUS_MODES = frozenset({
-    "AUTO", "GUIDED", "GUIDED_NOGPS", "RTL", "SMART_RTL", "LAND", "LOITER",
+    "AUTO", "GUIDED", "GUIDED_NOGPS", "RTL", "SMART_RTL", "LAND",
     "AUTO_RTL", "CIRCLE", "FOLLOW", "ZIGZAG",
 })
 
@@ -117,10 +120,17 @@ def flight_phase(landed, *, armed=None, altitude_rel=None, airborne_alt_m=1.0,
     return (AIRBORNE if airborne else GROUNDED), "fallback"
 
 
+#: DISARMED in one of these = "autonomous and ready" (handbook 3.4: STATE_AUTO "when that vehicle is
+#: autonomous and ready"; vehicles wait for RunStart). The pilot has switched into the autonomous mode
+#: (SC -> GUIDED) and the aircraft sits on the ground, not armed. Chris, 7 Nov 2026. Ekko's own
+#: heartbeat_core.py still says MANUAL for anything disarmed.
+WAITING_AUTONOMOUS_MODES = frozenset({"GUIDED"})
+
+
 def robot_state(mode, armed):
-    """heartbeat_core.py:86-91. Never STATE_UNKNOWN (the zero value)."""
+    """heartbeat_core.py:86-91, plus WAITING_AUTONOMOUS_MODES. Never STATE_UNKNOWN (the zero value)."""
     if not armed:
-        return "STATE_MANUAL"
+        return "STATE_AUTO" if (mode or "").upper() in WAITING_AUTONOMOUS_MODES else "STATE_MANUAL"
     return "STATE_AUTO" if (mode or "").upper() in AUTONOMOUS_MODES else "STATE_MANUAL"
 
 

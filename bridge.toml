@@ -68,6 +68,7 @@ type = "TYPE_UAV"
 # down the radio -- falling back to WiFi if the radio goes quiet for [limits]
 # link_prefer_s. Crusader has no preference: it only has WiFi.
 prefer = "radio"
+registration = "ASTA-53554"     # Chris, 7 Nov 2026: stamped by the OCS on every UAV1 heartbeat
 # Both vehicle clients republish a top-level key they do not know to
 # /crsd/ocs_command or /uav/ocs_command and carry on (see docs/VEHICLE_LINK.md),
 # so `ocs_info` (the course, and for a UAV the declared geofence) is safe to
@@ -127,7 +128,7 @@ never_on = ["192.168.65.0/24", "192.168.66.0/24",
 [robocommand]
 # The simulated RoboNation server. See README.md for why this is on its own
 # network segment and not a port on the team router.
-host = "192.168.65.2"
+host = "192.168.69.3"
 port = 1883
 
 [tiers]
@@ -139,6 +140,9 @@ task3 = "TIER_NONE"
 task4 = "TIER_NONE"
 
 [limits]
+# Ekko alone at screening and validation, 7-8 Nov 2026. Delete this
+# line for any run with Crusader, or for a Proof of Readiness log (handbook 3.1).
+min_declared = 1
 rate = 5.0                # messages/second, metered per vehicle -- the
                           # handbook says "per system", which settles the
                           # question the USV repo left open
@@ -218,3 +222,25 @@ confirm_max_age_s = 180   # A UAV is not declared unless its autopilot was read 
 #     [1.28110, 103.85625],
 #     [1.28010, 103.85520],
 # ]
+
+# Chris, 7 Nov 2026: drawn in QGC (Desktop\test.plan, polygon 1), inside SV1 by 3.5-4.6 m.
+[[geofence.course]]
+course_id = "SV1"
+uav_geofence = [
+    [1.444790255, 103.784949607],
+    [1.444801231, 103.785038667],
+    [1.444583736, 103.785017662],
+    [1.444575146, 103.784963451],
+    [1.444790255, 103.784949607],
+]
+
+# Chris, 7 Nov 2026: drawn in QGC (Desktop\sv3plan.plan, polygon 1), inside SV3.
+[[geofence.course]]
+course_id = "SV3"
+uav_geofence = [
+    [1.444685263, 103.785312892],
+    [1.444750956, 103.785376074],
+    [1.444618564, 103.785376074],
+    [1.444593896, 103.785198898],
+    [1.444685263, 103.785312892],
+]

@@ -233,7 +233,7 @@ class Config(unittest.TestCase):
         self.assertEqual((v.vehicle_id, v.companion_sysid, v.autopilot_sysid, v.link, ocs.sysid, ocs.compid),
                          ("UAV1", 200, 1, "rfd", 250, 190))
         self.assertFalse(v.phase_fallback)                    # off by default: a heuristic is opt-in
-        self.assertEqual(v.geoid_separation_m, -24.6)         # the user's value, deliberately untouched
+        self.assertEqual(v.geoid_separation_m, 5.9)          # Singapore, measured on Ekko 6 Nov 2026
         self.assertTrue(v.fence_upload)                       # the declared geofence goes onto the autopilot
         self.assertTrue(v.fence_may_block_arming)             # Chase: even if Ekko then cannot arm at home
         self.assertTrue(v.fence_clear_without_course)         # Chase: no RoboCommand course -> no polygon

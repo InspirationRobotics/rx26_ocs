@@ -389,11 +389,12 @@ uav_geofence = [[1.0, 103.0], [1.0, 103.001], [1.001, 103.001], [1.0, 103.0]]
         self.assertEqual(cfg.geofence_table["BRAVO"][0], (1.0, 103.0))
         self.assertEqual(len(cfg.geofence_table["BRAVO"]), 4)
 
-    def test_the_shipped_bridge_toml_loads_with_the_defaults_and_no_table_entry(self):
+    def test_the_shipped_bridge_toml_loads_with_the_defaults_and_the_sv_fences(self):
         cfg = load(Path(__file__).resolve().parents[1] / "bridge.toml")
         self.assertEqual(cfg.geofence_margin_m, 2.0)
         self.assertEqual(cfg.geofence_confirm_max_age_s, 180.0)
-        self.assertEqual(cfg.geofence_table, {}, "ALPHA is meant to use the inset")
+        self.assertEqual(sorted(cfg.geofence_table), ["SV1", "SV3"],
+                         "Ekko's own fences for the 7-8 Nov screening areas; ALPHA uses the inset")
         self.assertGreaterEqual(len(cfg.uav_geofence), 4,
                                 "the retired key stays: Drone's check_config.py reads it")
 
