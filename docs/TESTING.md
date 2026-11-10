@@ -579,7 +579,14 @@ and `run/seq.json`. Evidence on RoboNation's side is the `./logs/` directory of
 their docker stack — **that is the half that counts for the Proof of Readiness,
 and it lives on the sim box, not here.**
 
-## What is still not tested
+## Historical outstanding checks — August 20, 2026
+
+The items below are the original August snapshot, not current fleet status.
+For the November 10 GRAEY UUV1 addition to the shared `rc_e2e` harness, see
+[RC_E2E_GRAEY.md](RC_E2E_GRAEY.md). GRAEY now has a production TCP client;
+that harness exercises its telemetry builder, run context, queued survey,
+reconnect and acknowledgement alongside USV1/UAV1. Physical Wi-Fi range and
+underwater connectivity remain separate hardware tests.
 
 - **The cable has never been pulled.** The handbook requires the OCS to
   reconnect and restore its subscriptions. Restarting the process is proven;

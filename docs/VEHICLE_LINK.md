@@ -1,13 +1,14 @@
 # The vehicle link — TCP 37564
 
 The contract between the OCS bridge and every vehicle client, **as the code
-implements it**. Two kinds of client speak it today:
+implements it**. These clients speak it:
 
 | Client | Where it runs | Says hello? | Link |
 |---|---|---|---|
 | `crusader_groundstation/ocs_link.py` (Crusader) | the boat's Jetson, over team WiFi; finds the OCS from its [beacon](#discovery--udp-37565) | no | `wifi` |
 | `uav_groundstation/ocs_link.py` (Ekko) | Ekko's Jetson, over team WiFi | no | `wifi` |
 | `fleet/ocs_adapter.py` (Ekko's radio) | this laptop, inside `fleet_link`, on loopback | yes | `radio` |
+| `api/comms/competition_wifi.py` (GRAEY UUV1) | GRAEY's Jetson, directly to the shared OCS over team WiFi/tether | yes | `wifi` |
 
 The radio side of the third one — how it turns RXL TUNNELs into these frames
 and back — is [EKKO_RADIO_LINK.md](EKKO_RADIO_LINK.md). What the vehicles
@@ -17,7 +18,9 @@ would have to change to use any of this is
 `tests/test_readiness_and_wirelog.py`, `tests/test_fence_gate.py` and
 `tests/test_geofence.py` (the geofence and its gate), and `bench_stage2.py` against
 the boat's real client. `bench_stage3.py` plays an aircraft that answers the fence
-handshake.
+handshake. `rc_e2e.py` includes all three vehicle identities, with GRAEY's
+production telemetry builder, sender/outbox and WifiLink; see
+[the shared GRAEY end-to-end test](RC_E2E_GRAEY.md).
 
 ## Framing
 
@@ -30,7 +33,8 @@ Every frame, both directions (`rx_bridge/framing.py`):
 connection is dropped and the client reconnects into a clean one. (The
 `framing.py` docstring still says "the protobuf payload"; it is JSON.) The
 framing is **duplicated** in the boat's and Ekko's `ocs_link.py` — change one,
-change all three in the same round.
+change the OCS and all vehicle implementations, including GRAEY's WifiLink,
+in the same round.
 
 The vehicle dials in; the OCS never needs its address. One socket carries both
 directions. `[tcp] host = "0.0.0.0"`, `port = 37564` (`bridge.toml:95-97`). How the

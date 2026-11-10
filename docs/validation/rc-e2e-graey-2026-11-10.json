@@ -1,0 +1,410 @@
+{
+  "date": "2026-11-10",
+  "mode": "isolated loopback, synthetic sensors, production clients, official RoboNation server",
+  "summary": "End to end: 13/13 passed (E1 PASS, E2 PASS, E3 PASS, E4 PASS, E5 PASS, E6 PASS, E7 PASS, E8 PASS, E9 PASS, E10 PASS, E11 PASS, E12 PASS, E13 PASS)",
+  "verdicts": {
+    "E1": "pass",
+    "E2": "pass",
+    "E3": "pass",
+    "E4": "pass",
+    "E5": "pass",
+    "E6": "pass",
+    "E7": "pass",
+    "E8": "pass",
+    "E9": "pass",
+    "E10": "pass",
+    "E11": "pass",
+    "E12": "pass",
+    "E13": "pass"
+  },
+  "tests": [
+    {
+      "id": "E1",
+      "title": "Our OCS has the course, its transit area, and a fence UAV1 holds",
+      "status": "pass",
+      "note": "ALPHA: 5 corners + uav_transit_area 5 points -> fence 5 points (course + transit area inset 2.0 m); UAV1 read it back 0.5 s ago, matches: True; reporting: USV1, UUV1, UAV1",
+      "doing": "Our OCS on the laptop takes Course Alpha from this broker, works out the UAV fence over course + transit area and tells UAV1, which reads it back. USV1 (the boat's own ocs_link.py), UAV1 and GRAEY UUV1 start heartbeating through our OCS.",
+      "expect": "Judged on the laptop from our OCS's state, the evidence posted here. On this page: first heartbeats from ASTA/USV1, UAV1 and UUV1.",
+      "started": 1794333894.6534004,
+      "deadline": 1794333984.6534004
+    },
+    {
+      "id": "E2",
+      "title": "No pilot call sign: our OCS refuses, RoboCommand hears nothing",
+      "status": "pass",
+      "note": "everything expected, nothing forbidden",
+      "doing": "Pressing Declare on our OCS with the call-sign box empty.",
+      "expect": "Our OCS's refusal, in words, as a note -- and no REQUEST card from ASTA.",
+      "started": 1794333897.2485008,
+      "deadline": 1794333903.2485008
+    },
+    {
+      "id": "E3",
+      "title": "With a call sign, RoboCommand accepts the fence and starts the run",
+      "status": "pass",
+      "note": "saw everything expected",
+      "doing": "Declaring again with call sign E2EPILOT-0000: USV1 + UAV1 + UUV1, the stand-in pilot's fence read off UAV1 (inside the course fence), ceiling 39 m HAE (home 9 + FENCE_ALT_MAX 30).",
+      "expect": "A blue REQUEST card from ASTA with the call sign and ceiling, the server's 'geofence and ceiling OK', then a green COMMAND run_start for ASTA.",
+      "started": 1794333903.94782,
+      "deadline": 1794333923.94782
+    },
+    {
+      "id": "E4",
+      "title": "Our OCS knows the run started",
+      "status": "pass",
+      "note": "run state RUNNING, run_id 1, declaration seq 1, declared USV1, UUV1, UAV1",
+      "doing": "Reading our OCS's run state after that RunStart.",
+      "expect": "RUNNING, with RoboCommand's run id. Judged on the laptop.",
+      "started": 1794333906.574942,
+      "deadline": 1794333996.574942
+    },
+    {
+      "id": "E5",
+      "title": "All three heartbeats reach RoboCommand at 2 Hz through our OCS",
+      "status": "pass",
+      "note": "saw everything expected",
+      "doing": "USV1, UAV1 and UUV1 keep heartbeating; our OCS re-stamps and publishes each one.",
+      "expect": "ASTA/USV1, ASTA/UAV1 and ASTA/UUV1 in the Heartbeats table at about 2 Hz. Heartbeats never become cards.",
+      "started": 1794333908.1538172,
+      "deadline": 1794333920.1538172
+    },
+    {
+      "id": "E6",
+      "title": "A task report from the boat reaches RoboCommand",
+      "status": "pass",
+      "note": "saw everything expected",
+      "doing": "USV1 sends one Task 3 DockingReport (bay 2) on the boat's ocs_link.py, among the heartbeats.",
+      "expect": "One big amber TASK REPORT card from ASTA/USV1.",
+      "started": 1794333913.7669845,
+      "deadline": 1794333923.7669845
+    },
+    {
+      "id": "E7",
+      "title": "Our OCS shows that report acknowledged",
+      "status": "pass",
+      "note": "USV1 docking ACKNOWLEDGED: seq=20, RoboCommand's broker acknowledged it (PUBACK)",
+      "doing": "Reading the 'Task reports to RoboCommand' card on our OCS.",
+      "expect": "The docking report ACKNOWLEDGED: this broker returned its PUBACK (QoS 1). Judged on the laptop.",
+      "started": 1794333915.813313,
+      "deadline": 1794334005.813313
+    },
+    {
+      "id": "E8",
+      "title": "RoboCommand sends a MovingObjectAlert with a 7 m keep-out",
+      "status": "pass",
+      "note": "saw everything expected",
+      "doing": "RoboNation's test_client, as RoboCommand, alerts ASTA to a moving object at the course centre with keep_out_radius_m = 7.",
+      "expect": "A green COMMAND card for ASTA with keep_out_radius_m = 7.",
+      "started": 1794333917.3816507,
+      "deadline": 1794333927.3816507
+    },
+    {
+      "id": "E9",
+      "title": "The alert reaches all three vehicles, radius intact",
+      "status": "pass",
+      "note": "Received radii: {'USV1': 7.0, 'UAV1': 7.0, 'UUV1': 7.0}; OCS targets: ['USV1', 'UUV1', 'UAV1']",
+      "doing": "Looking at the OCS routing and all three production-link receive callbacks.",
+      "expect": "USV1, UAV1 and UUV1 got moving_object_alert with keep_out_radius_m = 7.",
+      "started": 1794333918.9121623,
+      "deadline": 1794334008.9121623
+    },
+    {
+      "id": "E10",
+      "title": "Submerged GRAEY retains its survey",
+      "status": "pass",
+      "note": "everything expected, nothing forbidden",
+      "doing": "Queueing a synthetic survey through GRAEY's production durable outbox at 2 m depth.",
+      "expect": "One pending report, no pipeline survey on RoboCommand's broker for six seconds.",
+      "started": 1794333920.462846,
+      "deadline": 1794333926.462846
+    },
+    {
+      "id": "E11",
+      "title": "GRAEY reconnects, surfaces and delivers the queued survey",
+      "status": "pass",
+      "note": "saw everything expected",
+      "doing": "Dropping only the fixture socket, then setting simulated surfaced status.",
+      "expect": "The actual client reconnects, receives current run context and reports intact/damaged/intact.",
+      "started": 1794333927.111936,
+      "deadline": 1794333942.111936
+    },
+    {
+      "id": "E12",
+      "title": "Broker acknowledgement returns to GRAEY's outbox",
+      "status": "pass",
+      "note": "GRAEY: acknowledged=1, pending=0, connections=2, telemetry_error=None",
+      "doing": "Checking the actual sender's receipt handling and second TCP connection.",
+      "expect": "One acknowledged report, zero pending; this is a PUBACK, not a scoring verdict.",
+      "started": 1794333930.2030334,
+      "deadline": 1794334020.2030334
+    },
+    {
+      "id": "E13",
+      "title": "End run reaches GRAEY",
+      "status": "pass",
+      "note": "run ended; GRAEY remote state=ENDED, confirmed=False",
+      "doing": "Ending the isolated shared OCS run with the same API used by its GUI.",
+      "expect": "GRAEY sees ENDED and clears run confirmation.",
+      "started": 1794333931.761577,
+      "deadline": 1794334021.761577
+    }
+  ],
+  "heartbeats": [
+    {
+      "team": "ASTA",
+      "vehicle": "UUV1",
+      "state": "STATE_AUTO",
+      "task": "TASK_NONE",
+      "type": "TYPE_UUV",
+      "lat": 1.2810202,
+      "lon": 103.8550097,
+      "spd": 0.0,
+      "hdg": 90.0,
+      "alt": null,
+      "phase": "",
+      "reg": "",
+      "seq": 55,
+      "last": 1794333933.2013485,
+      "hz": 1.7,
+      "age_s": 0.6
+    },
+    {
+      "team": "ASTA",
+      "vehicle": "USV1",
+      "state": "STATE_AUTO",
+      "task": "TASK_NONE",
+      "type": "TYPE_USV",
+      "lat": 1.2810202,
+      "lon": 103.8550097,
+      "spd": 1.4,
+      "hdg": 105.979065,
+      "alt": null,
+      "phase": "",
+      "reg": "",
+      "seq": 56,
+      "last": 1794333933.1539438,
+      "hz": 1.9,
+      "age_s": 0.7
+    },
+    {
+      "team": "ASTA",
+      "vehicle": "UAV1",
+      "state": "STATE_AUTO",
+      "task": "TASK_NONE",
+      "type": "TYPE_UAV",
+      "lat": 1.2810702,
+      "lon": 103.8550097,
+      "spd": 1.4,
+      "hdg": 105.88154,
+      "alt": null,
+      "phase": "FLIGHT_PHASE_GROUNDED",
+      "reg": "ASTA-53554",
+      "seq": 54,
+      "last": 1794333933.1864493,
+      "hz": 1.9,
+      "age_s": 0.6
+    }
+  ],
+  "counters": {
+    "forwarded": 165,
+    "dropped_rate": 0,
+    "dropped_invalid": 0,
+    "dropped_mistyped": 0,
+    "dropped_misregistered": 0,
+    "dropped_not_preferred": 0,
+    "stale": 0,
+    "commands_routed": 2,
+    "commands_undeliverable": 0,
+    "fence_frames_ignored": 0
+  },
+  "graey": {
+    "run_id": 1,
+    "remote_run_id": 1,
+    "remote_state": "ENDED",
+    "run_confirmed": false,
+    "surface": true,
+    "transmission_enabled": true,
+    "telemetry_fresh": true,
+    "pending": 0,
+    "broker_acknowledged": 1,
+    "rejected": 0,
+    "reports": [
+      {
+        "sequence": 1,
+        "run_id": 1,
+        "observation_id": "e2e-submerged-survey",
+        "kind": "pipeline_survey",
+        "verdict": "acknowledged",
+        "detail": "seq=48, RoboCommand's broker acknowledged it (PUBACK)"
+      }
+    ],
+    "course": {
+      "course_id": "ALPHA",
+      "pinger_freq_hz": 25000,
+      "corners": [
+        {
+          "latitude": 1.2809652,
+          "longitude": 103.8548424
+        },
+        {
+          "latitude": 1.2808457,
+          "longitude": 103.8550331
+        },
+        {
+          "latitude": 1.2810752,
+          "longitude": 103.855177
+        },
+        {
+          "latitude": 1.2811947,
+          "longitude": 103.8549863
+        },
+        {
+          "latitude": 1.2809652,
+          "longitude": 103.8548424
+        }
+      ],
+      "sent_at": "2026-11-10T18:04:50.34015Z",
+      "uav_transit_area": [
+        {
+          "latitude": 1.281294119,
+          "longitude": 103.855048646
+        },
+        {
+          "latitude": 1.281174598,
+          "longitude": 103.855239379
+        },
+        {
+          "latitude": 1.2810752,
+          "longitude": 103.855177
+        },
+        {
+          "latitude": 1.2811947,
+          "longitude": 103.8549863
+        },
+        {
+          "latitude": 1.281294119,
+          "longitude": 103.855048646
+        }
+      ]
+    },
+    "ocs_run": {
+      "state": "ENDED",
+      "declaration_seq": 1,
+      "run_id": 1,
+      "tiers": {
+        "task1": "TIER_CORE",
+        "task2": "TIER_CORE",
+        "task3": "TIER_NONE",
+        "task4": "TIER_NONE"
+      },
+      "tiers_source": "bridge.toml",
+      "tiers_set_at": "2026-11-10T18:04:54Z",
+      "declared_tiers": {
+        "task1": "TIER_CORE",
+        "task2": "TIER_CORE",
+        "task3": "TIER_NONE",
+        "task4": "TIER_NONE"
+      },
+      "sent_at": "2026-11-10T18:05:33.26917Z"
+    },
+    "ocs_directive": null,
+    "tiers_reply": null,
+    "report_transport_ready": true,
+    "report_hold_reason": null,
+    "previous_run_pending": 0,
+    "link": {
+      "transport": "wifi",
+      "host": "127.0.0.1",
+      "port": 38564,
+      "discovery": false,
+      "beacon_listening": false,
+      "connected": true,
+      "connections": 2,
+      "last_error": null
+    },
+    "telemetry_reason": null
+  },
+  "graey_error": null,
+  "survey_events": [
+    {
+      "type": "report",
+      "kind": "pipeline_survey",
+      "team": "ASTA",
+      "vehicle": "UUV1",
+      "seq": 48,
+      "title": "TASK REPORT · pipeline_survey",
+      "fields": [
+        [
+          "active_buoy_position",
+          "1.281020, 103.855010"
+        ],
+        [
+          "segments",
+          "PIPELINE_SEGMENT_INTACT, PIPELINE_SEGMENT_DAMAGED, PIPELINE_SEGMENT_INTACT"
+        ]
+      ],
+      "id": 38,
+      "at": 1794333929.7251432,
+      "text": "TASK REPORT · pipeline_survey active_buoy_position=1.281020, 103.855010 segments=PIPELINE_SEGMENT_INTACT, PIPELINE_SEGMENT_DAMAGED, PIPELINE_SEGMENT_INTACT"
+    }
+  ],
+  "sources": {
+    "ocs_base": "1a3cb4068b8138319c19d4a30c9ce6f82f758a55",
+    "crusader": "abf7d8214a7ef3194d4ec59ca5025795436adae8",
+    "graey_base": "249d641f451b95fd9786eab01ba1644267714c00",
+    "robonation": "8fc09f295fe266ad8106cc0344a3e4d57f844359",
+    "note": "OCS harness changes uncommitted; unrelated calibration work retained in GRAEY checkout"
+  },
+  "files": [
+    {
+      "sha256": "BB4C8A7D41398F44611A8B202E1252CD41514474677FC70CBB4F79BCABF6DD56",
+      "path": "team-ocs/rc_e2e.py"
+    },
+    {
+      "sha256": "AF74B2E3D3602A136ADEAA0CD4C75BC4AD0920F42EB2524785D25F9C507A6E61",
+      "path": "team-ocs/rc_e2e_graey.py"
+    },
+    {
+      "sha256": "A0F520ABACE62BE529613F8A3982524E08E487D08A46E4CD191741A18DBE0319",
+      "path": "team-ocs/rc_e2e_local.py"
+    },
+    {
+      "sha256": "6B85660B33B45E472243AD1214BF615FB563392B299104F6E5CF47F2A9AADC3A",
+      "path": "competition-comms/current-reference-2026-11-09/crusader/crusader_groundstation/crusader_groundstation/ocs_link.py"
+    },
+    {
+      "sha256": "2F711D38ADECEF6807A6A602C509D520B563D26327DD3248D377F64C1598D750",
+      "path": "robotx_graey_2026/robotx_graey_2026/api/comms/competition_wifi.py"
+    },
+    {
+      "sha256": "B17D2713E3770BBFE1AD4F45CE28B4631CC7051437BE5513077267EDB766C992",
+      "path": "robotx_graey_2026/robotx_graey_2026/api/comms/competition_telemetry.py"
+    },
+    {
+      "sha256": "48B0640F46ED2DFB2B13E089F302C11C1652243472C0F15C87F07EB075306EA1",
+      "path": "robotx_graey_2026/robotx_graey_2026/api/comms/competition_codec.py"
+    },
+    {
+      "sha256": "D4EDADA9A5D67A48230C1D1C6A5E9C7C8B573B6C4011BC8018D5905289AB9623",
+      "path": "robotx_graey_2026/robotx_graey_2026/api/gui/navigation_view.py"
+    }
+  ],
+  "raw_evidence": "C:/Users/libei/AppData/Local/Temp/rc_e2e_q8y_6f_p",
+  "limitations": [
+    "Synthetic sensor/control samples; no hardware motion or sensor accuracy test",
+    "Loopback TCP, not real WiFi range or reconnection on hardware",
+    "PUBACK is broker delivery, not competition scoring",
+    "No live vehicle deployment or Git publication"
+  ],
+  "regression": {
+    "command": "python -m unittest discover -s tests -t .",
+    "final": "OK",
+    "run": 611,
+    "skipped": 1,
+    "duration_s": 58.656,
+    "initial_attempt": "One timing-sensitive failure in existing tests.test_run_tiers.TestOcsRun.test_a_refused_run_start_sends_nothing while E2E also running; no production or test change made",
+    "focused_rerun": "27 tests passed",
+    "final_log": "competition-comms/rc-e2e-unit-final.log",
+    "warnings": "paho socket ResourceWarning in existing unit fixtures"
+  }
+}
