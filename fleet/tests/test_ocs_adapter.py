@@ -19,6 +19,7 @@ from unittest import mock
 
 from pymavlink.dialects.v20 import ardupilotmega as ap
 
+from fleet import fence_upload as fu
 from fleet import ocs_adapter as oa
 from fleet import rxl_codec as rx
 from fleet.fleet_link import DEFAULT_CONFIG, load_config
@@ -234,9 +235,9 @@ class Config(unittest.TestCase):
                          ("UAV1", 200, 1, "rfd", 250, 190))
         self.assertFalse(v.phase_fallback)                    # off by default: a heuristic is opt-in
         self.assertEqual(v.geoid_separation_m, 5.9)          # Singapore, measured on Ekko 6 Nov 2026
-        self.assertTrue(v.fence_upload)                       # the declared geofence goes onto the autopilot
+        self.assertTrue(v.fence_upload)                       # RoboCommand's polygon goes onto the autopilot
         self.assertTrue(v.fence_may_block_arming)             # Chase: even if Ekko then cannot arm at home
-        self.assertTrue(v.fence_clear_without_course)         # Chase: no RoboCommand course -> no polygon
+        self.assertFalse(hasattr(v, "fence_clear_without_course"))   # removed 7 Nov 2026: never cleared
         self.assertEqual(Path(ocs.fence_backup_dir), Path(oa.OCS_DIR) / "run" / "fence")
 
     def test_refusals(self):
@@ -252,6 +253,7 @@ class Config(unittest.TestCase):
             {"radio_vehicle": [{"vehicle_id": "UAV1", "node": 1}]},
             {"radio_vehicle": [{"vehicle_id": "UAV1", "fence_upload": "yes"}]},
             {"radio_vehicle": [{"vehicle_id": "UAV1", "fence_may_block_arming": 1}]},
+            {"radio_vehicle": [{"vehicle_id": "UAV1", "fence_clear_without_course": False}]},   # removed
             dict(base, bridge="nonsense"),
             dict(base, sysid=0),
         ]
@@ -1213,9 +1215,12 @@ class Plumbing(unittest.TestCase):
 
 
 
-# ================================================================ the geofence, onto the autopilot
+# ================================================================ the autopilot's fence
 
 FENCE_MSGS = {"MAV%d" % m for m in (20, 23, 43, 44, 47, 51, 73)}     # PARAM_SET (23) must never appear at all
+#: What only a WRITE sends: MISSION_COUNT and MISSION_ITEM_INT (and PARAM_SET, never at all). A read is
+#: PARAM_REQUEST_READ, MISSION_REQUEST_LIST, MISSION_REQUEST_INT and the closing MISSION_ACK.
+WRITE_MSGS = {"MAV%d" % m for m in (23, 44, 73)}
 
 
 class FenceUploadOverTheRadio(unittest.TestCase):
@@ -1246,12 +1251,19 @@ class FenceUploadOverTheRadio(unittest.TestCase):
             for raw in a.take():
                 r.hear(raw)
 
-    def test_off_by_default_nothing_is_said_to_the_autopilot(self):
-        r, a = self.rig(on=False)
+    def test_off_by_default_the_autopilot_is_only_read(self):
+        r, a = self.rig(on=False, autopilot=self.held_fence())
         r.info(uav_geofence=CORNERS + [CORNERS[0]])
         self.fly(r, a, 10)
-        self.assertEqual({x.name for x in r.log} & FENCE_MSGS, set())
-        self.assertEqual(r.status()["fence_upload"], {"enabled": False})
+        names = {x.name for x in r.log}
+        self.assertEqual(names & WRITE_MSGS, set())                  # nothing written...
+        self.assertTrue({"MAV20", "MAV43", "MAV51", "MAV47"} <= names, names)   # ...but read
+        self.assertEqual(a.uploads, 0)
+        st = r.status()["fence_upload"]
+        self.assertEqual((st["write"], st["state"], st["reads"] >= 1), (False, "off", True), st)
+        last = r.bridge.reports("ocs_fence")[-1]["ocs_fence"]
+        self.assertEqual(len(last["shapes"]), 1)
+        self.assertEqual(last["params"]["FENCE_TYPE"], 7.0)
         self.assertTrue(r.of("GEOFENCE_INFO"))                       # the RXL relay is unchanged
 
     def test_on_the_declared_fence_is_written_to_the_autopilot_over_the_radio(self):
@@ -1282,51 +1294,62 @@ class FenceUploadOverTheRadio(unittest.TestCase):
         self.assertTrue(any("FENCE_UPLOAD NOT sent" in line for line in logs.output))
         self.fly(r, a, 5)
         self.assertEqual(r.status()["fence_upload"]["state"], "off")
-        self.assertEqual({x.name for x in r.log} & FENCE_MSGS, set())
+        self.assertEqual({x.name for x in r.log} & WRITE_MSGS, set())
+        self.assertEqual(a.uploads, 0)
 
-    # ---- no course -> cleared (fence_clear_without_course); a refused course fence -> left alone
+    # ---- never cleared, never written over the pilot's fence
 
-    def held_fence(self):
-        return FakeAutopilot(fence=[{"command": 5001, "param1": 4.0, "lat": c["latitude"], "lon": c["longitude"]}
-                                    for c in CORNERS])
+    def held_fence(self, *polygons):
+        """An autopilot holding these open polygons (lists of CORNERS-style dicts); CORNERS by default."""
+        return FakeAutopilot(fence=[{"command": 5001, "param1": float(len(p)), "lat": c["latitude"],
+                                     "lon": c["longitude"]} for p in (polygons or (CORNERS,)) for c in p])
 
-    def test_no_course_clears_the_autopilots_fence_after_the_grace(self):
-        r, a = self.rig(autopilot=self.held_fence(), fence_clear_without_course=True)
-        r.info(course=None, uav_geofence=None)
-        self.fly(r, a, 15)
-        self.assertEqual(len(a.fence), 4)                            # the grace: a course may still come
-        self.fly(r, a, 15)
-        st = r.status()["fence_upload"]
-        self.assertEqual((st["state"], a.fence, st["clearing"]), ("done", [], True))
-        self.assertIsNotNone(st["backup"])
-
-    def test_without_the_switch_no_course_leaves_it_alone(self):
+    def test_no_course_nothing_is_written_and_the_fence_is_read(self):
         r, a = self.rig(autopilot=self.held_fence())
         r.info(course=None, uav_geofence=None)
-        self.fly(r, a, 30)
-        self.assertEqual(len(a.fence), 4)
-        self.assertEqual({x.name for x in r.log} & FENCE_MSGS, set())
+        self.fly(r, a, 40)
+        self.assertEqual((len(a.fence), a.uploads), (4, 0))
+        self.assertEqual({x.name for x in r.log} & WRITE_MSGS, set())
+        shapes = r.bridge.reports("ocs_fence")[-1]["ocs_fence"]["shapes"]
+        self.assertEqual([len(s["points"]) for s in shapes], [4])
 
     def test_a_course_whose_fence_was_refused_leaves_the_old_fence(self):
-        r, a = self.rig(autopilot=self.held_fence(), fence_clear_without_course=True)
+        r, a = self.rig(autopilot=self.held_fence())
         r.info(course=COURSE, uav_geofence=None)
         self.fly(r, a, 30)
-        self.assertEqual(len(a.fence), 4)
-        self.assertEqual({x.name for x in r.log} & FENCE_MSGS, set())
+        self.assertEqual((len(a.fence), a.uploads), (4, 0))
+        self.assertEqual({x.name for x in r.log} & WRITE_MSGS, set())
 
-    def test_the_bridge_is_told_what_the_autopilot_was_confirmed_to_hold(self):
+    def test_the_pilots_fence_beside_robocommands_is_never_touched(self):
+        inner = [{"latitude": 1.2803, "longitude": 103.8554}, {"latitude": 1.2803, "longitude": 103.8560},
+                 {"latitude": 1.2809, "longitude": 103.8560}, {"latitude": 1.2809, "longitude": 103.8554}]
+        r, a = self.rig(autopilot=self.held_fence(CORNERS, inner))
+        r.info(uav_geofence=CORNERS + [CORNERS[0]])
+        self.fly(r, a, 70)
+        self.assertEqual((len(a.fence), a.uploads), (8, 0))
+        self.assertEqual({x.name for x in r.log} & WRITE_MSGS, set())
+        last = r.bridge.reports("ocs_fence")[-1]["ocs_fence"]
+        self.assertEqual((last["state"], last["verified"], len(last["shapes"])), ("done", True, 2))
+
+    def test_the_bridge_is_told_what_the_autopilot_held_at_the_last_read(self):
         r, a = self.rig()
         r.info(uav_geofence=CORNERS + [CORNERS[0]])
         self.fly(r, a, 10)
         last = r.bridge.reports("ocs_fence")[-1]["ocs_fence"]
         self.assertEqual((last["vehicle_id"], last["state"], last["verified"]), ("UAV1", "done", True))
         self.assertEqual(last["polygon"], [[c["latitude"], c["longitude"]] for c in CORNERS])
-        self.assertLess(abs(parse_utc(last["verified_at"]) - (WALL0 + r.clock.t - T0)), 10)
+        now_wall = WALL0 + r.clock.t - T0
+        self.assertLess(abs(parse_utc(last["verified_at"]) - now_wall), 10)
+        self.assertLess(abs(parse_utc(last["read_at"]) - now_wall), 10)
+        self.assertEqual([[round(v, 6) for v in p] for p in last["shapes"][0]["points"]], last["polygon"])
+        # home HAE = GLOBAL_POSITION_INT alt - relative_alt + geoid_separation_m: 584.09 - 10.5 - 24.6
+        self.assertAlmostEqual(last["home_hae_m"], 548.99, places=2)
+        self.assertEqual(set(last["params"]), set(fu.REPORTED_PARAMS))
         n = len(r.bridge.reports("ocs_fence"))
         self.fly(r, a, 5)
         self.assertEqual(len(r.bridge.reports("ocs_fence")), n)     # nothing changed: nothing re-sent
         self.fly(r, a, 60)
-        self.assertGreater(len(r.bridge.reports("ocs_fence")), n)   # the re-check refreshed verified_at
+        self.assertGreater(len(r.bridge.reports("ocs_fence")), n)   # the next reads refreshed read_at
 
 
 if __name__ == "__main__":

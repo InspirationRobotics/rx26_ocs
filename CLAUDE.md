@@ -21,7 +21,10 @@ If this is wrong everything appears to work right up until the course.
 
 Never set a static address on the RoboCommand-facing interface. The handbook
 forbids it, and DHCP is what makes one config work on all four courses (Alpha
-`192.168.65.2`, Bravo `.66.2`, Charlie `.67.2`, Delta `.68.2`).
+`192.168.65.2`, Bravo `.66.2`, Charlie `.67.2`, Delta `.68.2`). Nor is the
+broker's address configured: `[robocommand] host = "auto"` finds whichever host
+holds the course retained on `robocommand/robotx/course` (`rx_bridge/rcfind.py`;
+the screening's was `192.168.69.3`, on none of those subnets).
 
 ## Running it
 
@@ -44,17 +47,22 @@ heartbeats are published as `STATE_AUTO`, so RoboCommand starts a run with the
 vehicles disarmed. Command line only, orange banner on both pages, never at
 competition — `docs/TESTING.md` "Bench dry run".
 
-Ports: **37564** vehicle link (TCP) · **37565** discovery beacon (UDP, OCS to the boat, broadcast — never on the course network; `docs/VEHICLE_LINK.md` "Discovery") · **8099** the page · **11883** dev broker.
+`start_ekko_ocs.py` (`.venv`) is the Ekko-only start from the 7-8 Nov
+assessment: it stops both, then starts fleet_link on the radio alone (COM28, no
+WiFi) and ocs_web on `bridge.toml`. With ocs_web stopped, `--find` runs one
+search for RoboCommand and prints every host that answered and what it was.
+
+Ports: **37564** vehicle link (TCP) · **37565** discovery beacon (UDP, OCS to the boat, broadcast — never on the course network; `docs/VEHICLE_LINK.md` "Discovery") · **8099** the page · **11883** dev broker · **1883** RoboCommand's broker (TCP, on the host the search finds).
 
 ## Before you commit — five gates, in order
 
 | | Command | Expect |
 |---|---|---|
-| 1 | `.venv\Scripts\python.exe -m unittest discover -s tests -t .` | `Ran 498 tests`, `OK` |
-| 2 | `python -m unittest discover -s fleet/tests -t .` — **system** python | `Ran 523 tests`, `OK` — fleet_link, the radio adapter, the RXL codec, the fence upload, `--sim-boat` |
+| 1 | `.venv\Scripts\python.exe -m unittest discover -s tests -t .` | `Ran 610 tests`, `OK` |
+| 2 | `python -m unittest discover -s fleet/tests -t .` — **system** python | `Ran 533 tests`, `OK` — fleet_link, the radio adapter, the RXL codec, the fence read and upload, `--sim-boat` |
 | 3 | `.venv\Scripts\python.exe bench_stage1.py` | `21/21` — the RoboCommand sequence, over MQTT |
-| 4 | `.venv\Scripts\python.exe bench_stage2.py` | `18/18` — the TCP vehicle link, with receipts |
-| 5 | `.venv\Scripts\python.exe bench_stage3.py` | `25/25` — the two-vehicle Proof of Readiness rehearsal, with the UAV fence handshake |
+| 4 | `.venv\Scripts\python.exe bench_stage2.py` | `22/22` — the TCP vehicle link, with receipts, tiers from a vehicle and run_end |
+| 5 | `.venv\Scripts\python.exe bench_stage3.py` | `25/25` — the two-vehicle Proof of Readiness rehearsal, with the UAV fence read off the aircraft |
 
 Gates 1 and 3-5 run on `.venv`; gate 2 needs `pymavlink` and `pyserial`, which
 live only in the system Python 3.13.
@@ -107,6 +115,8 @@ the run just never starts, which looks exactly like the "declared a vehicle that
 not on the water" hang below. Since 8fc09f2 it refuses a UAV fence that leaves the
 course and its `uav_transit_area` by more than 1 m, fewer than 4 points, and a
 ceiling (`uav_geofence_max_altitude_hae_m`) that is unset or outside 0–50 m HAE.
+Both are read off Ekko, never typed: the polygon is the pilot's, drawn in QGC
+inside RoboCommand's, and the ceiling is home HAE + FENCE_ALT_MAX.
 The bridge applies the same rule first (`geofence.rc_declaration_problems`, a
 transcription of their test server's) and refuses in words on the page; their
 test server's log is the only other place a refusal shows. On the sim box,
@@ -124,6 +134,8 @@ id is stable by design — it is what lets the broker keep our session across a 
 — so a second client using the same id takes the session and the two kick each
 other off forever. After three drops in 30 s the log says `DUPLICATE OCS?`. The
 handbook permits the team one connection, so the fight is the rule being enforced.
+The broker search is not a second OCS: it probes only while the bridge is not
+connected, under a client id of its own (`ocs-<team>-find-…`, clean session).
 
 **Declaring a vehicle that is not on the water hangs the run.** RoboCommand
 publishes RunStart only once *every* declared vehicle reports `STATE_AUTO`, with
@@ -147,15 +159,17 @@ newer robocommand revision, and read the diff when you do.
 | `rx_bridge/bridge.py` | the two connections and the rules between them |
 | `rx_bridge/runstate.py` | the run state machine — no I/O, all of the ordering rules |
 | `rx_bridge/active.py` | which vehicles go into the declaration |
-| `rx_bridge/geofence.py` | the UAV geofence for the course in hand, and the gate that refuses to declare a UAV whose autopilot has not been read back holding it — pure |
+| `rx_bridge/geofence.py` | RoboCommand's UAV polygon for the course in hand (put on the aircraft for the pilot to draw inside), and what a declaration with an aircraft carries: the pilot's polygon and ceiling, read off its autopilot, or why not — pure |
+| `rx_bridge/rcfind.py` | finds RoboCommand's broker by the course it keeps retained (`host = "auto"`): last host, gateways, .2/.3, then a /24 sweep; again after 30 s down; its probes never overlap the bridge's connection |
+| `rx_bridge/operatorstore.py` | the two values no vehicle reports, the pilot call sign and each aircraft's registration: typed on the page > this laptop's saved default (`run/operator.json`) > `bridge.toml` |
 | `rx_bridge/framing.py` | the vehicle link's frame boundaries — **mirrored in both vehicles' `ocs_link.py`** |
-| `rx_bridge/beacon.py` | the discovery beacon: which laptop addresses it broadcasts from (never the RoboCommand broker's /24) and what the boat does with it |
+| `rx_bridge/beacon.py` | the discovery beacon: which laptop addresses it broadcasts from (never the RoboCommand broker's /24 or the address that reaches it, and none on a /24 not yet searched for it) and what the boat does with it |
 | `rx_bridge/linkpolicy.py` | which of a vehicle's two links the OCS listens to (per kind) and talks on (one, never both) — pure |
 | `rx_bridge/validate.py` | the NaN and UNKNOWN nets |
 | `rx_bridge/benchauto.py` | the `--bench-auto` rewrite (MANUAL to AUTO, listed vehicles only, never KILLED) — the one deliberate exception to "never invent a value" |
-| `ocs_web/` | the operator page and `/map`, the fleet map (course, declared and read-back UAV geofence; `/api/fleet` proxies fleet_link) |
-| `fleet/` | `fleet_link`: owns the laptop's MAVLink inputs (WiFi UDP 14550, RFD900ux COM8) and fans them out (`127.0.0.1:8098/fleet`); the **OCS adapter** (Ekko's RXL TUNNELs ⇄ bridge as **sysid 250**), which also **writes the declared geofence to Ekko's autopilot**, disarmed only; `--sim-boat` is simulation only. **System python, not `.venv`**; start with `FLEET_LINK.cmd`; `fleet/README.md` |
-| `bridge.toml` | the fleet, the brokers, the tiers, the geofence and the UAV ceiling, the pilot call sign default, `prefer` and `link_prefer_s` |
+| `ocs_web/` | the operator page and `/map`, the fleet map (course, RoboCommand's UAV polygon, the fence read off each aircraft and the polygon a declaration carries; `/api/fleet` proxies fleet_link) |
+| `fleet/` | `fleet_link`: owns the laptop's MAVLink inputs (WiFi UDP 14550, RFD900ux COM8) and fans them out (`127.0.0.1:8098/fleet`); the **OCS adapter** (Ekko's RXL TUNNELs ⇄ bridge as **sysid 250**), which also **reads Ekko's fence** for the declaration and **writes RoboCommand's polygon onto it**, disarmed only and never over the pilot's; `--sim-boat` is simulation only. **System python, not `.venv`**; start with `FLEET_LINK.cmd`; `fleet/README.md` |
+| `bridge.toml` | the fleet, the brokers (`[robocommand] host = "auto"`), the tiers, the geofence margin, the pilot call sign and registration defaults, `prefer` and `link_prefer_s` |
 | `rc_watch.py`, `rc_box_tests.py` | **runs on the sim box, not here**: a live page (`:8088`) of everything that crossed RoboNation's broker, refusals from their log, and narrated tests (`docs/TESTING.md` 4e) |
 | `rc_e2e.py` | runs **here**: our OCS (isolated copy) + the boat's `ocs_link.py` against the sim box's test server, narrated on the box's page over ssh (`docs/TESTING.md` 4e) |
 | `docs/VEHICLE_LINK.md` | the TCP 37564 contract: framing, `ocs_hello`, the link preference, `ocs_info`, the ReadinessConfirm rewrite |

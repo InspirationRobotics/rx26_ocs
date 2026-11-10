@@ -1,11 +1,13 @@
-"""fence_upload: the declared geofence onto the autopilot, against a fake ArduPilot (helpers.FakeAutopilot)
+"""fence_upload: the autopilot's fence over the radio, against a fake ArduPilot (helpers.FakeAutopilot)
 that speaks the fence side of the mission protocol through pymavlink -- no radio, no sleeping.
 
-What is pinned: the wire layouts (both directions, against pymavlink), Ekko's own rules carried
-over (closing vertex stripped, param1 = vertex count, never armed, never a parameter written,
-read back within 1 m), and what this adds -- read first and skip a fence already there, save the
-old fence before replacing it (and refuse to replace it unsaved), never lock the aircraft out,
-survive a lossy radio, give up loudly."""
+What is pinned: the wire layouts (both directions, against pymavlink); Ekko's own rules carried over
+(closing vertex stripped, param1 = vertex count, never armed, never a parameter written, read back
+within 1 m); the READ that always runs -- every fence item, the FENCE_* params and home HAE, which is
+what the bridge declares from; and the one WRITE -- RoboCommand's polygon, once per course, skipped
+when it is there already, never over the pilot's polygon inside it, never put back once the pilot has
+taken it off, the old fence saved before it is replaced (and not replaced unsaved), never locking the
+aircraft out, surviving a lossy radio, giving up loudly."""
 from __future__ import annotations
 
 import json
@@ -22,14 +24,21 @@ from fleet import mavframe
 from .helpers import DIALECT, FakeAutopilot, encode, fence_items
 
 T0 = 1000.0
-#: bridge.toml's placeholder box at the Singapore test course (closed, as declared).
+#: bridge.toml's placeholder box at the Singapore test course (closed, as declared): RoboCommand's polygon.
 DECLARED = [(1.28010, 103.85520), (1.28010, 103.85625), (1.28110, 103.85625), (1.28110, 103.85520),
             (1.28010, 103.85520)]
 OPEN = DECLARED[:-1]
 INSIDE = (1.28060, 103.85570)
 SARASOTA = (27.3364, -82.5307)
+#: The pilot's own fence for the course, drawn in QGC inside RoboCommand's -- five vertices, to tell them apart.
+PILOT = [(1.28030, 103.85540), (1.28030, 103.85600), (1.28090, 103.85600), (1.28100, 103.85570),
+         (1.28090, 103.85540)]
+CIRCLE = [{"command": 5003, "param1": 35.0, "lat": 32.92357, "lon": -117.03857}]
+ENABLED = {"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}
 ALLOWED_TO_SEND = {"PARAM_REQUEST_READ", "MISSION_REQUEST_LIST", "MISSION_REQUEST_INT", "MISSION_ACK",
                    "MISSION_COUNT", "MISSION_ITEM_INT"}
+#: Only an upload sends these (a download ends with our MISSION_ACK, so that one is not a write).
+WRITES = {"MISSION_COUNT", "MISSION_ITEM_INT"}
 
 
 def frame_of(raw: bytes) -> mavframe.Frame:
@@ -43,11 +52,26 @@ def ours(msgid: int, payload: bytes) -> object:
     return ap.MAVLink(None).decode(bytearray(raw))
 
 
+def east(point, metres):
+    """`point` moved `metres` east, in fence_upload's own flat metres."""
+    return (point[0], point[1] + metres / (111195.08 * math.cos(math.radians(point[0]))))
+
+
+def reach(metres):
+    """PILOT with its east side moved out to `metres` beyond RoboCommand's east edge (lon 103.85625)."""
+    return [east((lat, 103.85625), metres) if lon == 103.85600 else (lat, lon) for lat, lon in PILOT]
+
+
+def held(*polygons):
+    """Downloaded fence items holding these (open) polygons, in this order."""
+    return [dict(i, seq=n) for n, i in enumerate(i for p in polygons for i in fence_items(p))]
+
+
 class Rig:
     """One FenceUploader wired to one FakeAutopilot on a fake clock."""
 
     def __init__(self, autopilot=None, *, timing=fu.Timing(), backup_dir=None, position=SARASOTA,
-                 may_block_arming=False):
+                 may_block_arming=False, write=True, home_hae=None):
         self.t = T0
         self.ap = autopilot or FakeAutopilot()
         self._tmp = tempfile.TemporaryDirectory()
@@ -56,6 +80,7 @@ class Rig:
                                    send=self._send, armed=lambda now: self.armed,
                                    position=lambda now: self.position, route_ok=lambda: self.route_ok,
                                    backup_dir=self.backup_dir, may_block_arming=may_block_arming,
+                                   write=write, home_hae=home_hae,
                                    wall=lambda: 1_790_000_000.0 + (self.t - T0), timing=timing)
         self.armed, self.position, self.route_ok = False, position, True
         self.accept = True
@@ -105,6 +130,10 @@ class RigCase(unittest.TestCase):
 
     def assertHolds(self, r, polygon=OPEN):
         self.assertIsNone(fu.matches([dict(i, seq=n) for n, i in enumerate(r.ap.fence)], polygon), r.ap.fence)
+
+    def assertNothingWritten(self, r, since=0):
+        later = r.ap.names()[since:]
+        self.assertFalse(WRITES & set(later), later)
 
 
 # ============================================================================ wire
@@ -194,6 +223,11 @@ class Geometry(unittest.TestCase):
         self.assertFalse(fu.inside(SARASOTA, OPEN))
         self.assertFalse(fu.inside((1.2806, 103.8565), OPEN))      # just east
 
+    def test_outside_by_m(self):
+        self.assertEqual(fu.outside_by_m(INSIDE, OPEN), 0.0)
+        self.assertAlmostEqual(fu.outside_by_m(east((1.28060, 103.85625), 10.0), OPEN), 10.0, delta=0.05)
+        self.assertGreater(fu.outside_by_m(SARASOTA, OPEN), 1e6)
+
     def test_distance_is_right_across_an_ocean_and_the_dateline(self):
         san_diego = (32.7157, -117.1611)
         self.assertAlmostEqual(fu.offset_m(san_diego, OPEN[0]) / 1000.0, 14140, delta=150)
@@ -201,7 +235,7 @@ class Geometry(unittest.TestCase):
         self.assertAlmostEqual(fu.offset_m(OPEN[0], (OPEN[0][0] + 1.0 / 111195.08, OPEN[0][1])), 1.0, places=3)
 
     def test_matches(self):
-        items = [dict(i, seq=n) for n, i in enumerate(fence_items(OPEN))]
+        items = held(OPEN)
         self.assertIsNone(fu.matches(items, OPEN))
         moved = [dict(i) for i in items]
         moved[2]["lat"] += 2.0 / 111195.0
@@ -213,8 +247,34 @@ class Geometry(unittest.TestCase):
         circle[0]["command"] = fu.CMD_FENCE_CIRCLE_INCLUSION
         self.assertIn("inclusion circle", fu.matches(circle, OPEN))
 
+    def test_the_same_ring_from_any_vertex_in_either_direction(self):
+        self.assertTrue(fu.same_ring(OPEN, OPEN[2:] + OPEN[:2]))
+        self.assertTrue(fu.same_ring(OPEN, list(reversed(OPEN))))
+        self.assertTrue(fu.same_ring(OPEN, [east(p, 0.5) for p in OPEN]))         # within 1 m
+        moved = list(OPEN)
+        moved[1] = east(OPEN[1], 2.0)
+        self.assertFalse(fu.same_ring(OPEN, moved))
+        self.assertFalse(fu.same_ring(OPEN, OPEN[:3]))
 
-# ======================================================================== the dialog
+    def test_contains_looks_among_every_inclusion_polygon(self):
+        self.assertTrue(fu.contains(held(PILOT, OPEN), OPEN))
+        self.assertTrue(fu.contains(held(list(reversed(OPEN))), OPEN))
+        self.assertFalse(fu.contains(held(PILOT), OPEN))
+        excluded = [dict(i, command=fu.CMD_FENCE_POLYGON_VERTEX_EXCLUSION) for i in held(OPEN)]
+        self.assertFalse(fu.contains(excluded, OPEN))
+
+    def test_drawn_inside_is_the_pilots_polygon(self):
+        self.assertEqual(fu.drawn_inside(held(PILOT), OPEN), 5)
+        self.assertEqual(fu.drawn_inside(held(OPEN, PILOT), OPEN), 5)     # RoboCommand's own is never the pilot's
+        self.assertIsNone(fu.drawn_inside(held(OPEN), OPEN))
+        self.assertEqual(fu.drawn_inside(held(reach(3.0)), OPEN), 5)      # placed by hand on RoboCommand's line
+        self.assertIsNone(fu.drawn_inside(held(reach(10.0)), OPEN))       # sticks out: another course's, or a test
+        self.assertIsNone(fu.drawn_inside(held(PILOT), OPEN, ignore=[PILOT]))   # this OCS's own
+        excluded = [dict(i, command=fu.CMD_FENCE_POLYGON_VERTEX_EXCLUSION) for i in held(PILOT)]
+        self.assertIsNone(fu.drawn_inside(excluded, OPEN))
+
+
+# ======================================================================== the write
 
 class Writing(RigCase):
     def test_fence_off_far_away_it_is_written_and_read_back(self):
@@ -227,11 +287,13 @@ class Writing(RigCase):
         self.assertHolds(r)
         self.assertEqual([i["param1"] for i in r.ap.fence], [4.0] * 4)          # the closing vertex is gone
         self.assertEqual((r.ap.uploads, st["writes"], st["attempts"], st["failures"]), (1, 1, 1, 0))
+        self.assertEqual([m.param_id for m in r.sent("PARAM_REQUEST_READ")], list(fu.REPORTED_PARAMS))
         names = r.ap.names()
-        self.assertEqual(names[:3], ["PARAM_REQUEST_READ"] * 3)
+        self.assertEqual(names[:5], ["PARAM_REQUEST_READ"] * 5)
         self.assertEqual(names.count("MISSION_COUNT"), 1)
         self.assertEqual(names.count("MISSION_REQUEST_LIST"), 2)                 # read first, then read back
         self.assertIsNone(st["backup"])                                          # nothing was there to save
+        self.assertTrue(st["verified"])
 
     def test_nothing_but_the_fence_dialog_and_parameter_READS_is_ever_sent(self):
         r = self.rig()
@@ -243,14 +305,16 @@ class Writing(RigCase):
         self.assertTrue(all(m.target_system == 1 for m in r.ap.heard))
 
     def test_a_fence_already_there_is_not_written_again(self):
-        r = self.rig(FakeAutopilot(fence=fence_items(OPEN)))
-        r.declare()
-        r.run(5)
-        st = r.status()
-        self.assertEqual(st["state"], "done")
-        self.assertIn("already holds this polygon", st["reason"])
-        self.assertNotIn("MISSION_COUNT", r.ap.names())
-        self.assertEqual(r.ap.uploads, 0)
+        for there in (OPEN, list(reversed(OPEN[1:] + OPEN[:1]))):               # as written, or redrawn in QGC
+            r = self.rig(FakeAutopilot(fence=fence_items(there)))
+            r.declare()
+            r.run(5)
+            st = r.status()
+            self.assertEqual(st["state"], "done")
+            self.assertIn("already holds RoboCommand's polygon; nothing written", st["reason"])
+            self.assertNothingWritten(r)
+            self.assertEqual(r.ap.uploads, 0)
+            self.assertTrue(st["verified"])
 
     def test_the_old_fence_is_saved_before_it_is_replaced(self):
         circle = [{"command": 5003, "param1": 35.0, "lat": 27.3364, "lon": -82.5307}]
@@ -280,7 +344,7 @@ class Writing(RigCase):
         self.assertEqual(st["state"], "waiting")
         self.assertIn("so it was not replaced", st["last_error"])
         self.assertEqual(r.ap.fence, circle)
-        self.assertNotIn("MISSION_COUNT", r.ap.names())
+        self.assertNothingWritten(r)
 
     def test_one_write_per_polygon_and_a_new_polygon_starts_over(self):
         r = self.rig()
@@ -290,33 +354,214 @@ class Writing(RigCase):
         r.declare()                                       # the bridge re-sends ocs_info on every reconnect
         r.run(60)
         later = r.ap.names()[n:]
-        self.assertNotIn("MISSION_COUNT", later)          # re-read (the 60 s re-check), never re-written
-        self.assertLessEqual(set(later), {"MISSION_REQUEST_LIST", "MISSION_REQUEST_INT", "MISSION_ACK"})
+        self.assertIn("MISSION_REQUEST_LIST", later)      # read every 30 s ...
+        self.assertLessEqual(set(later), ALLOWED_TO_SEND - WRITES)    # ... and never written again
         self.assertEqual(r.ap.uploads, 1)
-        bigger =[(1.2800, 103.8551), (1.2800, 103.8564), (1.2812, 103.8564), (1.2812, 103.8551)]
+        # A new course whose polygon encloses the old one: the old one is this OCS's own doing, not
+        # the pilot's fence drawn inside the new one, so it is saved and replaced.
+        bigger = [(1.2800, 103.8551), (1.2800, 103.8564), (1.2812, 103.8564), (1.2812, 103.8551)]
         r.declare(bigger)
         r.run(5)
-        self.assertEqual(r.status()["state"], "done")
+        st = r.status()
+        self.assertEqual(st["state"], "done", st)
         self.assertHolds(r, bigger)
         self.assertEqual(r.ap.uploads, 2)
+        self.assertEqual(len(json.loads(Path(st["backup"]).read_text(encoding="utf-8"))["items"]), 4)
 
-    def test_a_withdrawn_polygon_stops_and_leaves_the_autopilots_fence_alone(self):
-        r = self.rig(FakeAutopilot(fence=fence_items(OPEN)))
+    def test_a_withdrawn_polygon_is_never_written_and_the_fence_is_left_alone(self):
+        r = self.rig(FakeAutopilot(fence=CIRCLE))
         r.armed = True
         r.declare()
         r.run(2)
         r.up.set_polygon(None, r.t)
         r.armed = False
         r.run(10)
-        self.assertEqual(r.status()["state"], "off")
-        self.assertEqual(r.ap.heard, [])
-        self.assertEqual(len(r.ap.fence), 4)
+        st = r.status()
+        self.assertEqual(st["state"], "off")
+        self.assertIn("withdrew", st["reason"])
+        self.assertNothingWritten(r)
+        self.assertEqual(r.ap.fence, CIRCLE)
+        self.assertEqual(st["reads"], 1)                  # still read: the bridge declares from it
 
-    def test_nothing_happens_before_a_polygon_arrives(self):
-        r = self.rig()
+    def test_before_a_polygon_arrives_the_autopilot_is_only_read(self):
+        r = self.rig(FakeAutopilot(fence=CIRCLE))
         r.run(10)
-        self.assertEqual((r.status()["state"], r.ap.heard), ("off", []))
+        st = r.status()
+        self.assertEqual(st["state"], "off")
+        self.assertNothingWritten(r)
+        self.assertEqual((st["reads"], st["autopilot_fence"]), (1, "1 inclusion circle"))
+        self.assertEqual([m.param_id for m in r.sent("PARAM_REQUEST_READ")], list(fu.REPORTED_PARAMS))
 
+
+class WriteOff(RigCase):
+    """fence_upload = false: RoboCommand's polygon is only looked for on the autopilot."""
+
+    def test_nothing_is_written_even_to_an_empty_fence(self):
+        r = self.rig(write=False)
+        r.declare()
+        r.run(50)
+        st = r.status()
+        self.assertEqual(st["state"], "off")
+        self.assertIn("fence_upload is off", st["reason"])
+        self.assertNothingWritten(r)
+        self.assertEqual((st["verified"], st["reads"]), (False, 2))
+
+    def test_robocommands_polygon_put_there_in_qgc_is_seen(self):
+        r = self.rig(FakeAutopilot(fence=fence_items(OPEN) + fence_items(PILOT)), write=False)
+        r.declare()
+        r.run(5)
+        self.assertTrue(r.status()["verified"])
+        self.assertNothingWritten(r)
+
+
+class NeverOverThePilot(RigCase):
+    """The pilot's fence -- drawn in QGC inside RoboCommand's polygon -- is the polygon the bridge
+    declares, so the write never replaces it (Chase, 7 Nov 2026)."""
+
+    def test_the_pilots_polygon_alone_is_kept_and_robocommands_not_written(self):
+        r = self.rig(FakeAutopilot(fence=fence_items(PILOT)))
+        r.declare()
+        r.run(5)
+        st = r.status()
+        self.assertEqual(st["state"], "done", st)
+        self.assertIn("NOT written: the autopilot holds a 5-vertex polygon inside RoboCommand's", st["reason"])
+        self.assertNothingWritten(r)
+        self.assertEqual((r.ap.uploads, st["verified"], st["backup"]), (0, False, None))
+        self.assertHolds(r, PILOT)
+
+    def test_drawn_by_hand_on_robocommands_line_it_is_still_the_pilots(self):
+        r = self.rig(FakeAutopilot(fence=fence_items(reach(3.0))))
+        r.declare()
+        r.run(5)
+        self.assertIn("NOT written", r.status()["reason"])
+        self.assertNothingWritten(r)
+
+    def test_robocommands_and_the_pilots_side_by_side_nothing_is_written(self):
+        r = self.rig(FakeAutopilot(fence=fence_items(OPEN) + fence_items(PILOT)))
+        r.declare()
+        r.run(5)
+        st = r.status()
+        self.assertEqual(st["state"], "done")
+        self.assertIn("already holds RoboCommand's polygon and 1 polygon(s) beside it", st["reason"])
+        self.assertTrue(st["verified"])
+        self.assertNothingWritten(r)
+
+    def test_the_pilots_polygon_added_after_the_write_is_never_touched(self):
+        r = self.rig()
+        r.declare()
+        r.run(5)
+        n = len(r.ap.heard)
+        r.ap.fence = fence_items(OPEN) + fence_items(PILOT)        # drawn in QGC, both uploaded
+        r.run(65)
+        st = r.status()
+        self.assertEqual((st["state"], st["verified"], r.ap.uploads), ("done", True, 1))
+        self.assertEqual([len(s["points"]) for s in st["autopilot_shapes"]], [4, 5])
+        self.assertLess(st["verified_age_s"], 31)
+        self.assertNothingWritten(r, since=n)
+
+    def test_one_that_sticks_out_is_not_the_pilots_for_this_course_and_is_replaced(self):
+        r = self.rig(FakeAutopilot(fence=fence_items(reach(10.0))))
+        r.declare()
+        r.run(5)
+        st = r.status()
+        self.assertEqual(st["state"], "done", st)
+        self.assertHolds(r)
+        self.assertEqual(len(json.loads(Path(st["backup"]).read_text(encoding="utf-8"))["items"]), 5)
+
+
+# ======================================================================== the read
+
+class Watch(RigCase):
+    """Read every watch_s while disarmed: what the bridge declares from. Never a reason to write."""
+
+    def test_read_every_30_s_and_the_confirmation_refreshed(self):
+        r = self.rig()
+        r.declare()
+        r.run(5)
+        self.assertEqual(r.status()["reads"], 2)                        # before the write, and the read-back
+        n = len(r.ap.heard)
+        r.run(60)
+        st = r.status()
+        self.assertEqual((st["state"], st["reads"]), ("done", 4))
+        self.assertLess(st["verified_age_s"], 30)
+        self.assertNothingWritten(r, since=n)
+
+    def test_robocommands_polygon_taken_off_in_qgc_is_never_put_back(self):
+        r = self.rig()
+        r.declare()
+        r.run(5)
+        n = len(r.ap.heard)
+        r.ap.fence = [dict(i) for i in CIRCLE]                          # the pilot uploads something else
+        with self.assertLogs("fleet", "WARNING") as logs:
+            r.run(70)
+        self.assertTrue(any("no longer on the autopilot" in line for line in logs.output))
+        st = r.status()
+        self.assertEqual((st["state"], st["verified"], r.ap.uploads), ("done", False, 1))
+        self.assertIn("no longer on the autopilot (it holds 1 inclusion circle)", st["reason"])
+        self.assertEqual(r.ap.fence, CIRCLE)
+        self.assertNothingWritten(r, since=n)
+
+    def test_no_read_while_armed_and_an_unanswered_one_only_ages(self):
+        r = self.rig()
+        r.declare()
+        r.run(5)
+        n = len(r.ap.heard)
+        r.armed = True
+        r.run(120)
+        self.assertEqual(len(r.ap.heard), n)                            # nothing said to an armed autopilot
+        self.assertEqual(r.status()["state"], "done")
+        r.armed = False
+        r.ap.silent_missions = True
+        r.run(80)
+        st = r.status()
+        self.assertEqual((st["state"], st["failures"], st["verified"]), ("done", 0, True))
+        self.assertGreater(st["verified_age_s"], 190)                   # it just ages: the bridge judges it
+
+    def test_a_read_refused_mid_qgc_upload_is_tried_again_in_seconds(self):
+        a = FakeAutopilot()
+        a.deny_downloads = 1
+        r = self.rig(a)
+        r.run(1)
+        st = r.status()
+        self.assertEqual((st["reads"], st["read_refusals"], st["failures"]), (0, 1, 0))
+        r.run(5)
+        self.assertEqual(r.status()["reads"], 1)
+
+
+class WhatTheBridgeIsTold(RigCase):
+    """confirmation(): the body of `ocs_fence` -- what the bridge declares the polygon and ceiling from."""
+
+    PARAMS = {"FENCE_TYPE": 7.0, "FENCE_ENABLE": 0.0, "FENCE_AUTOENABLE": 0.0, "FENCE_ALT_MAX": 30.0,
+              "FENCE_OPTIONS": 0.0}
+
+    def test_before_a_read_nothing_is_claimed(self):
+        c = self.rig().up.confirmation()
+        self.assertEqual((c["read_at"], c["shapes"], c["home_hae_m"], c["verified"]), (None, None, None, False))
+        self.assertEqual(c["params"], dict.fromkeys(fu.REPORTED_PARAMS))
+
+    def test_every_shape_the_params_and_home_hae_at_the_last_read(self):
+        r = self.rig(FakeAutopilot(params=self.PARAMS, fence=fence_items(OPEN) + fence_items(PILOT)),
+                     home_hae=lambda now: 31.2468)
+        r.declare()
+        r.run(5)
+        c = r.up.confirmation()
+        json.dumps(c, allow_nan=False)
+        self.assertEqual((c["vehicle_id"], c["state"], c["verified"]), ("UAV1", "done", True))
+        self.assertEqual([(s["type"], s["inclusion"], len(s["points"])) for s in c["shapes"]],
+                         [("polygon", True, 4), ("polygon", True, 5)])
+        self.assertEqual(c["params"], self.PARAMS)
+        self.assertEqual(c["home_hae_m"], 31.25)
+        self.assertTrue(1_790_000_000.0 <= c["read_at"] <= 1_790_000_005.0)
+
+    def test_an_unknown_home_altitude_is_a_blank_not_a_guess(self):
+        r = self.rig(FakeAutopilot(params=self.PARAMS), home_hae=lambda now: None)
+        r.run(1)
+        c = r.up.confirmation()
+        self.assertIsNotNone(c["read_at"])
+        self.assertEqual((c["shapes"], c["home_hae_m"], c["polygon"]), ([], None, None))
+
+
+# ======================================================================== the rules
 
 class NeverArmed(RigCase):
     def test_armed_nothing_is_sent_and_disarming_lets_it_through(self):
@@ -365,18 +610,18 @@ class NeverArmed(RigCase):
 
 
 class NeverLockedOut(RigCase):
-    def test_enabled_and_outside_it_is_held_before_anything_is_read_or_written(self):
-        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}))
+    def test_enabled_and_outside_it_is_held_and_nothing_is_written(self):
+        r = self.rig(FakeAutopilot(params=ENABLED))
         r.declare()
         r.run(10)
         st = r.status()
         self.assertEqual(st["state"], "held")
         self.assertIn("FENCE_ENABLE 1", st["reason"])
         self.assertIn("outside it", st["reason"])
-        self.assertEqual(set(r.ap.names()), {"PARAM_REQUEST_READ"})
+        self.assertNothingWritten(r)
 
     def test_held_until_the_operator_switches_it_off_in_qgc(self):
-        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}))
+        r = self.rig(FakeAutopilot(params=ENABLED))
         r.declare()
         r.run(5)
         r.ap.set_param("FENCE_ENABLE", 0.0)            # broadcast, as ArduPilot does on a set
@@ -385,7 +630,7 @@ class NeverLockedOut(RigCase):
         self.assertHolds(r)
 
     def test_held_asks_the_params_again_in_case_the_broadcast_was_lost(self):
-        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}))
+        r = self.rig(FakeAutopilot(params=ENABLED))
         r.declare()
         r.run(5)
         r.ap.params["FENCE_ENABLE"] = 0.0              # changed, no broadcast heard
@@ -395,14 +640,13 @@ class NeverLockedOut(RigCase):
         self.assertEqual(r.status()["state"], "done")
 
     def test_enabled_and_inside_it_is_written(self):
-        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}),
-                     position=INSIDE)
+        r = self.rig(FakeAutopilot(params=ENABLED), position=INSIDE)
         r.declare()
         r.run(5)
         self.assertEqual(r.status()["state"], "done")
 
     def test_walking_inside_releases_a_hold(self):
-        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}))
+        r = self.rig(FakeAutopilot(params=ENABLED))
         r.declare()
         r.run(5)
         r.position = INSIDE
@@ -410,8 +654,7 @@ class NeverLockedOut(RigCase):
         self.assertEqual(r.status()["state"], "done")
 
     def test_an_unknown_position_is_not_inside(self):
-        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}),
-                     position=None)
+        r = self.rig(FakeAutopilot(params=ENABLED), position=None)
         r.declare()
         r.run(5)
         self.assertIn("position is unknown", r.status()["reason"])
@@ -430,7 +673,9 @@ class NeverLockedOut(RigCase):
         st = r.status()
         self.assertEqual(st["state"], "held")
         self.assertIn("FENCE_AUTOENABLE unanswered", st["reason"])
-        self.assertEqual(len(r.sent("PARAM_REQUEST_READ")), 3 + 3)       # 3 once, then the silent one 3 more times
+        asked = [m.param_id for m in r.sent("PARAM_REQUEST_READ")]
+        self.assertEqual(asked.count("FENCE_AUTOENABLE"), fu.Timing().tries + 1)   # the gate's tries, then a read
+        self.assertEqual(asked.count("FENCE_TYPE"), 1 + 1)                          # answered at once; the read
         r.position = INSIDE
         r.run(5)
         self.assertEqual(r.status()["state"], "done")
@@ -449,7 +694,9 @@ class NeverLockedOut(RigCase):
         self.assertEqual((st["state"], st["failures"]), ("gave up", 5))
         n = len(r.ap.heard)
         r.run(60)
-        self.assertEqual(len(r.ap.heard), n)                              # gave up means quiet
+        self.assertEqual(r.status()["state"], "gave up")
+        self.assertIn("MISSION_REQUEST_LIST", r.ap.names()[n:])          # gave up: still read ...
+        self.assertNothingWritten(r, since=n)                             # ... never written
         r.ap.set_param("FENCE_TYPE", 7.0)                                 # fixed in QGC: tried again --
         r.run(5)
         self.assertEqual(r.status()["state"], "held")                     # and now it CAN lock it out
@@ -458,8 +705,16 @@ class NeverLockedOut(RigCase):
         self.assertEqual(r.status()["state"], "done")
         self.assertHolds(r)
 
-
-ENABLED = {"FENCE_TYPE": 7.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0}
+    def test_a_fix_whose_broadcast_was_lost_is_caught_by_the_next_read(self):
+        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 1.0, "FENCE_ENABLE": 0.0, "FENCE_AUTOENABLE": 0.0}),
+                     timing=fu.Timing(retry_s=2.0))
+        r.declare()
+        r.run(31)
+        self.assertEqual(r.status()["state"], "gave up")
+        r.ap.params["FENCE_TYPE"] = 7.0                                   # set in QGC, broadcast lost
+        r.run(40)
+        self.assertEqual(r.status()["state"], "done")
+        self.assertHolds(r)
 
 
 class MayBlockArming(RigCase):
@@ -494,7 +749,7 @@ class MayBlockArming(RigCase):
         self.assertEqual(st["state"], "held")
         self.assertIn("does not cover this", st["reason"])
         self.assertIsNone(st["lockout"])
-        self.assertNotIn("MISSION_COUNT", r.ap.names())
+        self.assertNothingWritten(r)
 
     def test_it_does_not_cover_an_unanswered_fence_enable(self):
         r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 7.0, "FENCE_AUTOENABLE": 0.0}), may_block_arming=True)
@@ -523,8 +778,7 @@ class ForTheMap(RigCase):
                                 "radius_m": 20.0}])
 
     def test_the_status_carries_the_declared_polygon_and_what_the_autopilot_holds(self):
-        circle = [{"command": 5003, "param1": 35.0, "lat": 32.92357, "lon": -117.03857}]
-        r = self.rig(FakeAutopilot(fence=circle))
+        r = self.rig(FakeAutopilot(fence=CIRCLE))
         r.declare()
         self.assertEqual(r.status()["polygon"], [list(p) for p in OPEN])
         self.assertIsNone(r.status()["autopilot_shapes"])                  # never read: unknown, not empty
@@ -536,117 +790,6 @@ class ForTheMap(RigCase):
         for got, want in zip(shape["points"], OPEN):
             self.assertLess(fu.offset_m(tuple(got), want), 0.05)
         self.assertIsNotNone(st["autopilot_read_age_s"])
-
-
-CIRCLE = [{"command": 5003, "param1": 35.0, "lat": 32.92357, "lon": -117.03857}]
-
-
-class NoCourseClears(RigCase):
-    """set_clear: the bridge has no course, so the autopilot is left with NO fence items --
-    the bench case, flying without a RoboCommand server."""
-
-    def test_after_the_grace_the_fence_is_saved_cleared_and_read_back_empty(self):
-        r = self.rig(FakeAutopilot(fence=fence_items(OPEN)))
-        r.up.set_clear(r.t)
-        r.run(19)
-        self.assertNotIn("MISSION_COUNT", r.ap.names())                 # the grace: a course may still come
-        r.run(6)
-        st = r.status()
-        self.assertEqual(st["state"], "done", st)
-        self.assertEqual(st["reason"].split(".")[0], "cleared and read back empty")
-        self.assertEqual(r.ap.fence, [])
-        self.assertEqual([m.count for m in r.sent("MISSION_COUNT")], [0])
-        saved = json.loads(Path(st["backup"]).read_text(encoding="utf-8"))
-        self.assertEqual(len(saved["items"]), 4)
-        c = r.up.confirmation()
-        self.assertEqual((c["polygon"], c["verified"], c["state"]), ([], True, "done"))
-
-    def test_an_already_empty_fence_is_left_alone(self):
-        r = self.rig()
-        r.up.set_clear(r.t)
-        r.run(30)
-        self.assertIn("nothing to clear", r.status()["reason"])
-        self.assertNotIn("MISSION_COUNT", r.ap.names())
-
-    def test_a_course_inside_the_grace_cancels_the_clear(self):
-        r = self.rig(FakeAutopilot(fence=fence_items(OPEN)))
-        r.up.set_clear(r.t)
-        r.run(5)
-        r.declare()
-        r.run(30)
-        self.assertEqual(r.status()["state"], "done")
-        self.assertNotIn("MISSION_COUNT", r.ap.names())                 # it already held this course's fence
-        self.assertHolds(r)
-
-    def test_clearing_is_never_held_by_the_lock_out_rule(self):
-        r = self.rig(FakeAutopilot(params=ENABLED, fence=fence_items(OPEN)))
-        r.up.set_clear(r.t)
-        r.run(30)
-        self.assertEqual((r.status()["state"], r.ap.fence), ("done", []))
-        self.assertIsNone(r.status()["lockout"])
-
-    def test_a_polygons_only_fence_type_says_it_will_not_arm_cleared(self):
-        r = self.rig(FakeAutopilot(params={"FENCE_TYPE": 4.0, "FENCE_ENABLE": 1.0, "FENCE_AUTOENABLE": 0.0},
-                                   fence=fence_items(OPEN)))
-        r.up.set_clear(r.t)
-        r.run(30)
-        self.assertIn("Fences enabled, but none selected", r.status()["lockout"])
-
-    def test_still_never_while_armed(self):
-        r = self.rig(FakeAutopilot(fence=fence_items(OPEN)))
-        r.armed = True
-        r.up.set_clear(r.t)
-        r.run(60)
-        self.assertEqual(r.ap.heard, [])
-        self.assertEqual(len(r.ap.fence), 4)
-
-
-class Recheck(RigCase):
-    """Done is re-read every 60 s while disarmed: the confirmation never ages past that, and a
-    fence changed behind our back is put back."""
-
-    def test_the_confirmation_is_refreshed_by_a_read_every_minute(self):
-        r = self.rig()
-        r.declare()
-        r.run(5)
-        self.assertLess(r.status()["verified_age_s"], 5)
-        r.run(50)
-        self.assertGreater(r.status()["verified_age_s"], 49)
-        r.run(10)
-        st = r.status()
-        self.assertLess(st["verified_age_s"], 10)
-        self.assertEqual((st["state"], st["rechecks"], r.ap.uploads), ("done", 1, 1))
-
-    def test_a_fence_changed_in_qgc_is_saved_and_the_declared_one_put_back(self):
-        r = self.rig()
-        r.declare()
-        r.run(5)
-        r.ap.fence = [dict(i) for i in CIRCLE]                          # someone uploads a circle
-        with self.assertLogs("fleet", "WARNING") as logs:
-            r.run(70)
-        self.assertTrue(any("changed since it was verified" in line for line in logs.output))
-        st = r.status()
-        self.assertEqual(st["state"], "done")
-        self.assertHolds(r)
-        self.assertEqual(r.ap.uploads, 2)
-        saved = json.loads(Path(st["backup"]).read_text(encoding="utf-8"))
-        self.assertEqual(saved["items"][0]["command"], 5003)
-
-    def test_no_recheck_while_armed_and_a_silent_one_only_ages(self):
-        r = self.rig()
-        r.declare()
-        r.run(5)
-        n = len(r.ap.heard)
-        r.armed = True
-        r.run(120)
-        self.assertEqual(len(r.ap.heard), n)                            # nothing said to an armed autopilot
-        self.assertEqual(r.status()["state"], "done")
-        r.armed = False
-        r.ap.silent_missions = True
-        r.run(80)
-        st = r.status()
-        self.assertEqual((st["state"], st["failures"]), ("done", 0))    # an unanswered read is not a failure
-        self.assertGreater(st["verified_age_s"], 190)                   # it just ages: the bridge judges it
 
 
 class LossyRadio(RigCase):
@@ -683,10 +826,10 @@ class LossyRadio(RigCase):
         with self.assertLogs("fleet", "WARNING") as logs:
             r.run(5 * 30 + 30)
         st = r.status()
-        self.assertEqual((st["state"], st["failures"], st["attempts"]), ("gave up", 5, 5))
+        self.assertEqual((st["state"], st["failures"], st["attempts"], st["reads"]), ("gave up", 5, 5, 0))
         self.assertIn("no answer during the fence download after 4 request(s)", st["last_error"])
         self.assertTrue(any("GAVE UP" in line for line in logs.output))
-        self.assertEqual(len(r.sent("MISSION_REQUEST_LIST")), 5 * 4)
+        self.assertGreaterEqual(len(r.sent("MISSION_REQUEST_LIST")), 5 * 4)    # and the reads' own between them
 
     def test_a_link_that_refuses_the_frame_is_counted_and_retried(self):
         r = self.rig()
@@ -698,7 +841,7 @@ class LossyRadio(RigCase):
         r.run(40)
         self.assertEqual(r.status()["state"], "done")
 
-    def test_a_readback_that_disagrees_is_a_failure(self):
+    def test_a_readback_that_disagrees_is_a_failure_and_never_taken_for_the_pilots(self):
         a = FakeAutopilot()
         a.shift_m = 5.0
         r = self.rig(a)
@@ -706,7 +849,11 @@ class LossyRadio(RigCase):
         r.run(5)
         st = r.status()
         self.assertEqual(st["failures"], 1)
-        self.assertIn("read back wrong: vertex 0 is 5.0 m", st["last_error"])
+        self.assertIn("read back wrong: the polygon just written is not on the autopilot (it holds 4 "
+                      "inclusion-polygon vertices)", st["last_error"])
+        r.run(35)               # the retry: the mangled polygon lies within 5 m of RoboCommand's, but it is ours
+        st = r.status()
+        self.assertEqual((st["failures"], a.uploads), (2, 2))
 
 
 if __name__ == "__main__":

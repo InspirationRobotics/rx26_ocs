@@ -26,13 +26,15 @@ because they come from hardware or software states you cannot ask for:
   --mistype   report a vehicle_type that contradicts the config, the signature
               of a reporter copy-pasted from one vehicle to another
 
-A fake UAV is not declarable on heartbeats alone. The OCS will not declare an aircraft
-until its autopilot is KNOWN to hold the course's geofence (docs/VEHICLE_LINK.md,
-`ocs_fence`), and that confirmation travels on the TCP vehicle link, not on the MQTT
-topic these heartbeats use. `--ocs-tcp` plays the radio adapter's part for it: it
-connects to the bridge, says hello as `--vehicle`, answers every `ocs_info` that carries
-a fence with a verified `ocs_fence` (and re-confirms every 60 s, as the adapter does), and
-answers "no course" with a verified empty polygon -- "cleared".
+A fake UAV is not declarable on heartbeats alone. A declaration with an aircraft carries
+the fence and ceiling read off its autopilot (docs/VEHICLE_LINK.md, `ocs_fence`), and that
+read travels on the TCP vehicle link, not on the MQTT topic these heartbeats use.
+`--ocs-tcp` plays the radio adapter's part, and the autopilot's and pilot's with it: it
+connects to the bridge, says hello as `--vehicle`, and answers every `ocs_info` with an
+`ocs_fence` read "now" -- RoboCommand's polygon written to a stand-in autopilot, a stand-in
+pilot's polygon drawn inside it (RoboCommand's pulled toward its centre to half size), a
+FENCE_ALT_MAX and a home altitude (PARAMS, HOME_HAE_M). It reads again every
+30 s, as the adapter does. A null polygon leaves the stand-in autopilot as it is.
 
     python fake_vehicle.py --vehicle UAV1 --type TYPE_UAV --ocs-tcp 127.0.0.1:37564
 
@@ -70,47 +72,87 @@ def _rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
+# ---- a stand-in autopilot's fence, as the radio adapter reads it ------------------------
+# Shared with bench_stage3.py and rc_e2e.py, whose stand-in aircraft read the same way.
+
+#: What a stand-in autopilot reports: polygon and altitude fencing (FENCE_TYPE 5),
+#: auto-enabled on arming, FENCE_ALT_MAX 30 m above home.
+PARAMS = {"FENCE_TYPE": 5.0, "FENCE_ENABLE": 0.0, "FENCE_AUTOENABLE": 1.0,
+          "FENCE_ALT_MAX": 30.0, "FENCE_OPTIONS": 0.0}
+#: Its home altitude above the WGS84 ellipsoid: the ceiling declared is this + FENCE_ALT_MAX.
+HOME_HAE_M = 9.0
+#: The stand-in pilot's polygon: RoboCommand's, pulled toward its centre to this fraction.
+PILOT_SCALE = 0.5
+
+
+def open_polygon(fence: list) -> list:
+    """`ocs_info.uav_geofence` -- closed, {latitude, longitude} points -- as the OPEN
+    [lat, lon] list the adapter reads an autopilot's polygons in."""
+    return [[p["latitude"], p["longitude"]] for p in fence[:-1]]
+
+
+def pilot_polygon(rc: list) -> list:
+    """The polygon a stand-in pilot draws inside RoboCommand's OPEN polygon `rc`."""
+    return _shrunk(rc, PILOT_SCALE)
+
+
+def fence_read(vid: str, rc: list | None, held: list, reason: str) -> dict:
+    """The `ocs_fence` the radio adapter sends after reading a stand-in autopilot, read now:
+    `rc` RoboCommand's OPEN polygon it was told to put there (None: none), `held` the
+    autopilot's OPEN inclusion polygons, with PARAMS and HOME_HAE_M."""
+    on = rc is not None and rc in held
+    return {"ocs_fence": {
+        "vehicle_id": vid, "state": "done" if on else "off", "polygon": rc,
+        "verified": on, "verified_at": _rfc3339() if on else None, "reason": reason,
+        "lockout": None, "read_at": _rfc3339(),
+        "shapes": [{"type": "polygon", "inclusion": True, "points": p} for p in held],
+        "params": dict(PARAMS), "home_hae_m": HOME_HAE_M}}
+
+
 class FenceAdapter(threading.Thread):
-    """The radio adapter's half of the geofence handshake, over the TCP vehicle link.
+    """The radio adapter's half of the geofence workflow, over the TCP vehicle link -- with a
+    stand-in autopilot and a stand-in pilot behind it, because a bench has neither.
 
     Not a vehicle and not a report source: its heartbeats still go over MQTT. It opens a
     socket as `vehicle` (hello, link "radio"), reads `ocs_info`, and answers with an
-    `ocs_fence` -- the OPEN polygon it was told, verified, read back "now" -- the way
-    fleet_link does after it has written and re-read the autopilot's fence. A fence it is
-    told is "held" for as long as it runs; re-confirmed every REVERIFY_S so the OCS's
-    freshness limit keeps being met. Reconnects until stopped.
+    `ocs_fence` the way fleet_link does after reading the autopilot: RoboCommand's polygon
+    it was told, whether that is on the autopilot, every inclusion polygon there, the FENCE_*
+    parameters and home HAE. Told a polygon, the stand-in autopilot gets it and the stand-in
+    pilot draws one inside it (PILOT_SCALE); a null one leaves the autopilot as it is. Reads
+    again every READ_S so the OCS's freshness limit keeps being met. Reconnects until stopped.
     """
 
-    REVERIFY_S = 60.0
+    READ_S = 30.0
 
     def __init__(self, vehicle: str, host: str, port: int) -> None:
         super().__init__(daemon=True, name="fence-adapter")
         self.vehicle, self.host, self.port = vehicle, host, port
         self.halt = threading.Event()
-        self.polygon: list | None = None      # what the "autopilot" holds (open), or None
+        self.rc: list | None = None           # RoboCommand's polygon it was told (open), or None
+        self.held: list = []                  # the stand-in autopilot's inclusion polygons (open)
         self.sock: socket.socket | None = None
 
     def _send(self, obj: dict) -> None:
         self.sock.sendall(encode(json.dumps(obj).encode("utf-8")))
 
-    def _confirm(self, reason: str) -> None:
-        self._send({"ocs_fence": {
-            "vehicle_id": self.vehicle, "state": "done", "polygon": self.polygon,
-            "verified": True, "verified_at": _rfc3339(), "reason": reason,
-            "lockout": None}})
+    def _read(self, reason: str) -> None:
+        self._send(fence_read(self.vehicle, self.rc, self.held, reason))
         print("  ocs_fence: %s" % reason)
 
     def _on_info(self, info: dict) -> None:
         if "uav_geofence" not in info:
-            return                                  # not told a fence: not for an aircraft
+            return                                  # not told a polygon: not for an aircraft
         fence = info["uav_geofence"]
-        if fence:                                   # closed -> the open polygon it writes
-            self.polygon = [[p["latitude"], p["longitude"]] for p in fence[:-1]]
-            self._confirm("written and read back: %d vertices" % len(self.polygon))
-        elif info.get("course") is None:            # no course at all: clear it
-            self.polygon = []
-            self._confirm("cleared and read back empty")
-        # a course whose fence was refused: leave whatever is there standing
+        if not fence:
+            self.rc = None
+            self._read("no RoboCommand polygon: the autopilot's fence is left as it is")
+            return
+        rc = open_polygon(fence)
+        if rc != self.rc:
+            self.rc = rc
+            self.held = [rc, pilot_polygon(rc)]
+            self._read("RoboCommand's polygon written and read back (%d vertices); the stand-in "
+                       "pilot's drawn inside it" % len(rc))
 
     def run(self) -> None:
         while not self.halt.is_set():
@@ -134,8 +176,8 @@ class FenceAdapter(threading.Thread):
                         if "ocs_info" in msg:
                             self._on_info(msg["ocs_info"])
                             last = time.monotonic()
-                    if self.polygon is not None and time.monotonic() - last >= self.REVERIFY_S:
-                        self._confirm("re-read: still holding %d vertices" % len(self.polygon))
+                    if time.monotonic() - last >= self.READ_S:
+                        self._read("read again: %d inclusion polygon(s)" % len(self.held))
                         last = time.monotonic()
             except (OSError, ValueError) as exc:
                 print("fence adapter: %s -- retrying" % exc)
@@ -143,6 +185,15 @@ class FenceAdapter(threading.Thread):
                 if self.sock is not None:
                     self.sock.close()
             self.halt.wait(2.0)
+
+
+def _shrunk(polygon: list, k: float) -> list:
+    """`polygon` pulled toward the mean of its vertices to `k` of its size: inside it when it
+    is convex, which RoboCommand's always is."""
+    clat = sum(p[0] for p in polygon) / len(polygon)
+    clon = sum(p[1] for p in polygon) / len(polygon)
+    return [[round(clat + k * (lat - clat), 8), round(clon + k * (lon - clon), 8)]
+            for lat, lon in polygon]
 
 
 def main() -> int:

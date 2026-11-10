@@ -119,6 +119,14 @@ class TestEligibility(unittest.TestCase):
         self.assertEqual(sending, ["172.16.10.50"])
         self.assertIn("RoboCommand broker 172.16.9.2", why["172.16.9.50"])
 
+    def test_the_address_that_reaches_the_broker_is_skipped_whatever_its_mask(self):
+        """The screening network was 192.168.69.x; a broker on a wider network can sit
+        outside our /24 and still be reached from this address."""
+        sending, why = self.split(["10.20.30.40", "192.168.100.107"], never_on=(),
+                                  broker_host="10.20.99.2", via="10.20.30.40")
+        self.assertEqual(sending, ["192.168.100.107"])
+        self.assertEqual(why["10.20.30.40"], "the address RoboCommand 10.20.99.2 is reached from")
+
     def test_a_broker_hostname_adds_no_rule_but_never_on_still_holds(self):
         sending, why = self.split(["192.168.65.184", "192.168.100.107"],
                                   broker_host="robocommand.example")
@@ -310,6 +318,39 @@ class TestSender(unittest.TestCase):
         self.assertTrue(wait_until(lambda: s.snapshot()["errors"] >= 1))
         self.assertEqual(s.snapshot()["sending_on"], ["127.0.0.1"])
         self.assertIn("name not resolved", s.snapshot()["last_error"])
+
+    def test_a_held_address_is_silent_until_released(self):
+        hold = {"why": "192.168.69.0/24 not yet searched for RoboCommand"}
+        s = self.sender(lambda: ["127.0.0.1"], hold=lambda addr: hold["why"], rescan_s=60)
+        s.start(40123)
+        self.assertTrue(wait_until(lambda: s.snapshot()["skipped"] != []))
+        self.assertEqual(s.snapshot()["skipped"],
+                         [{"addr": "127.0.0.1", "why": hold["why"]}])
+        self.rx.settimeout(0.3)
+        with self.assertRaises(socket.timeout):
+            self.rx.recvfrom(2048)
+        hold["why"] = None
+        s.rescan()                                        # what the bridge does after a round
+        self.rx.settimeout(3.0)
+        data, _ = self.rx.recvfrom(2048)
+        self.assertEqual(beacon.parse(data)["team"], "ASTA")
+
+    def test_a_broker_found_later_moves_the_rule_at_once(self):
+        # 192.0.2.0/24 is TEST-NET-1: not this machine's, so its bind fails -- which is
+        # enough to see whether the rule let it through.
+        s = beacon.BeaconSender("ASTA", port=40124, log=self.logs.append, never_on=(),
+                                addresses=lambda: ["192.0.2.10"], interval_s=0.05,
+                                rescan_s=60, dest=("127.0.0.1", self.rx.getsockname()[1]))
+        self.addCleanup(s.stop)
+        s.set_broker("192.0.2.3")                     # before start: kept, nothing opened
+        s.set_broker(None)
+        s.start(40123)
+        self.assertTrue(wait_until(lambda: s.snapshot()["skipped"] != []))
+        self.assertIn("bind failed", s.snapshot()["skipped"][0]["why"])
+        s.set_broker("192.0.2.3", via="192.0.2.10")
+        self.assertEqual(s.snapshot()["skipped"],
+                         [{"addr": "192.0.2.10",
+                           "why": "the address RoboCommand 192.0.2.3 is reached from"}])
 
     def test_the_default_filter_never_lets_loopback_through(self):
         s = beacon.BeaconSender("ASTA", port=40124, log=self.logs.append,

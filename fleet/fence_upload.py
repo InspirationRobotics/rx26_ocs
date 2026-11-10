@@ -1,53 +1,71 @@
-"""fence_upload -- the declared UAV geofence onto the aircraft's autopilot, over the radio.
+"""fence_upload -- the aircraft's autopilot fence over the radio: READ all of it, WRITE only RoboCommand's polygon.
 
-    bridge.toml uav_geofence --ocs_info--> ocs_adapter --MISSION_* (type FENCE)--> COM8 --> ArduCopter
-                                                         ^ this file drives that dialog
+    bridge ocs_info.uav_geofence --> ocs_adapter --MISSION_* (type FENCE)--> radio --> ArduCopter
+      (RoboCommand's course, inset)
+    bridge <-- ocs_fence -------- ocs_adapter <-- every fence item, the FENCE_* params, home HAE
 
-The bridge declares the polygon to RoboCommand (RunDeclaration.uav_geofence) and hands the same
-polygon to the vehicle as `ocs_info.uav_geofence`; the adapter relays it to Ekko's companion as
-RXL GEOFENCE_INFO. With `fence_upload = true` on the radio vehicle (fleet.toml) the adapter ALSO
-writes it to the autopilot as an ArduPilot inclusion fence, so the fence the autopilot enforces
-is the fence that was declared -- and QGC shows it (Plan view, Download).
+THE WORKFLOW (Chase, 7 Nov 2026). RoboCommand sends the course. The bridge turns it into RoboCommand's
+fence -- the course joined with its UAV transit area, inset by `[geofence] boundary_margin_m` -- and this
+file puts that on the autopilot as an inclusion polygon, so QGC shows it (Plan view, Download). The pilot
+then draws Ekko's OWN fence inside it in QGC and uploads both. The bridge declares the pilot's polygon as
+read back from here, never one it made up, and the ceiling it declares is FENCE_ALT_MAX above home, read
+here too. Apart from that one polygon the OCS is read-only.
 
-THE REFERENCE IS EKKO'S OWN UPLOADER -- rx26_uav uav_common/fence_core.py, behind the
-/uav/fence_upload service -- and its rules are kept, not reinvented:
+ArduPilot treats two inclusion polygons as an INTERSECTION -- unless FENCE_OPTIONS bit 1 ("union of
+inclusion areas") is set -- so with the pilot's polygon inside RoboCommand's, the aircraft is held to the
+pilot's. FENCE_OPTIONS is read and reported so the page can say when that is not so.
+
+READ, ALWAYS. Every `watch_s` while the aircraft is disarmed and heard, whatever the bridge has sent and
+with fence_upload off: FENCE_TYPE, FENCE_ENABLE, FENCE_AUTOENABLE, FENCE_ALT_MAX and FENCE_OPTIONS are
+asked for, and every fence item is downloaded. A read that ArduPilot refuses because QGC is uploading at
+that moment (it DENIES a download mid-upload) is tried again a few seconds later.
+
+WRITE, ONCE PER POLYGON, NEVER OVER THE PILOT'S FENCE. With `fence_upload = true` (fleet.toml) a polygon
+from the bridge is written only when a read shows the autopilot needs it:
+  * it already holds that polygon among its inclusion polygons, whatever else is beside it -> nothing
+    is written;
+  * it holds an inclusion polygon lying inside that polygon (within KEEP_TOLERANCE_M) -- the pilot's
+    fence for this course, drawn before the course arrived or kept after RoboCommand's was deleted ->
+    nothing is written and nothing replaced. A polygon this OCS wrote itself in this run (an earlier
+    course's, or one the autopilot read back mangled) is never taken for the pilot's; after a fleet_link
+    restart that is not known, which matters only if one course's polygon lay inside another's;
+  * otherwise (no fence, or a fence for another course or a test) -> it is saved to run/fence/ and
+    REPLACED by that one polygon, then read back.
+Once there it is never written again in this run of fleet_link, whatever QGC does to it afterwards. A
+course change (a new polygon from the bridge) starts over; the bridge withdrawing its polygon stops, and
+the autopilot's fence is left exactly as it is -- this never clears a fence.
+
+THE REFERENCE IS EKKO'S OWN UPLOADER -- rx26_uav uav_common/fence_core.py, behind the /uav/fence_upload
+service -- and its rules are kept, not reinvented:
   * never while armed, and never while the armed state is unknown;
   * never sets FENCE_ENABLE or any other parameter: enabling a fence is a ground-station act;
-  * the closing vertex is stripped (the declaration is closed, ArduPilot closes it itself), and
-    every vertex carries param1 = the polygon's vertex count;
-  * a fence the autopilot does not echo back does not exist: every write is read back and
-    compared -- count, vertex count, and every vertex within 1 m.
+  * the closing vertex is stripped (the declaration is closed, ArduPilot closes it itself), and every
+    vertex carries param1 = the polygon's vertex count;
+  * a fence the autopilot does not echo back does not exist: every write is read back and compared --
+    every vertex within 1 m.
 
-WHAT IT ADDS, because it runs over a lossy radio and on its own initiative rather than when a
-person calls a service:
-  * READ FIRST. The autopilot's fence is downloaded before anything is written. Already this
-    polygon: nothing is written. Anything else: it is saved to run/fence/ (every item, raw)
-    BEFORE it is replaced -- a field fence drawn in QGC is never lost to an automatic upload --
-    and if it cannot be saved, it is not replaced.
-  * NEVER LOCK THE AIRCRAFT OUT. An inclusion polygon the aircraft is outside of fails pre-arm
-    ("Vehicle breaching") when the fence is enabled, and breaches straight after takeoff when it
-    auto-enables (AC_Fence: an auto-enabled fence is only checked once enabled). So FENCE_TYPE,
-    FENCE_ENABLE and FENCE_AUTOENABLE are READ each attempt (never written), and when the polygon
-    can engage the write waits until the aircraft is known to be inside it. A parameter that
-    does not answer counts as "can engage". With polygon fencing off the polygon is written
-    wherever the aircraft is: the bench case, a Singapore fence shown in QGC in Sarasota.
-    `may_block_arming` (fleet.toml fence_may_block_arming) is the operator saying "I accept it
-    will not arm": then a polygon is written over FENCE_ENABLE 1 even with the aircraft outside --
-    pre-arm refuses, so nothing flies (Copter runs the fence check while disarmed precisely so
-    pre-arm sees the breach). It never covers an aircraft that could still ARM and only meet the
-    fence after takeoff (FENCE_ENABLE 0 with FENCE_AUTOENABLE on, or FENCE_ENABLE unanswered).
-  * STEP RETRIES. Every request is re-sent if its answer has not come within a step timeout
-    (ArduPilot itself re-requests a missing upload item about once a second); an attempt that
-    still fails is retried whole RETRY_S later, at most MAX_ATTEMPTS times per polygon.
-  * ONE WRITE PER POLYGON PER RUN. Once verified it is left alone for the rest of fleet_link's
-    run: a fence the operator later changes in QGC is theirs, and this does not fight it. A new
-    polygon from the bridge starts over; a withdrawn one (None) stops, and the autopilot's fence
-    is left exactly as it is -- this never clears a fence.
+WHAT IT ADDS, because it runs over a lossy radio and on its own initiative:
+  * NOTHING IS LOST. Whatever the autopilot held is saved to run/fence/ (every item, raw) BEFORE it is
+    replaced, and if it cannot be saved it is not replaced.
+  * NEVER LOCK THE AIRCRAFT OUT. An inclusion polygon the aircraft is outside of fails pre-arm ("Vehicle
+    breaching") when the fence is enabled, and breaches straight after takeoff when it auto-enables
+    (AC_Fence: an auto-enabled fence is only checked once enabled). So FENCE_TYPE, FENCE_ENABLE and
+    FENCE_AUTOENABLE are READ each attempt (never written), and when the polygon can engage the write
+    waits until the aircraft is known to be inside it. A parameter that does not answer counts as "can
+    engage". With polygon fencing off the polygon is written wherever the aircraft is: the bench case, a
+    Singapore fence shown in QGC in Sarasota. `may_block_arming` (fleet.toml fence_may_block_arming) is
+    the operator saying "I accept it will not arm": then a polygon is written over FENCE_ENABLE 1 even
+    with the aircraft outside -- pre-arm refuses, so nothing flies. It never covers an aircraft that could
+    still ARM and only meet the fence after takeoff (FENCE_ENABLE 0 with FENCE_AUTOENABLE on, or
+    FENCE_ENABLE unanswered).
+  * STEP RETRIES. Every request is re-sent if its answer has not come within a step timeout (ArduPilot
+    itself re-requests a missing upload item about once a second); an attempt that still fails is retried
+    whole RETRY_S later, at most MAX_ATTEMPTS times per polygon.
 
-No threads, no I/O but the backup file: the adapter feeds it the autopilot's frames (note) and
-ticks it (tick), both under the adapter's lock, and every frame goes out through `send`. Frames
-are packed here by hand (mavframe.pack_frame adds the header and CRC); the tests cross-check each
-layout against pymavlink in both directions.
+No threads, no I/O but the backup file: the adapter feeds it the autopilot's frames (note) and ticks it
+(tick), both under the adapter's lock, and every frame goes out through `send`. Frames are packed here by
+hand (mavframe.pack_frame adds the header and CRC); the tests cross-check each layout against pymavlink in
+both directions.
 """
 from __future__ import annotations
 
@@ -95,12 +113,20 @@ MISSION_RESULTS = {0: "ACCEPTED", 1: "ERROR", 2: "UNSUPPORTED_FRAME", 3: "UNSUPP
                    9: "INVALID_PARAM4", 10: "INVALID_PARAM5_X", 11: "INVALID_PARAM6_Y", 12: "INVALID_PARAM7",
                    13: "INVALID_SEQUENCE", 14: "DENIED", 15: "OPERATION_CANCELLED"}
 
-#: Read, never written. FENCE_TYPE bit 2 (value 4) is "inclusion/exclusion circles + polygons".
+#: Read, never written: what the write gate needs. FENCE_TYPE bit 2 (value 4) is "inclusion/exclusion
+#: circles + polygons".
 PARAMS = ("FENCE_TYPE", "FENCE_ENABLE", "FENCE_AUTOENABLE")
+#: Read, never written, and reported to the bridge: the gate's three, FENCE_ALT_MAX (the ceiling, metres
+#: above home, enforced with FENCE_TYPE bit 0) and FENCE_OPTIONS (bit 1: inclusion areas are a union).
+REPORTED_PARAMS = PARAMS + ("FENCE_ALT_MAX", "FENCE_OPTIONS")
 FENCE_TYPE_POLYGON = 4
 
 #: fence_core.DEFAULT_TOLERANCE_M: the int32 1e-7 deg wire loses about a centimetre.
 TOLERANCE_M = 1.0
+#: How far outside the bridge's polygon a vertex of another inclusion polygon may lie and that polygon
+#: still count as drawn inside it (the pilot's own fence, which the write never replaces). The bridge's
+#: polygon is RoboCommand's course inset by 2 m, so a vertex placed by hand on its line is well inside this.
+KEEP_TOLERANCE_M = 5.0
 _EARTH_R_M = 6371008.8
 
 # ------------------------------------------------------------------------- wire layouts
@@ -215,6 +241,37 @@ def inside(point: Tuple[float, float], polygon: Sequence[Tuple[float, float]]) -
     return hit
 
 
+def outside_by_m(point: Tuple[float, float], polygon: Sequence[Tuple[float, float]]) -> float:
+    """0 when `point` is inside the (open) polygon, else metres to its nearest edge. Flat metres around
+    the point: right to well under a metre at course scale, which is all a tolerance of metres needs."""
+    if inside(point, polygon):
+        return 0.0
+    k_lat = math.radians(1.0) * _EARTH_R_M
+    k_lon = k_lat * math.cos(math.radians(point[0]))
+    xy = [((lon - point[1]) * k_lon, (lat - point[0]) * k_lat) for lat, lon in polygon]
+    best = math.inf
+    for (x1, y1), (x2, y2) in zip(xy, xy[1:] + xy[:1]):
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, -(x1 * dx + y1 * dy) / L2))
+        best = min(best, math.hypot(x1 + t * dx, y1 + t * dy))
+    return best
+
+
+def same_ring(a: Sequence[Tuple[float, float]], b: Sequence[Tuple[float, float]],
+              tol_m: float = TOLERANCE_M) -> bool:
+    """The same open polygon, every vertex within `tol_m`: from any starting vertex, in either direction --
+    QGC keeps the order it downloaded, but a hand-made copy need not."""
+    n = len(a)
+    if n == 0 or n != len(b):
+        return False
+    for ring in (list(b), list(reversed(b))):
+        for k in range(n):
+            if all(offset_m(a[i], ring[(i + k) % n]) <= tol_m for i in range(n)):
+                return True
+    return False
+
+
 def matches(items: Sequence[dict], polygon: Sequence[Tuple[float, float]]) -> Optional[str]:
     """None when the downloaded items are exactly this one inclusion polygon (fence_core's
     readback_verify), else what differs."""
@@ -260,6 +317,31 @@ def shapes(items: Sequence[dict]) -> List[dict]:
     return out
 
 
+def inclusion_polygons(items: Sequence[dict]) -> List[List[Tuple[float, float]]]:
+    """Every inclusion polygon the downloaded items make, open, in the autopilot's order."""
+    return [[(p[0], p[1]) for p in s["points"]] for s in shapes(items)
+            if s["type"] == "polygon" and s["inclusion"]]
+
+
+def contains(items: Sequence[dict], polygon: Sequence[Tuple[float, float]]) -> bool:
+    """Does the autopilot hold this (open) polygon as one of its inclusion polygons -- whatever else it
+    holds beside it?"""
+    return any(same_ring(p, polygon) for p in inclusion_polygons(items))
+
+
+def drawn_inside(items: Sequence[dict], polygon: Sequence[Tuple[float, float]],
+                 ignore: Sequence[Sequence[Tuple[float, float]]] = ()) -> Optional[int]:
+    """The vertex count of the first inclusion polygon lying inside `polygon` within KEEP_TOLERANCE_M --
+    the pilot's own fence for this course -- or None when there is none. `polygon` itself, and anything
+    in `ignore` (what this OCS wrote, e.g. an earlier course's polygon), is never the pilot's."""
+    for p in inclusion_polygons(items):
+        if same_ring(p, polygon) or any(same_ring(p, q) for q in ignore):
+            continue
+        if all(outside_by_m(v, polygon) <= KEEP_TOLERANCE_M for v in p):
+            return len(p)
+    return None
+
+
 def describe(items: Sequence[dict]) -> str:
     """What an autopilot's fence is, in words for the log and /fleet."""
     if not items:
@@ -283,52 +365,66 @@ class Timing:
     retry_s: float = 30.0             # a failed attempt is retried this much later
     max_attempts: int = 5             # failed attempts per polygon before giving up
     hold_recheck_s: float = 30.0      # held: the FENCE_* params are asked again this often
-    recheck_s: float = 60.0           # done: the autopilot's fence is read back again this often
-    clear_grace_s: float = 20.0       # "no course": wait this long for one before clearing
+    watch_s: float = 30.0             # the autopilot's fence and FENCE_* params are read this often
+    denied_retry_s: float = 5.0       # a read refused mid-QGC-upload is tried again this soon
 
 
 class FenceUploader:
-    """One radio vehicle's autopilot fence. Phases of an attempt: params -> (gate) -> read ->
-    write -> verify. `state` is what /fleet and the log say; `_phase` is the dialog in flight.
+    """One radio vehicle's autopilot fence: always READ, and WRITE the bridge's polygon only where the
+    module docstring says. Phases of a write attempt: params -> (gate) -> read -> write -> verify; the
+    watch is one more download ("watch") every watch_s. `state` is the WRITE side's, for /fleet and the
+    log ("off" when there is nothing to write or writing is off); `_phase` is the dialog in flight.
 
     `armed(now)` and `position(now)` are the autopilot's own, fresh, or None; `route_ok()` says the
-    radio has heard the vehicle lately. They are asked at every tick AND before every frame of a
-    write: a HEARTBEAT that says armed and the autopilot's next MISSION_REQUEST can arrive in the
-    same batch, and the vertex must not go out in between."""
+    radio has heard the vehicle lately; `home_hae(now)` is the home altitude above the WGS84 ellipsoid,
+    or None. They are asked at every tick AND before every frame of a write: a HEARTBEAT that says armed
+    and the autopilot's next MISSION_REQUEST can arrive in the same batch, and the vertex must not go out
+    in between."""
 
     def __init__(self, *, label: str, target_sysid: int, target_compid: int, our_sysid: int,
                  send: Callable[[int, bytes, float], bool], armed: Callable[[float], Optional[bool]],
                  position: Callable[[float], Optional[Tuple[float, float]]], route_ok: Callable[[], bool],
-                 backup_dir: Optional[str], may_block_arming: bool = False,
+                 backup_dir: Optional[str], may_block_arming: bool = False, write: bool = True,
+                 home_hae: Optional[Callable[[float], Optional[float]]] = None,
                  wall: Callable[[], float] = time.time, timing: Timing = Timing()):
         self.label, self.ts, self.tc, self.our_sysid = label, target_sysid, target_compid, our_sysid
         self._send_fn, self.backup_dir, self.wall, self.t = send, backup_dir, wall, timing
         self._armed, self._position_of, self._route_ok = armed, position, route_ok
+        self._home_hae = home_hae or (lambda now: None)
         self.may_block_arming = may_block_arming
+        #: False: the bridge's polygon is only looked for on the autopilot, never written (fence_upload off).
+        self.write = write
         #: Set when the polygon was cleared to go only because may_block_arming accepts that the
         #: aircraft will not arm where it is: what /fleet and the map say about it.
         self.lockout: Optional[str] = None
-        self._read_items: Optional[List[dict]] = None   # the last download, as the autopilot held it
+        # the last download, as the autopilot held it: items, when (monotonic and wall), home HAE then
+        self._read_items: Optional[List[dict]] = None
         self._read_at: Optional[float] = None
+        self._read_wall: Optional[float] = None
+        self.read_home_hae_m: Optional[float] = None
+        self.reads = self.read_refusals = 0
+        self._watch_at = 0.0                            # the first read goes out at once
         self.polygon: Optional[List[Tuple[float, float]]] = None
+        #: Polygons that are this OCS's own doing in this run -- each one it wrote, and whatever it read
+        #: back straight after writing -- so a polygon it put there for an earlier course, or mangled,
+        #: is never mistaken for the pilot's fence and left in place.
+        self._ours: List[List[Tuple[float, float]]] = []
         self.state, self.reason = "off", "no geofence from the bridge yet"
         self.attempts = self.failures = self.writes = self.frames = self.send_refused = 0
         self.last_error: Optional[str] = None
         self.backup: Optional[str] = None
         self.autopilot_fence: Optional[str] = None     # describe() of the last download
         self.done_at: Optional[float] = None
-        #: When the autopilot was last READ holding exactly `polygon` (monotonic, and wall for the
-        #: bridge): what the `ocs_fence` confirmation and the bridge's pre-run gate rest on.
+        #: When the autopilot was last READ holding `polygon` among its inclusion polygons (monotonic,
+        #: and wall for the bridge). None while it does not, or nobody has looked.
         self.verified_at: Optional[float] = None
         self.verified_wall: Optional[float] = None
-        self.rechecks = 0
-        self._recheck_at = math.inf
         self._next_at = 0.0
         #: name -> (value, when heard). Heard at any time -- ArduPilot broadcasts a parameter that
         #: is set -- but only a value heard since `_params_since` counts for the gate.
         self._params: Dict[str, Tuple[float, float]] = {}
         self._params_since = math.inf
-        self._phase: Optional[str] = None               # "params" | "read" | "write" | "verify" | "recheck"
+        self._phase: Optional[str] = None               # "params" | "read" | "write" | "verify" | "watch"
         self._resend: Optional[Callable[[float], None]] = None
         self._step_s = timing.step_s
         self._deadline = math.inf
@@ -340,36 +436,26 @@ class FenceUploader:
     # ------------------------------------------------------------------------ inputs
 
     def set_polygon(self, points: Optional[Sequence[Tuple[float, float]]], now: float) -> None:
-        """The geofence from the bridge's `ocs_info` (closed), or None. Raises FenceError."""
+        """RoboCommand's polygon from the bridge's `ocs_info` (closed), or None. Raises FenceError."""
         if points is None:
             if self.polygon is not None:
                 self._abort()
                 self.polygon = None
-                self._set("off", "the bridge withdrew the geofence; the autopilot's fence is left as it is",
+                self.verified_at = self.verified_wall = None
+                self._set("off", "the bridge withdrew RoboCommand's polygon; the autopilot's fence is left as it is",
                           logging.INFO)
             return
         polygon = open_polygon(points)
         if polygon == self.polygon:
             return
         self._retarget(polygon, now)
-        log.info("fence %s: %d-vertex geofence from the bridge; will put it on the autopilot when it is "
-                 "disarmed", self.label, len(polygon))
+        if not self.write:
+            self._set("off", "fence_upload is off: RoboCommand's %d-vertex polygon is looked for on the autopilot, "
+                             "never written" % len(polygon), logging.INFO)
+            return self._judge_presence()
+        log.info("fence %s: RoboCommand's %d-vertex polygon from the bridge; will put it on the autopilot "
+                 "when it is disarmed, unless it is there already", self.label, len(polygon))
         self._set("waiting", "starting")
-
-    def set_clear(self, now: float) -> None:
-        """The bridge has no course (it has heard none from RoboCommand since it started): the
-        autopilot should hold NO fence items, so the team can fly without a RoboCommand server.
-        Not at once: an OCS that has just started gets its (retained) course within seconds, and
-        that must not cost the aircraft a clear-then-write cycle -- so only after clear_grace_s
-        with nothing newer from the bridge. Then exactly like a write: disarmed only, the FENCE_*
-        params read, the fence read first and saved, an empty fence written and read back empty."""
-        if self.polygon == []:
-            return
-        self._retarget([], now + self.t.clear_grace_s)
-        log.info("fence %s: no course from RoboCommand; the autopilot's fence will be cleared in %.0f s "
-                 "unless a course arrives first", self.label, self.t.clear_grace_s)
-        self._set("waiting", "no course from RoboCommand: the autopilot's fence is cleared once it is "
-                             "disarmed, unless a course arrives first")
 
     def _retarget(self, polygon: List[Tuple[float, float]], start_at: float) -> None:
         self._abort()
@@ -377,7 +463,6 @@ class FenceUploader:
         self.attempts = self.failures = 0
         self.last_error = self.backup = self.done_at = self.lockout = None
         self.verified_at = self.verified_wall = None
-        self._recheck_at = math.inf
         self._next_at = start_at
 
     def note(self, frame: Frame, now: float) -> None:
@@ -387,7 +472,7 @@ class FenceUploader:
             return
         if frame.msgid == MSG_PARAM_VALUE:
             name, value = param_value(frame)
-            if name in PARAMS:
+            if name in REPORTED_PARAMS:
                 self._on_param(name, value, now)
             return
         if frame.msgid in (MSG_MISSION_REQUEST, MSG_MISSION_REQUEST_INT):
@@ -408,19 +493,41 @@ class FenceUploader:
                 self._on_ack(result, now)
 
     def tick(self, now: float) -> None:
-        """Called every adapter poll."""
-        if self.polygon is None or self.state == "gave up":
-            return
-        if self.state == "done":
-            return self._recheck_tick(now)
-        if not self._clear_to_talk(now):
-            return
+        """Called every adapter poll: a dialog in flight first, then a write that is due, then the watch."""
         if self._phase is not None:
+            return self._dialog_tick(now)
+        if self._writing():
+            self._write_tick(now)
+            if self._phase is not None:
+                return
+        self._watch_tick(now)
+
+    def _writing(self) -> bool:
+        return self.write and self.polygon is not None and self.state in ("waiting", "held")
+
+    def _dialog_tick(self, now: float) -> None:
+        if self._phase == "watch":
+            if self._armed(now) is not False or not self._route_ok():
+                self._abort()                 # an interruption: read again once disarmed and heard
+                return
             if now >= self._deadline:
                 if self._tries < self.t.tries:
-                    self._fire(now)
-                else:
-                    self._timed_out(now)
+                    return self._fire(now)
+                self._abort()
+                self._watch_at = now + self.t.watch_s
+                log.info("fence %s: no answer to a fence read; the last read is now %s old", self.label,
+                         "never" if self._read_at is None else "%.0f s" % (now - self._read_at))
+            return
+        if not self._clear_to_talk(now):
+            return
+        if now >= self._deadline:
+            if self._tries < self.t.tries:
+                self._fire(now)
+            else:
+                self._timed_out(now)
+
+    def _write_tick(self, now: float) -> None:
+        if not self._clear_to_talk(now):
             return
         if self.state == "held":
             why = self._gate(self._position_of(now))
@@ -436,6 +543,15 @@ class FenceUploader:
         self.attempts += 1
         self._start_params(now)
 
+    def _watch_tick(self, now: float) -> None:
+        """Read the autopilot's fence (and ask for the FENCE_* params) every watch_s while it is disarmed
+        and heard. Reads are not urgent: one that cannot run waits, and the bridge judges the age."""
+        if now < self._watch_at or self._armed(now) is not False or not self._route_ok():
+            return
+        for name in REPORTED_PARAMS:
+            self._send(MSG_PARAM_REQUEST_READ, pack_param_request_read(name, self.ts, self.tc), now)
+        self._start_download("watch", now, None)
+
     # ------------------------------------------------------------------------- phases
 
     def _start_params(self, now: float) -> None:
@@ -444,7 +560,7 @@ class FenceUploader:
         self._set_state_quietly("reading the FENCE_* parameters")
 
     def _ask_params(self, now: float) -> None:
-        for name in PARAMS:
+        for name in REPORTED_PARAMS:
             if self._param(name) is None:
                 self._send(MSG_PARAM_REQUEST_READ, pack_param_request_read(name, self.ts, self.tc), now)
 
@@ -453,7 +569,7 @@ class FenceUploader:
         self._params[name] = (value, now)
         if old is not None and old[0] != value:
             log.info("fence %s: %s changed %g -> %g on the autopilot", self.label, name, old[0], value)
-            if self.state == "gave up":      # e.g. the polygon bit was just set in QGC
+            if self.state == "gave up" and name in PARAMS:      # e.g. the polygon bit was just set in QGC
                 self.attempts = self.failures = 0
                 self._next_at = now
                 self._set("waiting", "%s changed; trying again" % name, logging.INFO)
@@ -484,31 +600,9 @@ class FenceUploader:
 
     def _start_write(self, now: float) -> None:
         self._requested = set()
+        self._ours.append(list(self.polygon))
         self._begin("write", now, self.t.write_step_s, self._ask_count)
-        self._set_state_quietly("writing %d vertices" % len(self.polygon) if self.polygon
-                                else "clearing the autopilot's fence")
-
-    def _recheck_tick(self, now: float) -> None:
-        """Done: read the fence back again every recheck_s while the aircraft is disarmed and heard,
-        so a confirmation is never older than that and a fence changed behind our back (QGC, the
-        companion's own /uav/fence_upload) is seen. A re-check that cannot run or gets no answer
-        changes nothing but its age -- reads are not urgent; the bridge's gate judges the age."""
-        if self._phase == "recheck":
-            if self._armed(now) is not False or not self._route_ok():
-                self._abort()
-                self._recheck_at = now + self.t.recheck_s
-            elif now >= self._deadline:
-                if self._tries < self.t.tries:
-                    self._fire(now)
-                else:
-                    self._abort()
-                    self._recheck_at = now + self.t.recheck_s
-                    log.info("fence %s: re-check got no answer; the confirmation is now %.0f s old",
-                             self.label, now - self.verified_at)
-            return
-        if now >= self._recheck_at and self._armed(now) is False and self._route_ok():
-            self.rechecks += 1
-            self._start_download("recheck", now, None)
+        self._set_state_quietly("writing %d vertices" % len(self.polygon))
 
     def _ask_list(self, now: float) -> None:
         if self._count is None:
@@ -553,9 +647,11 @@ class FenceUploader:
         self._deadline = now + self._step_s  # progress: the autopilot is driving, give it a full step
 
     def _on_ack(self, result: int, now: float) -> None:
-        if self._phase == "recheck":                     # not a failure: tried again at the next re-check
+        if self._phase == "watch":
+            # Not a failure: ArduPilot DENIES a download while QGC is uploading. Soon again.
             self._abort()
-            self._recheck_at = now + self.t.recheck_s
+            self.read_refusals += 1
+            self._watch_at = now + self.t.denied_retry_s
             return
         if self._phase in DOWNLOADS:
             return self._fail(now, "the autopilot refused the fence download: %s" % _result(result))
@@ -572,38 +668,57 @@ class FenceUploader:
     def _downloaded(self, now: float) -> None:
         phase, items = self._phase, self._items
         self._phase, self._deadline = None, math.inf
+        self._read_items, self._read_at, self._read_wall = list(items), now, self.wall()
         self.autopilot_fence = describe(items)
-        self._read_items, self._read_at = list(items), now
-        diff = matches(items, self.polygon)
-        if phase == "recheck":
-            self._recheck_at = now + self.t.recheck_s
-            if diff is None:
-                self.verified_at, self.verified_wall = now, self.wall()
-                return
-            self.attempts = self.failures = 0
-            self.done_at = self.verified_at = self.verified_wall = None
-            self._next_at = now
-            return self._set("waiting", "the autopilot's fence changed since it was verified (it holds %s: %s); "
-                                        "putting the declared one back" % (self.autopilot_fence, diff), logging.WARNING)
+        self.read_home_hae_m = self._home_hae(now)
+        self.reads += 1
+        self._watch_at = now + self.t.watch_s
+        if phase == "watch":
+            return self._judge_presence()
+        held = contains(items, self.polygon)
         if phase == "verify":
-            if diff is not None:
-                return self._fail(now, "read back wrong: %s" % diff)
-            if not self.polygon:
-                return self._done(now, "cleared and read back empty")
+            self._ours.extend(inclusion_polygons(items))    # straight after our write: all of it is ours
+            if not held:
+                return self._fail(now, "read back wrong: the polygon just written is not on the autopilot (it "
+                                       "holds %s)" % self.autopilot_fence)
             return self._done(now, "written and read back: %d vertices, each within %.0f m"
                               % (len(self.polygon), TOLERANCE_M))
-        if diff is None:
-            return self._done(now, "the autopilot already holds this polygon; nothing written" if self.polygon
-                              else "the autopilot holds no fence items; nothing to clear")
+        if held:
+            beside = len(inclusion_polygons(items)) - 1
+            return self._done(now, "the autopilot already holds RoboCommand's polygon%s; nothing written"
+                              % ("" if not beside else " and %d polygon(s) beside it" % beside))
+        kept = drawn_inside(items, self.polygon, ignore=self._ours)
+        if kept is not None:
+            # The pilot's fence for this course is there already; RoboCommand's polygon is not. Writing
+            # would replace the pilot's -- the one polygon this OCS exists to declare.
+            return self._done(now, "NOT written: the autopilot holds a %d-vertex polygon inside RoboCommand's "
+                                   "(the pilot's, drawn in QGC), and writing would replace it. It holds %s"
+                              % (kept, self.autopilot_fence))
         if items:
             try:
                 self.backup = self._save_backup(items, now)
             except OSError as e:
                 return self._fail(now, "could not save the autopilot's current fence (%s) before replacing "
                                        "it, so it was not replaced: %s" % (self.autopilot_fence, e))
-            log.warning("fence %s: replacing the autopilot's fence (%s); saved to %s",
-                        self.label, self.autopilot_fence, self.backup)
+            log.warning("fence %s: replacing the autopilot's fence (%s), which has neither RoboCommand's polygon "
+                        "nor one inside it; saved to %s", self.label, self.autopilot_fence, self.backup)
         self._start_write(now)
+
+    def _judge_presence(self) -> None:
+        """After a read: is the bridge's polygon (still) among the autopilot's inclusion polygons? Only
+        `verified` moves. Not there any more after it was is the pilot's doing (QGC) and is never put back."""
+        if self.polygon is None or self._read_items is None:
+            return
+        if contains(self._read_items, self.polygon):
+            self.verified_at, self.verified_wall = self._read_at, self._read_wall
+            return
+        if self.verified_at is not None:
+            log.warning("fence %s: RoboCommand's polygon is no longer on the autopilot (it holds %s); not put "
+                        "back -- the fence is the pilot's now", self.label, self.autopilot_fence)
+            if self.state == "done":
+                self.reason = ("RoboCommand's polygon is no longer on the autopilot (it holds %s): taken off in "
+                               "QGC? Not put back" % self.autopilot_fence)
+        self.verified_at = self.verified_wall = None
 
     # ------------------------------------------------------------------- the rules
 
@@ -611,11 +726,6 @@ class FenceUploader:
         """None when the polygon may be written now, else why not -- see the module docstring."""
         ftype, enable, auto = (self._param(n) for n in PARAMS)
         self.lockout = None
-        if not self.polygon:                 # clearing: there is no polygon to be outside of
-            if ftype is not None and int(ftype) == FENCE_TYPE_POLYGON and enable:
-                self.lockout = ("%s will NOT ARM with its fence cleared: FENCE_TYPE 4 is polygons only and "
-                                "FENCE_ENABLE is %g (pre-arm: Fences enabled, but none selected)" % (self.label, enable))
-            return None
         polygon_on = ftype is None or int(ftype) & FENCE_TYPE_POLYGON
         switched = (enable is None or enable != 0) or (auto is None or auto != 0)
         if not (polygon_on and switched):
@@ -657,6 +767,11 @@ class FenceUploader:
     def _param(self, name: str) -> Optional[float]:
         got = self._params.get(name)
         return got[0] if got is not None and got[1] >= self._params_since else None
+
+    def latest_param(self, name: str) -> Optional[float]:
+        """The value last heard from the autopilot, however long ago (it broadcasts a change), or None."""
+        got = self._params.get(name)
+        return None if got is None else got[0]
 
     def _nack_hint(self) -> str:
         ftype = self._param("FENCE_TYPE")
@@ -707,12 +822,10 @@ class FenceUploader:
     def _done(self, now: float, how: str) -> None:
         self._abort()
         self.done_at = now
-        self.verified_at, self.verified_wall = now, self.wall()
-        self._recheck_at = now + self.t.recheck_s
+        self._judge_presence()
         if self.lockout:
             log.warning("fence %s: %s", self.label, self.lockout)
-        self._set("done", how + ". FENCE_ENABLE is not touched; QGC shows it after Plan view > Download",
-                  logging.INFO)
+        self._set("done", how + ". Never written again for this course; FENCE_ENABLE is not touched", logging.INFO)
 
     def _set(self, state: str, reason: str, level: Optional[int] = None) -> None:
         """Change what /fleet says; log it at `level` when it is news (a repeat stays quiet)."""
@@ -737,7 +850,7 @@ class FenceUploader:
         path = Path(self.backup_dir) / ("%s-fence-%s.json" % (self.label, stamp))
         path.parent.mkdir(parents=True, exist_ok=True)
         doc = {"vehicle": self.label, "saved_at_utc": stamp, "autopilot_sysid": self.ts,
-               "why": "the autopilot's fence before fleet_link replaced it with the declared geofence",
+               "why": "the autopilot's fence before fleet_link replaced it with RoboCommand's polygon for the course",
                "summary": describe(items), "items": items,
                "replaced_by": [list(p) for p in self.polygon]}
         path.write_text(json.dumps(doc, indent=1), encoding="utf-8")
@@ -746,37 +859,42 @@ class FenceUploader:
     # ------------------------------------------------------------------------ status
 
     def status(self, now: float) -> dict:
-        return {"enabled": True, "state": self.state, "reason": self.reason,
+        return {"enabled": True, "write": self.write, "state": self.state, "reason": self.reason,
                 "vertices": None if self.polygon is None else len(self.polygon),
                 "attempts": self.attempts, "failures": self.failures, "writes": self.writes,
                 "last_error": self.last_error, "autopilot_fence": self.autopilot_fence, "backup": self.backup,
-                "params": {n: (None if n not in self._params else self._params[n][0]) for n in PARAMS},
-                "params_age_s": {n: round(now - self._params[n][1], 1) for n in PARAMS if n in self._params},
+                "params": {n: self.latest_param(n) for n in REPORTED_PARAMS},
+                "params_age_s": {n: round(now - self._params[n][1], 1) for n in REPORTED_PARAMS if n in self._params},
                 "done_age_s": None if self.done_at is None else round(now - self.done_at, 1),
                 "lockout": self.lockout, "may_block_arming": self.may_block_arming,
                 "verified": self.verified_at is not None,
                 "verified_age_s": None if self.verified_at is None else round(now - self.verified_at, 1),
-                "rechecks": self.rechecks, "clearing": self.polygon == [],
-                # for the OCS map: the polygon this was told to put on the autopilot, and what the
-                # autopilot held at the last read (not re-read after done: its age says how old)
+                "reads": self.reads, "read_refusals": self.read_refusals,
+                "home_hae_m": self.read_home_hae_m,
+                # for the OCS map: RoboCommand's polygon this was told to put on the autopilot, and what
+                # the autopilot held at the last read (its age says how old)
                 "polygon": None if self.polygon is None else [list(p) for p in self.polygon],
                 "autopilot_shapes": None if self._read_items is None else shapes(self._read_items),
                 "autopilot_read_age_s": None if self._read_at is None else round(now - self._read_at, 1),
                 "frames": self.frames, "send_refused": self.send_refused}
 
-
     def confirmation(self) -> dict:
-        """The body of the `ocs_fence` frame the adapter sends the bridge (docs/VEHICLE_LINK.md):
-        `verified` only while the autopilot was last READ holding exactly `polygon` ([] = cleared).
-        verified_at is wall time (the adapter formats it)."""
+        """The body of the `ocs_fence` frame the adapter sends the bridge (docs/VEHICLE_LINK.md). What the
+        autopilot held at the last read -- every shape, the FENCE_* params, home HAE -- is what the bridge
+        declares from; `verified` says only whether RoboCommand's polygon was among it. Times are wall time
+        (the adapter formats them)."""
         return {"vehicle_id": self.label, "state": self.state,
                 "polygon": None if self.polygon is None else [list(p) for p in self.polygon],
                 "verified": self.verified_at is not None, "verified_at": self.verified_wall,
-                "reason": self.reason, "lockout": self.lockout}
+                "reason": self.reason, "lockout": self.lockout,
+                "read_at": self._read_wall,
+                "shapes": None if self._read_items is None else shapes(self._read_items),
+                "params": {n: self.latest_param(n) for n in REPORTED_PARAMS},
+                "home_hae_m": None if self.read_home_hae_m is None else round(self.read_home_hae_m, 2)}
 
 
 #: The dialogs that download the fence (and so take MISSION_COUNT / MISSION_ITEM_INT answers).
-DOWNLOADS = ("read", "verify", "recheck")
+DOWNLOADS = ("read", "verify", "watch")
 
 
 def _result(code: int) -> str:

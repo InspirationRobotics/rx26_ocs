@@ -1,36 +1,36 @@
-"""start_ekko_ocs.py -- one command after a reboot: find RoboCommand, then start the OCS for Ekko.
+"""start_ekko_ocs.py -- one command after a reboot: start the OCS for Ekko.
 
-    .venv\\Scripts\\python.exe start_ekko_ocs.py            (from C:\\Users\\Chris\\OCS)
-    .venv\\Scripts\\python.exe start_ekko_ocs.py --find     only find RoboCommand and fix bridge.toml
+    .venv\\Scripts\\python.exe start_ekko_ocs.py            (from the OCS folder)
+    .venv\\Scripts\\python.exe start_ekko_ocs.py --find     only look for RoboCommand once, and say
+                                                          what answered (with the OCS stopped)
 
-For Ekko at the 7-8 Nov 2026 assessment. What it does, in order:
+For Ekko alone (the 7-8 Nov 2026 assessment). What it does, in order:
 
- 1. Waits for the Ethernet (the RoboCommand-facing port) to have a DHCP address.
- 2. Finds the MQTT broker on that network: the gateway, then .2 (the course convention), then every
-    address in the /24, by TCP connect to port 1883. More than one answering = it stops and asks.
- 3. If bridge.toml's [robocommand] host differs, rewrites that one line (backup in run/) and checks
-    the file still loads.
- 4. Stops any fleet_link / ocs_web already running (OCS.cmd starts fleet_link on COM8 and UDP 14550,
-    which is wrong for Ekko), then starts, each in its own window:
+ 1. Stops any fleet_link / ocs_web already running (OCS.cmd starts fleet_link on COM8 and UDP 14550,
+    which is wrong for Ekko).
+ 2. Starts, each in its own window:
       fleet_link  SYSTEM python, --serial COM28 --wifi-port NONE
       ocs_web     .venv python, --config bridge.toml   (never --bench-auto)
+
+It no longer finds RoboCommand or edits bridge.toml. With [robocommand] host = "auto" the OCS
+finds the broker itself, by the course it keeps retained on robocommand/robotx/course, and finds
+it again after a move to another network (rx_bridge/rcfind.py); the page's RoboCommand row shows
+the search. `--find` runs one round of that search from here and prints every host that answered.
+It refuses while ocs_web is running: a probe must not overlap the OCS's own connection, and the
+OCS is already searching.
 """
 from __future__ import annotations
 
-import ipaddress
 import re
-import shutil
 import socket
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BRIDGE = HERE / "bridge.toml"
-PORT = 1883
-ETH = "Ethernet"
+OCS_PAGE_PORT = 8099
 
 
 def ps(cmd: str) -> str:
@@ -38,55 +38,37 @@ def ps(cmd: str) -> str:
                           capture_output=True, text=True).stdout.strip()
 
 
-def ethernet() -> tuple[str, str] | None:
-    """(our IPv4, gateway) on the Ethernet port, or None while it has no DHCP address."""
-    out = ps("$c = Get-NetIPConfiguration -InterfaceAlias '%s' -ErrorAction SilentlyContinue; "
-             "if ((Get-NetAdapter -Name '%s').Status -eq 'Up' -and $c.IPv4Address) "
-             "{ $c.IPv4Address.IPAddress + ' ' + ($c.IPv4DefaultGateway.NextHop -join ',') }" % (ETH, ETH))
-    parts = out.split()
-    if not parts or parts[0].startswith("169.254."):
-        return None
-    return parts[0], (parts[1] if len(parts) > 1 else "")
-
-
-def open_1883(host: str, timeout: float = 0.6) -> bool:
+def ocs_is_running() -> bool:
     try:
-        socket.create_connection((host, PORT), timeout=timeout).close()
+        socket.create_connection(("127.0.0.1", OCS_PAGE_PORT), timeout=0.5).close()
         return True
     except OSError:
         return False
 
 
-def find_broker(ip: str, gw: str) -> list[str]:
-    net = ipaddress.ip_network(ip + "/24", strict=False)
-    first = [h for h in (gw, str(net.network_address + 2)) if h and h != ip]
-    for h in first:
-        if open_1883(h, 1.5):
-            return [h]
-    rest = [str(h) for h in net.hosts() if str(h) not in first and str(h) != ip]
-    with ThreadPoolExecutor(64) as ex:
-        hits = [h for h, ok in zip(rest, ex.map(open_1883, rest)) if ok]
-    return hits
-
-
-def set_host(host: str) -> None:
-    text = BRIDGE.read_bytes().decode("utf-8")      # keep its CRLF line endings exactly
-    m = re.search(r"(?ms)^\[robocommand\]\s*$.*?^host\s*=\s*\"([^\"]*)\"", text)
-    if not m:
-        sys.exit("bridge.toml: no host line under [robocommand] -- not touching it")
-    if m.group(1) == host:
-        print("bridge.toml already points at %s" % host)
-        return
-    backup = HERE / "run" / ("bridge.toml.before_host_" + time.strftime("%Y%m%d_%H%M%S"))
-    shutil.copy2(BRIDGE, backup)
-    start, end = m.span(1)
-    BRIDGE.write_bytes((text[:start] + host + text[end:]).encode("utf-8"))
-    from rx_bridge import config
-    got = config.load(BRIDGE).robocommand.host
-    if got != host:
-        shutil.copy2(backup, BRIDGE)
-        sys.exit("bridge.toml did not load back with %s (got %s); restored the backup" % (host, got))
-    print("bridge.toml: RoboCommand %s -> %s (backup %s)" % (m.group(1), host, backup.name))
+def find() -> int:
+    """One search round, printed host by host."""
+    if ocs_is_running():
+        print("ocs_web is running and is already searching: its page's RoboCommand row shows "
+              "what it found. Not probing alongside it.")
+        return 2
+    from rx_bridge import config, rcfind
+    cfg = config.load(BRIDGE)
+    if not cfg.robocommand.auto:
+        print("bridge.toml pins RoboCommand at %s; searching anyway" % cfg.robocommand.host)
+    print("looking for a broker with %s on TCP %d ..."
+          % (cfg.rc_course_sub(), cfg.robocommand.port))
+    rnd = rcfind.find_once(cfg.robocommand.port, cfg.rc_course_sub(), cfg.team_id)
+    print("from %s; swept %s; %.1f s" % (", ".join(rnd.addresses) or "no usable address",
+                                         ", ".join(rnd.swept) or "nothing", rnd.took_s))
+    for t in rnd.tried:
+        print("  %-15s %s: %s" % (t["host"], t["why"], t["verdict"]))
+    if rnd.found is None:
+        print("RoboCommand: not found")
+        return 1
+    print("RoboCommand: %s:%d, course %s" % (rnd.found.host, rnd.found.port,
+                                             rnd.found.course_id or "(no course_id)"))
+    return 0
 
 
 def stop_existing() -> None:
@@ -105,34 +87,18 @@ def start(title: str, args: list[str]) -> None:
     print("started: %s" % title)
 
 
-def main() -> None:
-    print("waiting for the Ethernet to get a DHCP address ...")
-    while (eth := ethernet()) is None:
-        time.sleep(2)
-    ip, gw = eth
-    print("Ethernet %s, gateway %s" % (ip, gw or "none"))
-    while True:
-        hits = find_broker(ip, gw)
-        if len(hits) == 1:
-            break
-        if len(hits) > 1:
-            print("more than one MQTT broker on this network: %s -- using the first" % ", ".join(hits))
-            hits = hits[:1]
-            break
-        print("no MQTT broker on port %d yet; looking again in 5 s" % PORT)
-        time.sleep(5)
-    print("RoboCommand broker: %s:%d" % (hits[0], PORT))
-    set_host(hits[0])
+def main() -> int:
     if "--find" in sys.argv:
-        return
+        return find()
     stop_existing()
-    start("Fleet link COM28",["python", "-m", "fleet.fleet_link", "--config", r"fleet\fleet.toml",
-                                 "--serial", "COM28", "--wifi-port", "NONE"])
+    start("Fleet link COM28", ["python", "-m", "fleet.fleet_link", "--config", r"fleet\fleet.toml",
+                                "--serial", "COM28", "--wifi-port", "NONE"])
     time.sleep(3)
     start("OCS (ocs_web)", [str(HERE / ".venv" / "Scripts" / "python.exe"), "-m", "ocs_web",
                             "--config", "bridge.toml"])
-    print("open http://127.0.0.1:8099")
+    print("open http://127.0.0.1:8099 -- the RoboCommand row shows the search for the broker")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

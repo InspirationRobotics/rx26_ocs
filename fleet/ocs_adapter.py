@@ -36,10 +36,12 @@ has not been heard for 10 s, and at most once per 10 s -- the rule and the 1 Hz 
 gcs_radio.py's WANTED list, so the two can never fight over the rate. The autopilot's own radio
 port budget (~1.3 kB/s of the mesh) is not ours to spend; our air use is a handful of small
 frames, counted in /fleet (tx, and heartbeat.flight_state_request).
-  The second, only on a radio vehicle with `fence_upload = true`: the declared geofence from
-`ocs_info` is written to the autopilot as an inclusion fence (fence_upload.py -- read three
-FENCE_* parameters, download the fence, write it if it differs, read it back; never while armed,
-never a parameter written). A few dozen frames once per polygon per run of fleet_link, counted in
+  The second is the autopilot's fence (fence_upload.py). It is READ on every radio vehicle: every
+30 s while disarmed, the fence items and five FENCE_* parameters, reported to the bridge as
+`ocs_fence` -- the polygon the pilot drew in QGC is what the bridge declares, and FENCE_ALT_MAX
+above home is its ceiling. With `fence_upload = true` RoboCommand's polygon from `ocs_info` is
+also WRITTEN, once per course, and only when the autopilot holds neither it nor a polygon inside
+it -- never while armed, never a parameter written. A few dozen frames per read, counted in
 /fleet (ocs.vehicles.<id>.fence_upload).
 
 CONCURRENCY. Three kinds of thread meet here: the hub's (observer: append to a deque, nothing
@@ -119,9 +121,8 @@ class RadioVehicleCfg:
     phase_fallback: bool = False
     companion_fresh_s: float = 2.0           # a companion heartbeat this young takes precedence
     timeouts: Timeouts = Timeouts()
-    fence_upload: bool = False               # write ocs_info's geofence to the autopilot (fence_upload.py)
+    fence_upload: bool = False               # write RoboCommand's polygon (ocs_info) to the autopilot (fence_upload.py)
     fence_may_block_arming: bool = False     # ...even when that leaves it unable to arm where it is
-    fence_clear_without_course: bool = False  # bridge has no course -> clear the autopilot's fence
 
 
 @dataclass(frozen=True)
@@ -176,8 +177,11 @@ def parse_radio_vehicle(t: dict, index: int) -> RadioVehicleCfg:
     node = _byte(t, "node", rx.NODE_BY_VEHICLE_TYPE[vtype], where, lo=1)
     if node in (rx.NODE_OCS, rx.NODE_BROADCAST):
         raise OcsConfigError("%s: node %d is the OCS / broadcast" % (where, node))
+    if "fence_clear_without_course" in t:
+        raise OcsConfigError("%s: fence_clear_without_course was removed (7 Nov 2026): the OCS never clears the "
+                             "autopilot's fence -- the fence drawn in QGC is the pilot's. Delete the line" % where)
     flags = {}
-    for key in ("fence_upload", "fence_may_block_arming", "fence_clear_without_course"):
+    for key in ("fence_upload", "fence_may_block_arming"):
         flags[key] = t.get(key, False)
         if not isinstance(flags[key], bool):
             raise OcsConfigError("%s: %s must be true or false, not %r" % (where, key, flags[key]))
@@ -569,17 +573,16 @@ class RadioVehicle:
         self.fs_last_sent: Optional[float] = None
         self._fs_tried: Optional[float] = None
         self._fs_next = 0.0
-        # the declared geofence onto the autopilot; None when this vehicle has fence_upload off
-        self.fence: Optional[fu.FenceUploader] = None
+        # the autopilot's fence: always read; RoboCommand's polygon written only with fence_upload on
+        self.fence = fu.FenceUploader(label=cfg.vehicle_id, target_sysid=cfg.autopilot_sysid,
+                                      target_compid=AUTOPILOT_COMPID, our_sysid=ocs.sysid,
+                                      send=self._send_to_autopilot, armed=self.synth.armed,
+                                      position=self.synth.position, route_ok=self._route_ok,
+                                      backup_dir=ocs.fence_backup_dir, write=cfg.fence_upload,
+                                      home_hae=self.synth.home_hae_m,
+                                      may_block_arming=cfg.fence_may_block_arming, wall=wall)
         self.fence_reports = 0
         self._fence_sent: Optional[tuple] = None         # (bridge connection, body) last reported
-        if cfg.fence_upload:
-            self.fence = fu.FenceUploader(label=cfg.vehicle_id, target_sysid=cfg.autopilot_sysid,
-                                          target_compid=AUTOPILOT_COMPID, our_sysid=ocs.sysid,
-                                          send=self._send_to_autopilot, armed=self.synth.armed,
-                                          position=self.synth.position, route_ok=self._route_ok,
-                                          backup_dir=ocs.fence_backup_dir,
-                                          may_block_arming=cfg.fence_may_block_arming, wall=wall)
 
     # ------------------------------------------------------------- what to listen to
 
@@ -590,15 +593,14 @@ class RadioVehicle:
             return frame.sysid == self.cfg.companion_sysid
         if frame.sysid != self.cfg.autopilot_sysid:
             return False
-        return frame.msgid in AUTOPILOT_IDS or (self.fence is not None and frame.msgid in fu.MESSAGE_IDS)
+        return frame.msgid in AUTOPILOT_IDS or frame.msgid in fu.MESSAGE_IDS
 
     def consume(self, frame: Frame, now: float) -> None:
         if frame.msgid == MSG_TUNNEL:
             self._on_tunnel(frame, now)
             return
         self.synth.note(frame, now)
-        if self.fence is not None:
-            self.fence.note(frame, now)
+        self.fence.note(frame, now)
 
     # ---------------------------------------------------------------------- uplink
 
@@ -758,12 +760,11 @@ class RadioVehicle:
             c.vehicle_id, 1e6 / REQUEST_INTERVAL_US,
             "ever" if age is None else "%.0f s" % age, self.fs_sent)
 
-    # ------------------------------------------------------------ the geofence, onto the autopilot
+    # ------------------------------------------------------------ the autopilot's fence
 
     def fence_tick(self, now: float) -> None:
-        if self.fence is not None:
-            self.fence.tick(now)
-            self._report_fence()
+        self.fence.tick(now)
+        self._report_fence()
 
     def _send_to_autopilot(self, msgid: int, payload: bytes, now: float) -> bool:
         return self.sender.send_message(self.cfg.link, msgid, payload, "fence:" + self.cfg.vehicle_id,
@@ -893,33 +894,27 @@ class RadioVehicle:
         if fence_key is not None:
             with self._refusing("GEOFENCE_INFO"):
                 self._set_fence(info[fence_key], now)
-            if self.fence is not None:       # its own refusal: the RXL message's limits are not the autopilot's
+            if self.cfg.fence_upload:        # its own refusal: the RXL message's limits are not the autopilot's
                 with self._refusing("FENCE_UPLOAD"):
-                    self._fence_from_info(info, info[fence_key], now)
+                    self._fence_from_info(info[fence_key], now)
 
-    def _fence_from_info(self, info: dict, fence, now: float) -> None:
-        """What the autopilot's fence should be, from one `ocs_info` (docs/VEHICLE_LINK.md):
-          a polygon                               -> that polygon (the current course's);
-          no polygon AND no course ("course": null) -> nothing at all, if fence_clear_without_course:
-                                                     the bridge has heard no course since it started,
-                                                     so this is a bench without RoboCommand;
-          no polygon but a course                 -> left as it is: the course's fence was refused
-                                                     (the bridge says why), and a leftover fence from
-                                                     another course stops the aircraft arming here,
-                                                     which a cleared one would not."""
-        if fence is not None:
-            self.fence.set_polygon(tr.fence_points(fence), now)
-        elif "course" in info and info["course"] is None and self.cfg.fence_clear_without_course:
-            self.fence.set_clear(now)
-        else:
-            self.fence.set_polygon(None, now)
+    def _fence_from_info(self, fence, now: float) -> None:
+        """RoboCommand's polygon for the course from one `ocs_info` (docs/VEHICLE_LINK.md), or none.
+        None -- no course yet, or a course whose fence the bridge refused (it says why) -- leaves the
+        autopilot's fence exactly as it is: the OCS never clears a fence."""
+        self.fence.set_polygon(None if fence is None else tr.fence_points(fence), now)
 
     def _report_fence(self) -> None:
-        """`ocs_fence` to the bridge: what the autopilot was last confirmed to hold. Sent on every
-        new bridge connection and whenever it changes (a re-check refreshes verified_at once a
-        minute); the bridge's pre-run gate declares no UAV run without a fresh one."""
+        """`ocs_fence` to the bridge: what the autopilot held at the last read. Sent on every new
+        bridge connection and whenever it changes (each read refreshes read_at, every 30 s while
+        disarmed); the bridge declares no UAV run without a fresh one. Nothing until there is something
+        to say -- a read, or RoboCommand's polygon -- so an adapter that has not reached the autopilot
+        yet tells the bridge nothing rather than an empty report."""
         c = self.fence.confirmation()
-        body = dict(c, verified_at=None if c["verified_at"] is None else tr.rfc3339(c["verified_at"]))
+        if c["read_at"] is None and c["polygon"] is None:
+            return
+        body = dict(c, verified_at=None if c["verified_at"] is None else tr.rfc3339(c["verified_at"]),
+                    read_at=None if c["read_at"] is None else tr.rfc3339(c["read_at"]))
         key = (getattr(self.bridge, "connects", None), json.dumps(body, sort_keys=True))
         if key == self._fence_sent or not self.bridge.connected:
             return
@@ -1109,8 +1104,7 @@ class RadioVehicle:
                          "refusals_by_reason": dict(self.refusals),
                          "directives_ignored": dict(self.directives), "run_id": self.run_id,
                          "course": self._known("course"), "geofence": self._known("fence")},
-            "fence_upload": (dict(self.fence.status(now), reports_to_bridge=self.fence_reports)
-                             if self.fence is not None else {"enabled": False}),
+            "fence_upload": dict(self.fence.status(now), reports_to_bridge=self.fence_reports),
             "tunnel_log": tunnel_log,
         }
 

@@ -31,9 +31,10 @@ from rx_bridge.proto import rx_commands_pb2, rx_course_pb2  # noqa: E402
 TEAM = "ASTA"
 
 #: Ekko prefers its radio; the boat has no preference; the sub is configured but
-#: never connected, as in bench_stage3. There is no static fence: the UAV geofence
-#: comes from the course (rx_bridge/geofence.py), and a test that wants a
-#: `[geofence]` section or a `[[geofence.course]]` entry sets `BridgeCase.geofence`.
+#: never connected, as in bench_stage3. There is no static fence: RoboCommand's UAV
+#: polygon comes from the course (rx_bridge/geofence.py) and what is declared is read
+#: off the aircraft (fence_frame). A test that wants a `[geofence]` section sets
+#: `BridgeCase.geofence`.
 CONFIG = """
 team_id = "{team}"
 
@@ -60,7 +61,7 @@ host = "127.0.0.1"
 port = 1
 
 [robocommand]
-host = "127.0.0.1"
+host = "{rc_host}"
 port = 1
 
 [tcp]
@@ -87,6 +88,8 @@ class FakeMqtt:
     def __init__(self) -> None:
         self.published: list[tuple[str, bytes, int]] = []
         self.mids: list[int] = []
+        self.calls: list[tuple] = []          #: connect_async / loop_start / loop_stop
+        self.connected = False
 
     def publish(self, topic, payload, qos=0, **_kw):
         """Like paho: an MQTTMessageInfo-alike carrying the mid that a PUBACK (the
@@ -95,8 +98,20 @@ class FakeMqtt:
         self.mids.append(len(self.mids) + 1)
         return SimpleNamespace(mid=self.mids[-1], rc=0)
 
+    def connect_async(self, host, port, keepalive=60, **_kw):
+        self.calls.append(("connect_async", host, port))
+
+    def loop_start(self):
+        self.calls.append(("loop_start",))
+
     def loop_stop(self):
-        pass
+        self.calls.append(("loop_stop",))
+
+    def is_connected(self):
+        return self.connected
+
+    def subscribe(self, topics, *_a, **_kw):
+        self.calls.append(("subscribe", topics))
 
     def disconnect(self):
         pass
@@ -169,20 +184,67 @@ def course_bytes(cid: str = "ALPHA", freq: int = 25000, corners=None, transit=()
     return c.SerializeToString()
 
 
-def fence_frame(vid: str, polygon, *, verified: bool = True, state: str = "done",
-                at="now", reason: str | None = None, lockout=None) -> dict:
-    """The `ocs_fence` the radio adapter sends: what the autopilot was read back
-    holding. `polygon` is the OPEN polygon (no closing vertex), [] for "cleared", or
-    None. `at` is the read-back time as epoch seconds, "now", or None."""
-    when = time.time() if at == "now" else at
+#: Ekko's own fence for the harness's course, as the pilot draws it in QGC: an open
+#: pentagon some 16-22 m inside BOX, so well inside RoboCommand's 2 m inset of it.
+PILOT = [(1.28030, 103.85540), (1.28030, 103.85600), (1.28060, 103.85610),
+         (1.28090, 103.85580), (1.28080, 103.85545)]
+
+#: The FENCE_* parameters the harness's aircraft reports: polygon and altitude fencing
+#: (FENCE_TYPE 5), auto-enabled on arming, FENCE_ALT_MAX 30 m above home.
+PARAMS = {"FENCE_TYPE": 5.0, "FENCE_ENABLE": 0.0, "FENCE_AUTOENABLE": 1.0,
+          "FENCE_ALT_MAX": 30.0, "FENCE_OPTIONS": 0.0}
+
+#: Home 9 m above the WGS84 ellipsoid, so the ceiling declared is 9 + 30 m HAE.
+HOME_HAE_M = 9.0
+CEILING_HAE_M = 39.0
+
+_DEFAULT = object()
+
+
+def poly_shape(points, inclusion: bool = True) -> dict:
+    """One polygon as fleet/fence_upload.shapes reports it."""
+    return {"type": "polygon", "inclusion": inclusion, "points": [list(p) for p in points]}
+
+
+def fence_frame(vid: str, polygon, *, held=_DEFAULT, verified=None, state: str = "done",
+                at="now", read_at="now", reason: str | None = None, lockout=None,
+                params=_DEFAULT, home_hae_m=HOME_HAE_M) -> dict:
+    """The `ocs_fence` the radio adapter sends after reading the autopilot.
+
+    polygon   RoboCommand's OPEN polygon the adapter was told to put there, or None
+    held      what the read found: OPEN polygons (inclusion) or shape dicts. Default:
+              RoboCommand's polygon, when there is one, and the pilot's PILOT -- the
+              workflow done right. None: never read (no read_at, no shapes)
+    verified  RoboCommand's polygon among them; by default, whether it is in `held`
+    at        when it was last seen there (verified_at); read_at when the read was.
+              Each epoch seconds, "now", or None
+    params    the FENCE_* parameters (default PARAMS); home_hae_m home above the
+              ellipsoid at the read (default HOME_HAE_M)"""
+    if held is _DEFAULT:
+        held = ([polygon] if polygon else []) + [PILOT]
+    shapes = (None if held is None
+              else [s if isinstance(s, dict) else poly_shape(s) for s in held])
+    if verified is None:
+        verified = bool(polygon) and shapes is not None and any(
+            s.get("points") == [list(p) for p in polygon] for s in shapes)
+
+    def when(t):
+        t = time.time() if t == "now" else t
+        return None if t is None else rfc3339(t)
+
     return {"ocs_fence": {
         "vehicle_id": vid, "state": state,
         "polygon": None if polygon is None else [list(p) for p in polygon],
         "verified": verified,
-        "verified_at": None if when is None else rfc3339(when),
+        "verified_at": when(at) if verified else None,
         "reason": reason if reason is not None else (
-            "written and read back" if verified else "not read back"),
-        "lockout": lockout}}
+            "RoboCommand's polygon is on the autopilot" if verified
+            else "RoboCommand's polygon is not on the autopilot"),
+        "lockout": lockout,
+        "read_at": None if shapes is None else when(read_at),
+        "shapes": shapes,
+        "params": dict(PARAMS) if params is _DEFAULT else params,
+        "home_hae_m": home_hae_m}}
 
 
 def open_fence(info_fence) -> list | None:
@@ -247,12 +309,8 @@ class VehicleClient:
         info = frame.get("ocs_info") if vid else None
         if info is None or "uav_geofence" not in info:
             return
-        fence = info["uav_geofence"]
         try:
-            if fence:
-                self.fence(vid, open_fence(fence))
-            elif info.get("course") is None:
-                self.fence(vid, [], reason="cleared and read back empty")
+            self.fence(vid, open_fence(info["uav_geofence"]))
         except OSError:
             pass
 
@@ -267,11 +325,11 @@ class VehicleClient:
         self.send(fence_frame(vid, polygon, **kw))
 
     def adapter_for(self, vid: str) -> "VehicleClient":
-        """Behave like the radio adapter from now on: answer every `ocs_info` that
-        carries a fence with an `ocs_fence` (verified, the OPEN polygon it was
-        given, read back now), and one that says there is no course at all with a
-        verified EMPTY polygon -- "cleared". A course whose fence was refused is
-        answered with nothing: the adapter leaves the old fence standing. Returns self."""
+        """Behave like the radio adapter from now on: answer every `ocs_info` with an
+        `ocs_fence` read now -- RoboCommand's polygon it was given (OPEN) on the
+        autopilot beside the pilot's PILOT, or, for a null one (no course, or a course
+        whose polygon was refused), polygon null and the autopilot holding PILOT alone:
+        the adapter never clears a fence. Returns self."""
         self._adapter_vid = vid
         return self
 
@@ -290,18 +348,6 @@ class VehicleClient:
             pass
 
 
-def with_ceiling(block: str, ceiling) -> str:
-    """A test's `[geofence]` block with `max_altitude_hae_m` in it, unless the test
-    set one itself or asked for none. Inserted under the test's own `[geofence]`
-    header when it has one: TOML refuses the same table twice."""
-    if ceiling is None or "max_altitude_hae_m" in block:
-        return block
-    line = "max_altitude_hae_m = %r" % float(ceiling)
-    if "[geofence]" in block:
-        return block.replace("[geofence]", "[geofence]\n" + line, 1)
-    return "[geofence]\n%s\n%s" % (line, block)
-
-
 class BridgeCase(unittest.TestCase):
     """A Bridge on an ephemeral TCP port with recording stand-ins for both brokers."""
 
@@ -309,16 +355,16 @@ class BridgeCase(unittest.TestCase):
     uav_extra = ""
     limits = ""
     #: Text appended at the very end of the config, after [paths]: a `[geofence]`
-    #: section and any `[[geofence.course]]` entries. Bare keys here would belong to
-    #: the last table, which is why it is a block of its own.
+    #: section. Bare keys here would belong to the last table, which is why it is a
+    #: block of its own.
     geofence = ""
-    #: What a declaration with an aircraft must carry besides the fence (8fc09f2):
-    #: `[geofence] max_altitude_hae_m` (None leaves it out) and `[uav]
-    #: pilot_callsign`. Test values, set so the existing tests still declare Ekko.
-    ceiling: float | None = 40.0
+    #: `[uav] pilot_callsign`, bridge.toml's default for the call sign a declaration
+    #: with an aircraft carries (8fc09f2). A test value, so the tests declare Ekko.
     callsign = "Test UA0000"
     #: Vehicle ids for the bridge's bench dry-run switch (empty: off).
     bench_auto: tuple = ()
+    #: `[robocommand] host`: "auto" makes the bridge search for it (rcfind.py).
+    rc_host = "127.0.0.1"
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -333,8 +379,8 @@ class BridgeCase(unittest.TestCase):
         cfg_path = tmp / "bridge.toml"
         cfg_path.write_text(CONFIG.format(
             team=TEAM, usv_extra=self.usv_extra, uav_extra=self.uav_extra,
-            limits=self.limits, geofence=with_ceiling(self.geofence, self.ceiling),
-            callsign=self.callsign, seq=(tmp / "seq.json").as_posix(),
+            limits=self.limits, geofence=self.geofence,
+            callsign=self.callsign, rc_host=self.rc_host, seq=(tmp / "seq.json").as_posix(),
             wire=(tmp / "wire").as_posix()), encoding="utf-8")
         bridge = Bridge(load(cfg_path), log=lambda m: self.logs.append(str(m)),
                         bench_auto=self.bench_auto)
@@ -391,9 +437,11 @@ class BridgeCase(unittest.TestCase):
                       **kw) -> None:
         """Play the radio adapter: identify as `vid` (once) and send an `ocs_fence`.
 
-        `polygon` "fence" (the default) is the OPEN form of the fence the bridge holds
-        for the course in hand -- the adapter's whole job, done right. Pass a list,
-        [] or None to say something else. kw goes to fence_frame (verified, at, ...)."""
+        `polygon` "fence" (the default) is the OPEN form of RoboCommand's polygon the
+        bridge holds for the course in hand, which the adapter was told; pass a list or
+        None to say something else. By default the read finds it on the autopilot with
+        the pilot's PILOT inside it, FENCE_ALT_MAX 30 and home 9 m HAE -- a declarable
+        aircraft. kw goes to fence_frame (held, params, read_at, home_hae_m, ...)."""
         # Its own fed connection (key), never the one a test feeds its heartbeats
         # down: a test that opens with its own hello on `link` must still be the
         # first to speak on that socket.
@@ -412,8 +460,9 @@ class BridgeCase(unittest.TestCase):
 
     def declared(self, active=("USV1", "UAV1"), *, confirm: bool = True) -> None:
         """Walk the machine to DECLARED with `active` forced in. Each aircraft going
-        in is first confirmed to hold the course's fence, as the adapter would
-        (`confirm=False` leaves that to the test: the gate refuses an unconfirmed one)."""
+        in is first read by the adapter holding RoboCommand's polygon and the pilot's
+        PILOT (`confirm=False` leaves that to the test: the gate refuses an aircraft
+        whose autopilot has not been read)."""
         b = self.bridge
         b.machine.on_connect()
         b._handle_course(course_bytes())

@@ -63,11 +63,21 @@ class ConfigError(ValueError):
     """Raised with a message meant to be read on a trailer, not in a debugger."""
 
 
+#: `[robocommand] host = "auto"` (or no host): the bridge finds RoboCommand's broker by
+#: its course topic instead (rcfind.py). Never for the team broker.
+AUTO_HOST = "auto"
+
+
 @dataclass(frozen=True)
 class Broker:
-    host: str
+    host: str                       #: an address, or AUTO_HOST
     port: int = 1883
     keepalive: int = 15
+
+    @property
+    def auto(self) -> bool:
+        """True when the broker is found by searching rather than configured."""
+        return self.host == AUTO_HOST
 
 
 @dataclass(frozen=True)
@@ -104,10 +114,12 @@ class Vehicle:
     #: client that cannot tolerate a top-level key it does not know.
     send_info: bool = True
 
-    #: UAV only: its CAAS registration, which RoboCommand wants in
-    #: Heartbeat.uav_registration when the team has more than one UAV registered
-    #: (Garuda relays UAV heartbeats for Network Remote ID). The bridge stamps it
-    #: on every heartbeat, whichever link brought it. Blank: the field stays blank.
+    #: UAV only: the team-wide default for its CAAS registration, which RoboCommand
+    #: wants in Heartbeat.uav_registration when the team has more than one UAV
+    #: registered (Garuda relays UAV heartbeats for Network Remote ID). The page's
+    #: box, or a default saved there (run/operator.json), wins over it; the bridge
+    #: stamps the result on every heartbeat, whichever link brought it. Blank: the
+    #: field stays blank.
     registration: str = ""
 
     @property
@@ -156,33 +168,24 @@ class Config:
     #: uav_params.yaml and fails Ekko's rebuild without it.
     uav_geofence: tuple[tuple[float, float], ...] = ()
 
-    #: `[geofence] boundary_margin_m`: how far inside the course boundary the
-    #: derived UAV geofence sits when there is no `[[geofence.course]]` entry. The
-    #: declared vertices must be strictly inside the boundary, never on it, where a
-    #: float-rounding validation could reject them. Chase's to change.
+    #: `[geofence] boundary_margin_m`: how far inside the course (and transit area)
+    #: RoboCommand's polygon sits -- the one put on the aircraft for the pilot to draw
+    #: inside. Strictly inside, never on the line, where a float-rounding validation
+    #: could reject a fence drawn along it. Chase's to change.
     geofence_margin_m: float = DEFAULT_MARGIN_M
-    #: `[geofence] confirm_max_age_s`: how old an `ocs_fence` read-back may be and
-    #: still count as the autopilot holding the fence. The adapter re-verifies every
-    #: 60 s.
+    #: `[geofence] confirm_max_age_s`: how old the last read of the aircraft's fence
+    #: (`ocs_fence` read_at) may be and still be declared from. The adapter reads every
+    #: 30 s while the aircraft is disarmed.
     geofence_confirm_max_age_s: float = DEFAULT_CONFIRM_MAX_AGE_S
-    #: `[[geofence.course]]`: course_id -> the hand-written CLOSED fence for it, as
-    #: ((course_id, ((lat, lon), ...)), ...). A tuple of pairs because the config
-    #: is frozen; `geofence_table` is the dict.
-    geofence_courses: tuple[tuple[str, tuple[tuple[float, float], ...]], ...] = ()
-    #: `[geofence] max_altitude_hae_m`: the ceiling declared with an aircraft
-    #: (RunDeclaration.uav_geofence_max_altitude_hae_m), metres above the WGS84
-    #: ellipsoid. No default: it is the team's decision, and RoboCommand refuses a
-    #: declaration with an aircraft and no ceiling -- silently -- so without one the
-    #: bridge refuses to declare an aircraft at all.
-    geofence_ceiling_hae_m: float | None = None
     #: `[geofence] ceiling_limit_hae_m`: the most RoboCommand accepts. Their test
     #: server refuses above 50 m HAE (MAX_UAV_ALTITUDE_HAE_M); handbook 5.3.3 says
-    #: 60 m AMSL. The stricter one until RoboNation says otherwise.
+    #: 60 m AMSL. The stricter one until RoboNation says otherwise. The ceiling itself
+    #: is the aircraft's own, home HAE + FENCE_ALT_MAX, read off its autopilot.
     geofence_ceiling_limit_hae_m: float = RC_MAX_CEILING_HAE_M
-    #: `[uav] pilot_callsign`: what the page's call-sign box starts with --
+    #: `[uav] pilot_callsign`: the team-wide default for the page's call-sign box --
     #: RunDeclaration.uav_pilot_callsign, the pilot's MyDroneFleets call sign (first
-    #: name + UAPL number). Per run, so the page can change it; blank blocks a
-    #: declaration with an aircraft in it.
+    #: name + UAPL number). A default saved on the page (run/operator.json, this
+    #: laptop only) wins over it; blank blocks a declaration with an aircraft in it.
     uav_pilot_callsign: str = ""
 
     rate: float = 5.0
@@ -209,6 +212,9 @@ class Config:
 
     seq_store: Path = Path("run/seq.json")
     wire_log: Path = Path("run/wire")
+    #: `[paths] operator_store`: this laptop's saved call sign and registrations
+    #: (operatorstore.py). None: operator.json beside seq_store -- see operator_path.
+    operator_store: Path | None = None
 
     #: Where vehicles dial in. 0.0.0.0 because the OCS is dual-homed and the
     #: team NIC is not the one we bind by name -- see README on why this must
@@ -218,6 +224,13 @@ class Config:
     tcp_enabled: bool = True
 
     discovery: Discovery = Discovery()
+
+    @property
+    def operator_path(self) -> Path:
+        """Where operatorstore keeps this laptop's defaults: beside the sequence
+        counters unless bridge.toml says otherwise, so a bench or a test that moves
+        `seq_store` somewhere temporary never reads or writes the real laptop's."""
+        return self.operator_store or self.seq_store.parent / "operator.json"
 
     # ---- fleet lookups ----------------------------------------------------
 
@@ -243,11 +256,6 @@ class Config:
 
     def has_uav(self) -> bool:
         return any(v.type == "TYPE_UAV" for v in self.vehicles)
-
-    @property
-    def geofence_table(self) -> dict[str, tuple[tuple[float, float], ...]]:
-        """`[[geofence.course]]` as {course_id: closed polygon}."""
-        return dict(self.geofence_courses)
 
     # ---- topics: one place, so the two namespaces cannot drift ------------
 
@@ -276,15 +284,23 @@ class Config:
         return "robocommand/robotx/course"
 
 
-def _broker(raw: dict, name: str) -> Broker:
+def _broker(raw: dict, name: str, *, auto: bool = False) -> Broker:
+    """A broker section. With `auto`, a missing host or "auto" means search for it."""
     try:
         section = raw[name]
     except KeyError:
         raise ConfigError(f"[{name}] section missing") from None
-    if "host" not in section:
+    host = section.get("host", AUTO_HOST if auto else None)
+    if host is None:
         raise ConfigError(f"[{name}] needs a host")
+    if not isinstance(host, str) or not host.strip():
+        raise ConfigError(f"[{name}] host must be an address"
+                          + (f' or "{AUTO_HOST}"' if auto else ""))
+    if host.strip() == AUTO_HOST and not auto:
+        raise ConfigError(f'[{name}] host cannot be "{AUTO_HOST}": only RoboCommand is '
+                          "found by searching")
     return Broker(
-        host=str(section["host"]),
+        host=host.strip(),
         port=int(section.get("port", 1883)),
         keepalive=int(section.get("keepalive", 15)),
     )
@@ -434,26 +450,6 @@ def _number(section: dict, key: str, default: float, where: str) -> float:
     return float(v)
 
 
-def _ceiling(raw: dict) -> tuple[float | None, float]:
-    """`[geofence]` max_altitude_hae_m and ceiling_limit_hae_m: (ceiling or None, limit).
-
-    The ceiling is checked against the limit here, at load, as well as before every
-    declaration: a value RoboCommand will refuse is a config error, not a run that
-    silently never starts."""
-    section = raw.get("geofence", {})
-    if not isinstance(section, dict):
-        raise ConfigError("[geofence] is not a table")
-    limit = _number(section, "ceiling_limit_hae_m", RC_MAX_CEILING_HAE_M, "geofence")
-    if "max_altitude_hae_m" not in section:
-        return None, limit
-    ceiling = _number(section, "max_altitude_hae_m", 0.0, "geofence")
-    if ceiling > limit:
-        raise ConfigError(
-            f"geofence.max_altitude_hae_m = {ceiling:g} is above ceiling_limit_hae_m = "
-            f"{limit:g}: RoboCommand refuses the declaration, and says nothing")
-    return ceiling, limit
-
-
 def _callsign(raw: dict) -> str:
     section = raw.get("uav", {})
     if not isinstance(section, dict):
@@ -464,59 +460,33 @@ def _callsign(raw: dict) -> str:
     return sign.strip()
 
 
-def _geofence(raw: dict) -> tuple[float, float, tuple]:
-    """`[geofence]`: (boundary_margin_m, confirm_max_age_s, the per-course table).
+#: `[geofence]` keys that were removed when the declaration started to come from the
+#: aircraft itself (Chase, 7 Nov 2026), with what to do instead. A leftover one is an
+#: error, never ignored: whoever wrote it expects it to be declared, and it would not be.
+_REMOVED_GEOFENCE = {
+    "course": "[[geofence.course]] was removed: the UAV geofence declared is the polygon the "
+              "pilot draws in QGC, read back off the aircraft's autopilot. Draw it there (inside "
+              "RoboCommand's polygon, which the OCS puts on the aircraft) and delete these entries",
+    "max_altitude_hae_m": "geofence.max_altitude_hae_m was removed: the ceiling declared is the "
+                          "aircraft's own, home HAE + FENCE_ALT_MAX read off its autopilot. Set "
+                          "FENCE_ALT_MAX in QGC and delete this line",
+}
+
+
+def _geofence(raw: dict) -> tuple[float, float, float]:
+    """`[geofence]`: (boundary_margin_m, confirm_max_age_s, ceiling_limit_hae_m).
 
     Every default lives in geofence.py, so a config with no `[geofence]` section
-    behaves exactly as the shipped bridge.toml does. A table entry is validated as
-    hard as anything else the OCS declares to RoboCommand: it must be a closed
-    polygon of at least three distinct vertices, each a real position. Whether it is
-    INSIDE the course is not knowable here -- the boundary arrives from RoboCommand
-    -- and is checked when the course does (geofence.for_course).
-    """
+    behaves exactly as the shipped bridge.toml does."""
     section = raw.get("geofence", {})
     if not isinstance(section, dict):
         raise ConfigError("[geofence] is not a table")
-    margin = _number(section, "boundary_margin_m", DEFAULT_MARGIN_M, "geofence")
-    max_age = _number(section, "confirm_max_age_s", DEFAULT_CONFIRM_MAX_AGE_S, "geofence")
-
-    entries = section.get("course", [])
-    if not isinstance(entries, list):
-        raise ConfigError("geofence.course must be an array of [[geofence.course]] tables")
-    table: list[tuple[str, tuple[tuple[float, float], ...]]] = []
-    for n, entry in enumerate(entries, start=1):
-        where = f"[[geofence.course]] #{n}"
-        if not isinstance(entry, dict):
-            raise ConfigError(f"{where} is not a table")
-        cid = entry.get("course_id")
-        if not isinstance(cid, str) or not cid.strip():
-            raise ConfigError(f"{where} needs a course_id, e.g. \"ALPHA\"")
-        cid = cid.strip()
-        where = f"[[geofence.course]] {cid}"
-        poly = entry.get("uav_geofence")
-        if not isinstance(poly, list):
-            raise ConfigError(f"{where} needs uav_geofence = [[lat, lon], ...]")
-        pts: list[tuple[float, float]] = []
-        for p in poly:
-            ok = (isinstance(p, list) and len(p) == 2
-                  and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                          and math.isfinite(v) for v in p)
-                  and -90.0 <= p[0] <= 90.0 and -180.0 <= p[1] <= 180.0)
-            if not ok:
-                raise ConfigError(f"{where}: uav_geofence holds {p!r}, not a [lat, lon]")
-            pts.append((float(p[0]), float(p[1])))
-        if len(pts) < 4 or pts[0] != pts[-1]:
-            raise ConfigError(
-                f"{where}: uav_geofence must be closed (first point == last) and have "
-                f"at least 3 distinct vertices -- RoboCommand rejects fewer than 4 "
-                f"points")
-        if len(set(pts)) < 3:       # closed: the last point repeats the first
-            raise ConfigError(f"{where}: uav_geofence repeats a vertex; it needs at "
-                              f"least 3 distinct ones")
-        if cid in {c for c, _ in table}:
-            raise ConfigError(f"{where}: two [[geofence.course]] entries for {cid}")
-        table.append((cid, tuple(pts)))
-    return margin, max_age, tuple(table)
+    for key, why in _REMOVED_GEOFENCE.items():
+        if key in section:
+            raise ConfigError(why)
+    return (_number(section, "boundary_margin_m", DEFAULT_MARGIN_M, "geofence"),
+            _number(section, "confirm_max_age_s", DEFAULT_CONFIRM_MAX_AGE_S, "geofence"),
+            _number(section, "ceiling_limit_hae_m", RC_MAX_CEILING_HAE_M, "geofence"))
 
 
 def load(path: str | Path) -> Config:
@@ -549,8 +519,7 @@ def load(path: str | Path) -> Config:
         fence = tuple((float(a), float(b)) for a, b in raw.get("uav_geofence", []))
     except (TypeError, ValueError):
         raise ConfigError("uav_geofence (retired) is not a list of [lat, lon] pairs") from None
-    margin_m, confirm_max_age_s, courses = _geofence(raw)
-    ceiling, ceiling_limit = _ceiling(raw)
+    margin_m, confirm_max_age_s, ceiling_limit = _geofence(raw)
 
     limits = raw.get("limits", {})
     paths = raw.get("paths", {})
@@ -566,13 +535,11 @@ def load(path: str | Path) -> Config:
         team_id=team_id,
         vehicles=vehicles,
         team=_broker(raw, "team"),
-        robocommand=_broker(raw, "robocommand"),
+        robocommand=_broker(raw, "robocommand", auto=True),
         tiers=tiers,  # type: ignore[arg-type]
         uav_geofence=fence,
         geofence_margin_m=margin_m,
         geofence_confirm_max_age_s=confirm_max_age_s,
-        geofence_courses=courses,
-        geofence_ceiling_hae_m=ceiling,
         geofence_ceiling_limit_hae_m=ceiling_limit,
         uav_pilot_callsign=_callsign(raw),
         rate=float(limits.get("rate", 5.0)),
@@ -582,6 +549,8 @@ def load(path: str | Path) -> Config:
         link_prefer_s=link_prefer_s,
         seq_store=Path(paths.get("seq_store", "run/seq.json")),
         wire_log=Path(paths.get("wire_log", "run/wire")),
+        operator_store=(Path(paths["operator_store"]) if "operator_store" in paths
+                        else None),
         tcp_host=str(tcp.get("host", "0.0.0.0")),
         tcp_port=int(tcp.get("port", 37564)),
         tcp_enabled=bool(tcp.get("enabled", True)),

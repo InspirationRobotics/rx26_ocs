@@ -359,7 +359,11 @@ and DHCP is what makes one OCS config work on all four courses (Alpha
 
 ### 4c. Point the OCS at it
 
-In `bridge.toml`, set `[robocommand] host` to the sim box's address.
+Nothing to set: with `[robocommand] host = "auto"` (as shipped) the OCS finds the sim
+box's broker by the course it keeps retained on `robocommand/robotx/course`, and the
+RoboCommand row on the page lists every host the search tried and what each said
+(`rx_bridge/rcfind.py`). To skip the search, set `[robocommand] host` to the sim box's
+address; `rc_e2e.py` pins it that way.
 
 Trim the `[[vehicle]]` blocks to **only the vehicles that will actually report**
 — see the first gotcha below, it is the one that will get you.
@@ -394,8 +398,9 @@ With UAV1 declared (8fc09f2), also:
 - [ ] Their log has `[geofence] ASTA: UAV geofence and ceiling OK` before `[auto-start]`.
       A refusal is `[ERROR] ... RunDeclaration for ASTA refused: <why>` and **nothing
       else**: no reply, no RunStart. The OCS page should have refused first, in words
-- [ ] The page's UAV fence line says `course + transit area inset ...` and shows the
-      ceiling; the call-sign box next to Declare was filled in
+- [ ] The page's UAV fence line says RoboCommand's polygon is `course + transit area
+      inset ...`, and UAV1's line says what it declares: the pilot's polygon and the
+      ceiling read off it; the call-sign box next to Declare was filled in
 - [ ] A task report sent during the run shows in **Task reports to RoboCommand** as
       `acknowledged` (their broker's PUBACK), not just `published`
 
@@ -483,21 +488,27 @@ running.**
 `test_server.py:104` rejects the declaration if any `vehicle_id` starts with
 `"UAV"` and `uav_geofence` has fewer than 4 points.
 
-**The UAV geofence is per course, and worked out from the course.** The top-level
-`uav_geofence` in `bridge.toml` is retired (the drone repo's `check_config.py` still
-reads it; the OCS does not). When the course arrives the OCS declares a
-`[[geofence.course]]` entry for it if there is one, otherwise the boundary pulled in by
-`[geofence] boundary_margin_m` (2 m). Their server only counts points, so it will accept a
-fence anywhere on Earth -- the check that matters is on the page: *UAV fence* names its
-source and vertex count, and a course finding says so loudly when no fence could be made.
+**The UAV geofence declared is the pilot's, read off the autopilot.** When the course
+arrives the OCS makes RoboCommand's polygon -- the course joined with its transit area,
+pulled in by `[geofence] boundary_margin_m` (2 m) -- and the radio adapter puts it on
+Ekko's autopilot so QGC shows it. The pilot draws Ekko's own fence inside it in QGC and
+uploads; the adapter reads the whole fence back every 30 s while disarmed, with
+FENCE_ALT_MAX and the home altitude. A declaration carries the one inclusion polygon that
+is not RoboCommand's, and home HAE + FENCE_ALT_MAX as the ceiling. Their server checks the
+fence against the course and transit area (1 m) and the ceiling (0-50 m HAE) and refuses
+silently; the page applies the same check first and says why in words. The top-level
+`uav_geofence` in `bridge.toml` is retired (the drone repo's `check_config.py` still reads
+it; the OCS does not), and the per-course `[[geofence.course]]` table and `[geofence]
+max_altitude_hae_m` are gone -- the bridge refuses to start with either.
 
-**A UAV is not declared until its autopilot is read back holding that fence.** The radio
-adapter sends an `ocs_fence` after it has written and re-read Ekko's fence; without a fresh
-(180 s) one that matches, *Declare run* is disabled and says why, and `POST /api/declare`
-refuses. For a fake UAV on the bench run
+**A UAV is not declared without a fresh read of its autopilot's fence.** Without an
+`ocs_fence` read in the last 180 s holding exactly one polygon besides RoboCommand's, plus
+FENCE_ALT_MAX and the home altitude, *Declare run* is disabled and says why, and
+`POST /api/declare` refuses. For a fake UAV on the bench run
 `python fake_vehicle.py --vehicle UAV1 --type TYPE_UAV --ocs-tcp 127.0.0.1:37564`
-(system or `.venv` python, in `OCS`): it plays the adapter's half over the TCP link. The
-`--inject` buttons publish over MQTT and cannot carry the confirmation.
+(system or `.venv` python, in `OCS`): it plays the adapter's half over the TCP link, with a
+stand-in pilot's polygon at half the size of RoboCommand's, FENCE_ALT_MAX 30 m and home
+9 m HAE (a 39 m ceiling). The `--inject` buttons publish over MQTT and cannot carry the read.
 
 **Windows reserves port 1883.** Binding a broker there fails with
 `WinError 10013`, which is why `--local-broker` defaults to 11883. To see the

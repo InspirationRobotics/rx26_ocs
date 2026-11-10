@@ -35,8 +35,10 @@ from bench_stage2 import _PKG                                          # noqa: E
 from rx_bridge.bridge import Bridge                                    # noqa: E402
 from rx_bridge.config import load                                      # noqa: E402
 from rx_bridge.runstate import RunState                                # noqa: E402
+from fake_vehicle import (HOME_HAE_M, PARAMS, fence_read, open_polygon,  # noqa: E402
+                          pilot_polygon)
 
-from crusader_groundstation.ocs_link import OcsLink, fake_report, rfc3339   # noqa: E402
+from crusader_groundstation.ocs_link import OcsLink, fake_report            # noqa: E402
 
 TCP_PORT = 37598          # its own port; never collide with a real OCS
 
@@ -82,32 +84,33 @@ stale_ms = 1000.0
 seq_store = "{seq}"
 wire_log  = "{wire}"
 
-# What a declaration with an aircraft carries besides the fence (8fc09f2). Test
-# values: the call sign is nobody's.
+# What a declaration with an aircraft carries besides the fence (8fc09f2). A test
+# value: the call sign is nobody's. The ceiling is read off the aircraft.
 [uav]
 pilot_callsign = "{callsign}"
-
-[geofence]
-max_altitude_hae_m = {ceiling}
 """
 CALLSIGN = "Bench UA0000"
-CEILING = 40.0
+#: What the stand-in aircraft's read gives: home HAE + FENCE_ALT_MAX.
+CEILING = HOME_HAE_M + PARAMS["FENCE_ALT_MAX"]
 
 
 class Vehicle:
     """One vehicle's client, streaming at the mandated 2 Hz.
 
-    A UAV also plays the radio adapter's part in the geofence handshake: when the OCS
-    tells it a fence (`ocs_info.uav_geofence`) it answers with an `ocs_fence` -- verified,
-    the OPEN polygon it was given, read back now -- and the OCS will not declare an
-    aircraft without that. `confirm_fence=False` holds the answer back until `confirm()`,
-    which is how the bench proves a declaration is REFUSED without it.
+    A UAV also plays the radio adapter's part in the geofence workflow, and the
+    autopilot's and the pilot's: when the OCS tells it RoboCommand's polygon
+    (`ocs_info.uav_geofence`) it answers with an `ocs_fence` read -- that polygon on a
+    stand-in autopilot, a stand-in pilot's drawn inside it, FENCE_ALT_MAX and home
+    (fake_vehicle.fence_read). The OCS declares an aircraft only from such a read.
+    `confirm_fence=False` holds the read back until `confirm()`, which is how the bench
+    proves a declaration is REFUSED without it.
     """
 
     def __init__(self, vid: str, vtype: str, logs: list, *, confirm_fence: bool = True) -> None:
         self.vid = vid
         self.directives: list = []
         self.fence = None                          # the last uav_geofence told, closed
+        self.pilot = None                          # the stand-in pilot's polygon, open
         self.auto_confirm = confirm_fence
         self._owe_fence = threading.Event()
         self.link = OcsLink("127.0.0.1", TCP_PORT,
@@ -133,11 +136,10 @@ class Vehicle:
         self._owe_fence.set()
 
     def _fence_frame(self) -> dict:
-        poly = [[p["latitude"], p["longitude"]] for p in self.fence[:-1]]     # OPEN form
-        return {"ocs_fence": {"vehicle_id": self.vid, "state": "done", "polygon": poly,
-                              "verified": True, "verified_at": rfc3339(),
-                              "reason": "written and read back: %d vertices" % len(poly),
-                              "lockout": None}}
+        rc = open_polygon(self.fence)
+        self.pilot = pilot_polygon(rc)
+        return fence_read(self.vid, rc, [rc, self.pilot],
+                          "written and read back: %d vertices, the pilot's inside" % len(rc))
 
     def _run(self):
         while not self._stop.is_set():
@@ -163,8 +165,7 @@ def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="por-stage3-"))
     cfg_path = work / "bridge.toml"
     cfg_path.write_text(
-        CONFIG.format(team=TEAM, host=HOST, port=PORT, tcp=TCP_PORT,
-                      callsign=CALLSIGN, ceiling=CEILING,
+        CONFIG.format(team=TEAM, host=HOST, port=PORT, tcp=TCP_PORT, callsign=CALLSIGN,
                       seq=(work / "seq.json").as_posix(),
                       wire=(work / "wire").as_posix()),
         encoding="utf-8")
@@ -206,10 +207,11 @@ def main() -> int:
           "both connected -> active=%s (UUV1 absent, never declared)"
           % (bridge.active_ids(),))
 
-    print("\nC2e-C2f  an aircraft is not declared until its autopilot is KNOWN to hold the fence")
+    print("\nC2e-C2f  an aircraft is not declared until its autopilot's fence has been READ")
     n_req = len(rc.requests)
     msg = bridge.declare()
-    check("C2e", msg.startswith("cannot declare") and "UAV1" in msg and "not confirmed" in msg
+    check("C2e", msg.startswith("cannot declare") and "UAV1" in msg
+          and "nothing read from its autopilot" in msg
           and len(rc.requests) == n_req and bridge.machine.state is RunState.COURSE_RX,
           "no ocs_fence yet -> REFUSED, nothing sent to RoboCommand: %r" % msg[:80])
     uav.confirm()
@@ -217,8 +219,9 @@ def main() -> int:
     fc = bridge.snapshot()["fence_confirm"].get("UAV1", {})
     check("C2f", fc.get("verified") is True and fc.get("matches_course_fence") is True
           and bridge.declare_blocker() is None,
-          "the aircraft read the course fence back (%s, %s vertices) -> the gate opens"
-          % (bridge.snapshot()["uav_geofence_source"], len(fc.get("polygon") or [])))
+          "read: RoboCommand's polygon on the autopilot (%s) beside the pilot's, %d inclusion "
+          "polygons -> the gate opens"
+          % (bridge.snapshot()["uav_geofence_source"], len(fc.get("shapes") or [])))
 
     print("\nC3  3.4.10 step 4: the declaration names exactly the active two")
     n_req = len(rc.requests)
@@ -236,16 +239,18 @@ def main() -> int:
           "run hanging forever waiting for it")
     sent_fence = [(p.latitude, p.longitude)
                   for p in rc.requests[-1].run_declaration.uav_geofence] if rc.requests else []
-    check("C3e", len(sent_fence) >= 4 and sent_fence[0] == sent_fence[-1]
-          and sent_fence == list(bridge._fence.polygon),
-          "RoboCommand got the COURSE's fence, closed (%d points) -- the one the aircraft holds"
-          % len(sent_fence))
+    pilot = [tuple(p) for p in uav.pilot or []]
+    check("C3e", len(sent_fence) >= 4 and sent_fence == pilot + pilot[:1]
+          and sent_fence != list(bridge._fence.polygon),
+          "RoboCommand got the PILOT's polygon read off the aircraft, closed (%d points) -- "
+          "not its own" % len(sent_fence))
     decl = rc.requests[-1].run_declaration if rc.requests else None
     check("C3f", decl is not None and decl.HasField("uav_geofence_max_altitude_hae_m")
           and decl.uav_geofence_max_altitude_hae_m == CEILING
           and decl.uav_pilot_callsign == CALLSIGN,
-          "with an aircraft in it, the declaration carries the ceiling (%s m HAE) and the "
-          "pilot's call sign (%r) -- without them RoboCommand refuses it, silently"
+          "with an aircraft in it, the declaration carries the ceiling read off it (%s m HAE: "
+          "home + FENCE_ALT_MAX) and the pilot's call sign (%r) -- without them RoboCommand "
+          "refuses it, silently"
           % ((decl.uav_geofence_max_altitude_hae_m, decl.uav_pilot_callsign) if decl
              else (None, None)))
 

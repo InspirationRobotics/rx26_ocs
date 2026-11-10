@@ -14,7 +14,12 @@ Endpoints:
     GET  /api/fleet        fleet_link's /fleet, proxied (or {"error": ...})
     GET  /api/map-config   map centre and the vehicle-GUI links
     POST /api/declare      publish the RunDeclaration ({"callsign": ...} for an aircraft)
+    POST /api/operator     the pilot's call sign and the aircraft registrations
+                           ({"callsign", "registration": {id: ...}, "save"})
     POST /api/active       force a vehicle in/out of the declaration
+    POST /api/tiers        the tiers the next declaration carries ({"task1".."task4":
+                           "TIER_NONE|CORE|ADVANCED|DISRUPTIVE"}); refused while a run is
+                           DECLARED or RUNNING
     POST /api/end          end the run
     POST /api/inject       publish one fake heartbeat as a chosen vehicle
 
@@ -237,10 +242,22 @@ def make_handler(bridge: Bridge, injector: Injector | None, logs: list, *,
             body = json.loads(self.rfile.read(n) or b"{}") if n else {}
 
             if self.path == "/api/declare":
-                # The pilot's call sign from the page's box; absent -> bridge.toml's.
-                sign = body.get("callsign")
-                self._json({"result": bridge.declare(
-                    None if sign is None else str(sign))})
+                # The pilot's call sign from the page's box; absent -> the one the
+                # bridge holds (typed earlier, this laptop's default, or bridge.toml's).
+                self._json({"result": bridge.declare(body.get("callsign"))})
+            elif self.path == "/api/operator":
+                # What the operator typed; a key left out is left alone. "save": also
+                # keep it as this laptop's default (run/operator.json).
+                ok, result = bridge.set_operator(
+                    callsign=body.get("callsign"), registration=body.get("registration"),
+                    save=bool(body.get("save")))
+                self._json({"ok": ok, "result": result}, 200 if ok else 400)
+            elif self.path == "/api/tiers":
+                # The same four values a vehicle's `ocs_tiers` sets; the reason, in
+                # words, when refused (409: a run is DECLARED/RUNNING, 400: bad values).
+                ok, result = bridge.set_tiers(body, "page")
+                self._json({"ok": ok, "result": result},
+                           200 if ok else 409 if bridge.tiers_blocker() else 400)
             elif self.path == "/api/end":
                 self._json({"result": bridge.end()})
             elif self.path == "/api/active":

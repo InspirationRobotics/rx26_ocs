@@ -24,9 +24,13 @@ address is skipped if it is
   * loopback, or link-local (169.254/16, an interface with no real address),
   * inside any `never_on` subnet -- by default the four course DHCP subnets
     Alpha 192.168.65.0/24 .. Delta 192.168.68.0/24, or
-  * in the same /24 as the configured RoboCommand broker host. This catches a
-    bench stub on a subnet that is not one of the four, and a course that
-    changes its numbering.
+  * in the same /24 as the RoboCommand broker -- the one bridge.toml pins, or the
+    one the bridge found by its course topic (rcfind.py) -- or the very address
+    the bridge reaches it from. This catches a bench stub on a subnet that is
+    not one of the four, and a course that changes its numbering (the Singapore
+    screening's was 192.168.69.0/24), or
+  * with `[robocommand] host = "auto"`, until RoboCommand has been found: in a
+    /24 the search has not swept yet. That network may be the course network.
 
 Skipped addresses are listed with the reason on the operator page. Nothing here
 sets an address or touches a route; it only chooses which addresses to speak from.
@@ -165,7 +169,7 @@ def _networks(subnets: Iterable[str]) -> list:
     return [ipaddress.ip_network(n, strict=False) for n in subnets]
 
 
-def _slash24(host: str | None) -> ipaddress.IPv4Network | None:
+def slash24(host: str | None) -> ipaddress.IPv4Network | None:
     """The /24 around `host` if it is an IPv4 literal. A hostname is not resolved
     here (a lookup could block the bridge's start); list its subnet in never_on."""
     try:
@@ -175,7 +179,8 @@ def _slash24(host: str | None) -> ipaddress.IPv4Network | None:
         return None
 
 
-def _why_not(addr: str, never_on: list, broker_net, broker_host) -> str | None:
+def _why_not(addr: str, never_on: list, broker_net, broker_host,
+             via: str | None) -> str | None:
     try:
         ip = ipaddress.IPv4Address(addr)
     except ValueError:
@@ -189,6 +194,8 @@ def _why_not(addr: str, never_on: list, broker_net, broker_host) -> str | None:
     for net in never_on:
         if ip in net:
             return "inside never_on %s" % net
+    if addr == via:
+        return "the address RoboCommand %s is reached from" % broker_host
     if broker_net is not None and ip in broker_net:
         return "same /24 as the RoboCommand broker %s" % broker_host
     return None
@@ -196,13 +203,15 @@ def _why_not(addr: str, never_on: list, broker_net, broker_host) -> str | None:
 
 def eligible(addresses: Iterable[str],
              never_on: Iterable[str] = DEFAULT_NEVER_ON,
-             broker_host: str | None = None) -> tuple[list[str], list[dict]]:
+             broker_host: str | None = None,
+             via: str | None = None) -> tuple[list[str], list[dict]]:
     """Split `addresses` into (the ones to broadcast from, [{addr, why}] skipped).
+    `via` is this laptop's address on its connection to `broker_host`, when known.
 
     Order is kept and duplicates dropped. Pure: the caller supplies the list.
     """
     nets = _networks(never_on)
-    broker_net = _slash24(broker_host)
+    broker_net = slash24(broker_host)
     sending: list[str] = []
     skipped: list[dict] = []
     seen: set[str] = set()
@@ -211,7 +220,7 @@ def eligible(addresses: Iterable[str],
         if addr in seen:
             continue
         seen.add(addr)
-        why = _why_not(addr, nets, broker_net, broker_host)
+        why = _why_not(addr, nets, broker_net, broker_host, via)
         if why is None:
             sending.append(addr)
         else:
@@ -237,6 +246,10 @@ class BeaconSender:
     socket path on loopback without touching a network: `select` replaces the
     eligibility filter (and so is the one way to let 127.0.0.1 through -- the
     default filter never does).
+
+    `hold(addr)` returns a reason not to speak from an address the filter passed,
+    or None; the bridge's RoboCommand search supplies it (rcfind.py). `set_broker`
+    moves the broker rule to a broker found after construction.
     """
 
     def __init__(self, team: str, *, port: int = DEFAULT_PORT,
@@ -246,6 +259,7 @@ class BeaconSender:
                  addresses: Callable[[], list[str]] = local_ipv4_addresses,
                  dest: tuple[str, int] | None = None,
                  select: Callable | None = None,
+                 hold: Callable[[str], str | None] | None = None,
                  rescan_s: float = RESCAN_S) -> None:
         self.team = team
         self.port = port
@@ -255,8 +269,10 @@ class BeaconSender:
         self.rescan_s = rescan_s
         self._addresses = addresses
         self._dest = dest or (LIMITED_BROADCAST, port)
+        self._broker: tuple[str | None, str | None] = (broker_host, None)
         self._select = select or (lambda found: eligible(
-            found, self.never_on, broker_host))
+            found, self.never_on, *self._broker))
+        self._hold = hold
 
         self._lock = threading.Lock()
         self._socks: dict[str, socket.socket] = {}
@@ -316,23 +332,39 @@ class BeaconSender:
             try:
                 now = time.monotonic()
                 if now >= next_scan:
-                    self._rescan()
+                    self.rescan()
                     next_scan = now + self.rescan_s
                 self._send_round()
             except Exception as exc:  # noqa: BLE001 -- the beacon must not die quietly
                 self._fail("internal", "beacon: %s: %s" % (type(exc).__name__, exc))
             self._stop.wait(self.interval_s)
 
-    def _rescan(self) -> None:
+    def set_broker(self, host: str | None, via: str | None = None) -> None:
+        """RoboCommand's broker is `host`, reached from this laptop's `via`. The
+        addresses that rule now skips stop at once, not at the next scan."""
+        with self._lock:
+            self._broker = (host, via)
+        self.rescan()
+
+    def rescan(self) -> None:
+        """List this machine's addresses and apply the rules now. Safe from any
+        thread: the rules are applied under the lock, so whichever scan finishes
+        last uses the newest broker."""
+        if self._thread is None or self._stop.is_set():
+            return                  # not beaconing: nothing to open, nothing to close
         try:
             found = list(self._addresses())
         except OSError as exc:
             # Keep what is open: a resolver hiccup is not a reason to go silent.
             self._fail("addresses", "cannot list this machine's addresses: %s" % exc)
             return
-        sending, skipped = self._select(found)
         opened: list[str] = []
         with self._lock:
+            sending, skipped = self._select(found)
+            if self._hold is not None:
+                held = [(a, self._hold(a)) for a in sending]
+                sending = [a for a, why in held if why is None]
+                skipped = skipped + [{"addr": a, "why": why} for a, why in held if why]
             for addr in [a for a in self._socks if a not in sending]:
                 self._socks.pop(addr).close()
             for addr in sending:
@@ -364,8 +396,9 @@ class BeaconSender:
                 # it rather than fail every second; the next rescan reopens
                 # whatever is really there.
                 with self._lock:
-                    if self._socks.get(addr) is sock:
-                        del self._socks[addr]
+                    if self._socks.get(addr) is not sock:
+                        continue          # a rescan closed it on purpose meanwhile
+                    del self._socks[addr]
                     self._skipped.append({"addr": addr, "why": "send failed: %s" % exc})
                     self._note_error("send from %s: %s" % (addr, exc))
                 sock.close()

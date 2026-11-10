@@ -27,7 +27,7 @@ rising silence; a fabricated value is indistinguishable from a real one. The rea
 kept and shown in /fleet, so the silence is explained, not just observed.
 
 What it cannot know, and says so: current_task. It is the literal TASK_NONE, on purpose and
-exactly as Ekko's own heartbeat_core.py:138 sends it ("no task-state source exists on the
+exactly as Ekko's own heartbeat_core.py:145 sends it ("no task-state source exists on the
 aircraft yet"): this mirrors the aircraft's own reporter, it is not our guess about what the
 aircraft is doing. Only Ekko's own heartbeat can ever mark a task attempt begun.
 """
@@ -72,17 +72,17 @@ _PHASE_BY_LANDED = {
     LANDED_LANDING: AIRBORNE,
 }
 
-#: heartbeat_core.py:52-55 -- modes in which an armed ArduCopter is flying itself. Anything
-#: else, and anything at all while disarmed, is STATE_MANUAL. STATE_UNKNOWN is never sent.
-#: LOITER is NOT here (Chris, 6 Nov 2026): it is flown on the sticks, and the handbook's
-#: STATE_AUTO means "autonomous and ready" -- a pilot taking over into Loiter must show as
-#: MANUAL on MyDroneFleets. Ekko's own heartbeat_core.py still lists it.
+#: heartbeat_core.py:54-57 -- modes in which an armed ArduCopter is flying itself. Armed in
+#: anything else is STATE_MANUAL; disarmed, see WAITING_AUTONOMOUS_MODES. STATE_UNKNOWN is
+#: never sent. LOITER is NOT here (Chris, 6 Nov 2026): it is flown on the sticks, and the
+#: handbook's STATE_AUTO means "autonomous and ready" -- a pilot taking over into Loiter must
+#: show as MANUAL on MyDroneFleets.
 AUTONOMOUS_MODES = frozenset({
     "AUTO", "GUIDED", "GUIDED_NOGPS", "RTL", "SMART_RTL", "LAND",
     "AUTO_RTL", "CIRCLE", "FOLLOW", "ZIGZAG",
 })
 
-#: heartbeat_core.py:138 -- the same literal Ekko's own reporter sends (no task-state source
+#: heartbeat_core.py:145 -- the same literal Ekko's own reporter sends (no task-state source
 #: exists on the aircraft); see the module docstring.
 CURRENT_TASK = "TASK_NONE"
 
@@ -104,7 +104,7 @@ def flight_phase(landed, *, armed=None, altitude_rel=None, airborne_alt_m=1.0,
                  allow_fallback=False):
     """(phase, source). phase is None when it cannot be determined truthfully.
 
-    heartbeat_core.py:58-83, with `allow_fallback` added (default False, see the module
+    heartbeat_core.py:67-92, with `allow_fallback` added (default False, see the module
     docstring). An UNDEFINED landed_state is the autopilot saying it does not know; with
     the fallback off that is a blank, not a guess."""
     if landed is not None and landed != LANDED_UNDEFINED:
@@ -120,15 +120,15 @@ def flight_phase(landed, *, armed=None, altitude_rel=None, airborne_alt_m=1.0,
     return (AIRBORNE if airborne else GROUNDED), "fallback"
 
 
-#: DISARMED in one of these = "autonomous and ready" (handbook 3.4: STATE_AUTO "when that vehicle is
-#: autonomous and ready"; vehicles wait for RunStart). The pilot has switched into the autonomous mode
-#: (SC -> GUIDED) and the aircraft sits on the ground, not armed. Chris, 7 Nov 2026. Ekko's own
-#: heartbeat_core.py still says MANUAL for anything disarmed.
+#: heartbeat_core.py:64 -- DISARMED in one of these = "autonomous and ready" (handbook 3.4:
+#: STATE_AUTO "when that vehicle is autonomous and ready"; vehicles wait for RunStart). The pilot
+#: has switched into the autonomous mode (SC -> GUIDED) and the aircraft sits on the ground, not
+#: armed. Chris, 7 Nov 2026.
 WAITING_AUTONOMOUS_MODES = frozenset({"GUIDED"})
 
 
 def robot_state(mode, armed):
-    """heartbeat_core.py:86-91, plus WAITING_AUTONOMOUS_MODES. Never STATE_UNKNOWN (the zero value)."""
+    """heartbeat_core.py:95-98. Never STATE_UNKNOWN (the zero value)."""
     if not armed:
         return "STATE_AUTO" if (mode or "").upper() in WAITING_AUTONOMOUS_MODES else "STATE_MANUAL"
     return "STATE_AUTO" if (mode or "").upper() in AUTONOMOUS_MODES else "STATE_MANUAL"
@@ -216,11 +216,11 @@ class HeartbeatSynth:
 
     def build(self, now: float) -> Tuple[Optional[dict], str]:
         """(heartbeat body, source) -- source "autopilot" or "fallback" -- or
-        (None, reason). heartbeat_core.py:94-147. On success `data_t` is the time of the
+        (None, reason). heartbeat_core.py:101-154. On success `data_t` is the time of the
         newest autopilot message the body was built from (the data's time, not `now`); on
         (None, reason) it is None.
 
-        current_task is TASK_NONE, exactly as heartbeat_core.py:138 sends it: this is a mirror
+        current_task is TASK_NONE, exactly as heartbeat_core.py:145 sends it: this is a mirror
         of the aircraft's own reporter, not a statement about what the aircraft is doing."""
         self.data_t = None
         t = self.timeouts
@@ -269,12 +269,12 @@ class HeartbeatSynth:
             "position": {"latitude": lat, "longitude": lon},
             "spd_mps": spd,
             "heading_deg": hdg,
-            "altitude_hae_m": amsl + self.geoid_separation_m,        # heartbeat_core.py:132
+            "altitude_hae_m": amsl + self.geoid_separation_m,        # heartbeat_core.py:139
             "depth_m": 0.0,
             "vehicle_type": self.vehicle_type,
             "current_task": CURRENT_TASK,
             "flight_phase": phase,
-            "roll_deg": math.degrees(attitude[0]),                   # heartbeat_core.py:145
+            "roll_deg": math.degrees(attitude[0]),                   # heartbeat_core.py:152
             "pitch_deg": math.degrees(attitude[1]),
         }
         return hb, source
@@ -292,6 +292,17 @@ class HeartbeatSynth:
         if pose is None or (pose[0] == 0.0 and pose[1] == 0.0):
             return None
         return pose[0], pose[1]
+
+    def home_hae_m(self, now: float) -> Optional[float]:
+        """Home's altitude above the WGS84 ellipsoid: GLOBAL_POSITION_INT alt (AMSL) minus relative_alt
+        (above home) is home's AMSL, plus geoid_separation_m -- the same conversion as altitude_hae_m.
+        FENCE_ALT_MAX is measured from home, so this + FENCE_ALT_MAX is the ceiling in RoboCommand's
+        terms. None without a fresh position (or at the 0,0 of an EKF without an origin) or a geoid
+        separation: a blank, never a guess."""
+        pose = _fresh(self._pose, now, self.timeouts.pose_s)
+        if pose is None or (pose[0] == 0.0 and pose[1] == 0.0) or self.geoid_separation_m is None:
+            return None
+        return pose[4] - pose[5] + self.geoid_separation_m
 
     def flight_age(self, now: float) -> Optional[float]:
         """Seconds since EXTENDED_SYS_STATE was last heard (any age), None if never."""

@@ -1,42 +1,42 @@
-"""geofence — the UAV geofence for the course in hand, and the gate on declaring an aircraft.
+"""geofence — RoboCommand's polygon for the course in hand, and what a declaration with an aircraft carries.
 
 Pure: no sockets, no clock of its own, no protobuf. bridge.py holds the state and
 the connections; this file holds the geometry and the rules, so they can be
 exercised on a laptop with nothing running -- the split active.py and runstate.py
 already use.
 
-WHERE THE FENCE COMES FROM, "table, else the boundary". There are four courses
-(ALPHA .. DELTA), each a different place, so one static polygon in bridge.toml
-was only ever right for one of them. When RoboCommand's RxCourse is accepted the
-OCS works out THIS course's fence:
+THE WORKFLOW (Chase, 7 Nov 2026). The OCS is read-only on the aircraft but for one
+polygon, and it declares only what the aircraft itself holds:
 
-  1. If bridge.toml has a `[[geofence.course]]` entry for that course_id, use it --
-     but only if every vertex lies inside the course boundary (or within
-     TABLE_TOLERANCE_M of it). An entry that is outside is a typed-in fence for the
-     wrong place, and it is refused with the vertex named. It never falls through
-     to (2): a table entry somebody wrote on purpose and got wrong must be seen,
-     not quietly replaced by something they did not choose.
-  2. Otherwise the boundary itself, shrunk INWARD by `[geofence] boundary_margin_m`.
-     Handbook 3.4.10: RoboCommand validates the declared fence against the course
-     boundary. A fence that IS the boundary sits exactly on the line where a
-     float-rounding comparison can reject it, so the vertices are pulled inside by
-     a margin (default 2 m) that is the operator's to change.
+  1. RoboCommand's RxCourse arrives. `for_course` turns it into ROBOCOMMAND'S
+     POLYGON: the course joined with its UAV transit area, shrunk INWARD by
+     `[geofence] boundary_margin_m`. The bridge sends it to the aircraft in
+     `ocs_info`, and fleet_link's fence_upload puts it on the autopilot as an
+     inclusion polygon, so QGC shows it.
+  2. The pilot draws Ekko's OWN fence inside it in QGC, uploads it, and sets
+     FENCE_ALT_MAX.
+  3. fleet_link reads the autopilot every 30 s while it is disarmed and sends what
+     it holds (`ocs_fence`: every shape, the FENCE_* params, home HAE).
+     `aircraft_fence` picks what a declaration carries from that read: the ONE
+     inclusion polygon that is not RoboCommand's, and the ceiling home HAE +
+     FENCE_ALT_MAX. Nothing is typed into the OCS and nothing is made up.
 
-No course yet means no fence (NO_COURSE): there is nothing to be inside of. And
-NO FENCE IS NEVER A GUESS -- when the table entry is bad, or the boundary is not
-a shape the inset is trustworthy for (it must be a simple CONVEX polygon, and the
-inset must not collapse it), the answer is `polygon=None` with the reason, and the
-operator is told loudly. A convex polygon is required because the inset offsets
-every edge inward and joins neighbours; at a reflex corner that join is a
-different construction altogether, and a wrong fence that looks right is exactly
-what this OCS exists to avoid.
+THE INSET. Handbook 3.4.10: RoboCommand validates a declared fence against the
+course. A polygon that IS the boundary sits exactly on the line where a
+float-rounding comparison can reject it, so the vertices are pulled inside by a
+margin (default 2 m) that is the operator's to change. No course yet means no
+polygon (NO_COURSE): there is nothing to be inside of. And NO POLYGON IS NEVER A
+GUESS -- when the boundary is not a shape the inset is trustworthy for (it must be
+a simple CONVEX polygon, and the inset must not collapse it), the answer is
+`polygon=None` with the reason. A convex polygon is required because the inset
+offsets every edge inward and joins neighbours; at a reflex corner that join is a
+different construction altogether. Without it nothing is put on the aircraft, and
+the pilot draws against the course on /map instead.
 
-THE GATE. An aircraft whose autopilot is not KNOWN to hold the declared fence is
-not declared. The knowledge is a frame the radio adapter sends after reading the
-fence back from the autopilot (`ocs_fence`, docs/VEHICLE_LINK.md), and the rule
-for believing it is `confirmation_problem` below: verified, the same polygon, and
-recent. The adapter writes the fence; this file decides whether the OCS may rely
-on that having happened.
+THE GATE. An aircraft is declared only from a RECENT read of its autopilot holding
+exactly one polygon of the pilot's and a known ceiling (`aircraft_fence`), and only
+when that passes RoboCommand's own rule (`rc_declaration_problems`), which it
+applies SILENTLY.
 
 GEOMETRY. Lat/lon are turned into a local flat metre frame around the boundary's
 mean vertex with the WGS84 radii of curvature at that latitude. At course scale
@@ -55,14 +55,10 @@ LatLon = tuple[float, float]
 #: the boundary, never on it -- see the module docstring. Chase's to change.
 DEFAULT_MARGIN_M = 2.0
 
-#: `[geofence] confirm_max_age_s` when bridge.toml says nothing. The adapter
-#: re-verifies every 60 s, so three of its cycles can be lost before the OCS stops
-#: believing the aircraft still holds the fence.
+#: `[geofence] confirm_max_age_s` when bridge.toml says nothing. The adapter reads
+#: the autopilot every 30 s while it is disarmed, so several reads can be lost
+#: before the OCS stops believing what the last one said.
 DEFAULT_CONFIRM_MAX_AGE_S = 180.0
-
-#: How far outside the boundary a `[[geofence.course]]` vertex may be and still
-#: count as inside it: the width of a hand-typed coordinate, not of a mistake.
-TABLE_TOLERANCE_M = 0.5
 
 #: How far a vertex where the course meets its transit area may sit off the straight
 #: line through its neighbours and still be no corner. The two rings share the seam's
@@ -102,13 +98,14 @@ _E2 = 6.69437999014e-3
 
 @dataclass(frozen=True)
 class CourseFence:
-    """The UAV geofence for the course in hand, or the reason there is none."""
+    """RoboCommand's polygon for the course in hand (what is put on the aircraft for the
+    pilot to draw inside), or the reason there is none."""
 
     course_id: str | None
-    #: CLOSED (first == last), as RunDeclaration.uav_geofence needs it. None = none.
+    #: CLOSED (first == last), as `ocs_info.uav_geofence` carries it. None = none.
     polygon: tuple[LatLon, ...] | None = None
-    #: Where it came from: "table: ALPHA", "course boundary inset 2.0 m". None when
-    #: there is no fence.
+    #: How it was made: "course + transit area inset 2.0 m", "course boundary inset
+    #: 2.0 m". None when there is none.
     source: str | None = None
     #: Why there is no fence. None when there is one.
     reason: str | None = None
@@ -164,31 +161,6 @@ def _signed_area(pts) -> float:
     return 0.5 * sum(_cross(*pts[i], *pts[(i + 1) % n]) for i in range(n))
 
 
-def _inside(p, ring) -> bool:
-    """Even-odd ray cast: is `p` inside the ring (any simple polygon)?"""
-    x, y = p
-    inside = False
-    n = len(ring)
-    for i in range(n):
-        (x1, y1), (x2, y2) = ring[i], ring[(i + 1) % n]
-        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
-            inside = not inside
-    return inside
-
-
-def _dist_to_ring(p, ring) -> float:
-    """Metres from `p` to the nearest point on the ring's edges."""
-    best = math.inf
-    n = len(ring)
-    for i in range(n):
-        (x1, y1), (x2, y2) = ring[i], ring[(i + 1) % n]
-        dx, dy = x2 - x1, y2 - y1
-        L2 = dx * dx + dy * dy
-        t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((p[0] - x1) * dx + (p[1] - y1) * dy) / L2))
-        best = min(best, math.hypot(p[0] - (x1 + t * dx), p[1] - (y1 + t * dy)))
-    return best
-
-
 def _distinct(pts):
     """Consecutive near-duplicates removed, and a repeated closing vertex too."""
     out: list = []
@@ -228,7 +200,7 @@ def _inset(pts, margin: float):
     """(inset ring in the same order, None, None) or (None, why not, kind).
 
     `kind` is "shape" when the boundary is not something an inset is trustworthy for
-    (only a table entry can help) and "margin" when the margin is the problem (a
+    (only drawing it by hand can help) and "margin" when the margin is the problem (a
     smaller one would also do).
 
     `pts` is the boundary in local metres, open (no repeated closing vertex), in
@@ -315,24 +287,28 @@ def _valid_ll(points) -> bool:
                for a, b in points)
 
 
-def for_course(course_id: str, corners, table, margin_m: float, transit=()) -> CourseFence:
-    """The UAV geofence for a course: the table entry, else the boundary inset.
+#: Said whenever RoboCommand's polygon cannot be made: nothing is put on the aircraft.
+_DRAW_ANYWAY = ("so nothing is put on the aircraft for this course -- draw Ekko's fence in QGC "
+                "against the course on /map")
+
+
+def for_course(course_id: str, corners, margin_m: float, transit=()) -> CourseFence:
+    """RoboCommand's polygon for a course: the course (joined with its transit area)
+    inset by `margin_m`.
 
     corners   [(lat, lon), ...] as RoboCommand sent them -- open or closed, either
               winding.
-    table     {course_id: closed ((lat, lon), ...)} from `[[geofence.course]]`.
     margin_m  `[geofence] boundary_margin_m`.
     transit   RxCourse.uav_transit_area, the same way, or empty. RoboCommand accepts a
               fence anywhere in the course OR this area, which is where Ekko takes off
-              and lands; a course-only fence leaves the launch point outside it.
+              and lands; a course-only polygon leaves the launch point outside it.
 
     With a transit area that shares a whole edge with the course, the inset is of the
     two together; when they cannot be joined (no shared edge, or not convex together)
-    the course alone is inset as before and `source` says the transit area was left
-    out. A table entry is checked against course and transit area together.
+    the course alone is inset and `source` says the transit area was left out.
 
     Returns a CourseFence; `polygon` is None, with `reason`, whenever the answer
-    is "no fence". Never raises on a bad course: a frame we cannot make a fence
+    is "none". Never raises on a bad course: a frame we cannot make a polygon
     from is a finding, and the OCS stays up to show it.
     """
     cid = course_id or "?"
@@ -356,14 +332,10 @@ def for_course(course_id: str, corners, table, margin_m: float, transit=()) -> C
             left_out = "it has only %d distinct point(s)" % len(tring)
             tring = []
 
-    entry = table.get(course_id)
-    if entry is not None:
-        return _from_table(cid, entry, [ring] + ([tring] if tring else []), frame)
-
     if len(ring) < 3:
         return CourseFence(cid, reason=(
             "the course boundary has only %d distinct corner(s), not enough to "
-            "inset: add a [[geofence.course]] entry for %s" % (len(ring), cid)))
+            "inset, %s" % (len(ring), _DRAW_ANYWAY)))
     if tring:
         union, left_out = _union(ring, tring)
         if union is not None:
@@ -375,15 +347,14 @@ def for_course(course_id: str, corners, table, margin_m: float, transit=()) -> C
             left_out = "course and transit area together: %s" % why
     inset, why, kind = _inset(ring, margin_m)
     if inset is None:
-        advice = ("lower [geofence] boundary_margin_m or add a" if kind == "margin"
-                  else "add a")
-        return CourseFence(cid, reason="%s: %s [[geofence.course]] entry for %s"
-                                       % (why, advice, cid))
+        return CourseFence(cid, reason="%s for %s, %s%s" % (
+            why, cid, _DRAW_ANYWAY,
+            " (or lower [geofence] boundary_margin_m)" if kind == "margin" else ""))
     open_ring = [frame.ll(x, y) for x, y in inset]
     source = "course boundary inset %s m" % fmt_m(margin_m)
     if left_out:
-        source += ("; transit area NOT included (%s) -- add a [[geofence.course]] entry "
-                   "to use it" % left_out)
+        source += ("; transit area NOT included (%s) -- a fence drawn in QGC may still "
+                   "use it" % left_out)
     return CourseFence(cid, tuple(open_ring) + (open_ring[0],), source=source)
 
 
@@ -416,48 +387,6 @@ def _union(ring, tring):
                         del out[k]
                 return out, None
     return None, "it shares no whole edge with the course boundary"
-
-
-def _from_table(cid: str, entry, areas, frame: _Frame) -> CourseFence:
-    """A `[[geofence.course]]` entry, if and only if all of it -- every point along every
-    edge, as RoboCommand checks it -- lies inside the course or the transit area."""
-    ring = areas[0]
-    if len(ring) < 3:
-        return CourseFence(cid, reason=(
-            "the table fence for %s cannot be checked: the course boundary has only "
-            "%d distinct corner(s)" % (cid, len(ring))))
-    where = "the course boundary" if len(areas) == 1 else "the course and transit area"
-
-    def outside_by(p) -> float:
-        return min(0.0 if _inside(p, a) else _dist_to_ring(p, a) for a in areas)
-
-    outside = []
-    for i, (lat, lon) in enumerate(entry[:-1], start=1):
-        d = outside_by(frame.xy(lat, lon))
-        if d > TABLE_TOLERANCE_M:
-            outside.append((i, lat, lon, d))
-    if outside:
-        i, lat, lon, d = outside[0]
-        more = "" if len(outside) == 1 else " (and %d more vertices outside)" % (
-            len(outside) - 1)
-        return CourseFence(cid, reason=(
-            "the [[geofence.course]] entry for %s is outside %s: "
-            "vertex %d [%s, %s] is %.1f m outside it%s -- no fence for this course "
-            "until the entry is fixed or removed"
-            % (cid, where, i, repr(lat), repr(lon), d, more)))
-    # Every vertex inside is not every edge inside: one across a notch leaves.
-    pts = [frame.xy(lat, lon) for lat, lon in entry]
-    for i, (p, q) in enumerate(zip(pts, pts[1:]), start=1):
-        steps = max(1, math.ceil(math.dist(p, q) / RC_EDGE_STEP_M))
-        worst = max(outside_by((p[0] + (q[0] - p[0]) * k / steps, p[1] + (q[1] - p[1]) * k / steps))
-                    for k in range(steps + 1))
-        if worst > TABLE_TOLERANCE_M:
-            return CourseFence(cid, reason=(
-                "the [[geofence.course]] entry for %s leaves %s along edge %d-%d, by "
-                "%.1f m -- no fence for this course until the entry is fixed or removed"
-                % (cid, where, i, i + 1 if i < len(pts) - 1 else 1, worst)))
-    return CourseFence(cid, tuple((float(a), float(b)) for a, b in entry),
-                       source="table: %s" % cid)
 
 
 # ---- RoboCommand's own check of a declaration -------------------------------
@@ -527,23 +456,100 @@ def rc_declaration_problems(fence, corners, transit, ceiling_m,
             problems.append("uav_geofence leaves the course and transit area by %.1f m at %s"
                             % (worst, where))
     if ceiling_m is None:
-        problems.append("uav_geofence_max_altitude_hae_m is not set: [geofence] "
-                        "max_altitude_hae_m in bridge.toml")
+        problems.append("uav_geofence_max_altitude_hae_m is not set")
     elif not 0 < ceiling_m <= max_ceiling_m:
         problems.append("uav_geofence_max_altitude_hae_m is %g: it must be above 0 and at most %g"
                         % (ceiling_m, max_ceiling_m))
     return problems
 
 
-# ---- the gate on declaring an aircraft --------------------------------------
+# ---- what the radio adapter read off the autopilot --------------------------
+
+#: FENCE_TYPE bit 0: the altitude ceiling, FENCE_ALT_MAX (metres above home).
+FENCE_TYPE_ALT_MAX = 1
+#: FENCE_TYPE bit 2: inclusion/exclusion circles and polygons.
+FENCE_TYPE_POLYGON = 4
+#: FENCE_OPTIONS bit 1: inclusion areas are a UNION (ArduPilot's default is their intersection).
+FENCE_OPTIONS_UNION = 2
+
+
+def _finite(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _finite_pair(p) -> bool:
+    return isinstance(p, (list, tuple)) and len(p) == 2 and all(_finite(v) for v in p)
+
+
+def _latlons_or_why(raw, what: str):
+    """[[lat, lon], ...] of finite numbers -> (list, None), or (None, why not)."""
+    if not isinstance(raw, list):
+        return None, "%s must be a list of [lat, lon] or null" % what
+    for p in raw:
+        if not _finite_pair(p):
+            return None, "%s holds %r, not a finite [lat, lon]" % (what, p)
+    return [[float(p[0]), float(p[1])] for p in raw], None
+
+
+def _shapes_or_why(raw):
+    """The adapter's `shapes` (fleet/fence_upload.shapes) -> (list, None), or (None, why not).
+    Absent stays None: never read, which is not the same as read and empty."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, list):
+        return None, "shapes must be a list or null"
+    out = []
+    for n, s in enumerate(raw):
+        if not isinstance(s, dict) or not isinstance(s.get("inclusion"), bool):
+            return None, "shape %d is not {type, inclusion, ...}" % n
+        if s.get("type") == "polygon":
+            pts, why = _latlons_or_why(s.get("points"), "shape %d's points" % n)
+            if why:
+                return None, why
+            if len(pts) < 3:
+                return None, "shape %d is a polygon of %d point(s)" % (n, len(pts))
+            out.append({"type": "polygon", "inclusion": s["inclusion"], "points": pts})
+        elif s.get("type") == "circle":
+            if not (_finite_pair(s.get("center")) and _finite(s.get("radius_m"))):
+                return None, "shape %d is a circle without a finite center and radius_m" % n
+            out.append({"type": "circle", "inclusion": s["inclusion"],
+                        "center": [float(v) for v in s["center"]], "radius_m": float(s["radius_m"])})
+        else:
+            return None, "shape %d has type %r, not polygon or circle" % (n, s.get("type"))
+    return out, None
+
+
+def _params_or_why(raw):
+    """The adapter's FENCE_* `params` -> (dict, None), or (None, why not). A name that is
+    not a FENCE_* parameter is not ours to judge and is left out."""
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return None, "params must be an object or null"
+    out = {}
+    for name, v in raw.items():
+        if not (isinstance(name, str) and name.startswith("FENCE_") and len(name) <= 16):
+            continue
+        if v is not None and not _finite(v):
+            return None, "params.%s must be a number or null, got %r" % (name, v)
+        out[name] = None if v is None else float(v)
+    return out, None
+
 
 def parse_confirmation(raw):
     """An `ocs_fence` body -> (the fields we keep, None), or (None, why it is bad).
 
-    Strict about types and loose about omissions: `verified` is the field the gate
-    trusts, so it must be a real boolean; the free-text fields are cut to a length
-    the page can show. An absent polygon is None, never an empty list -- "the
-    autopilot holds nothing" is `[]`, which the adapter says on purpose.
+    Strict about types and loose about omissions: a field an older adapter does not
+    send is None, and the gate then has nothing to go on rather than something wrong.
+    The free-text fields are cut to a length the page can show.
+
+      polygon     RoboCommand's (open) polygon the adapter was told to put on the
+                  autopilot, or None; `verified` whether it was among the autopilot's
+                  inclusion polygons at the last read, `verified_at` when.
+      read_at     when the autopilot's fence was last read (RFC 3339); None: never.
+      shapes      everything it held then (fleet/fence_upload.shapes); None: never read.
+      params      the FENCE_* parameters as last heard; one never heard is None.
+      home_hae_m  home altitude above the WGS84 ellipsoid at that read, or None.
     """
     if not isinstance(raw, dict):
         return None, "ocs_fence is not an object"
@@ -555,31 +561,38 @@ def parse_confirmation(raw):
         return None, "verified must be true or false, got %r" % (verified,)
     poly = raw.get("polygon")
     if poly is not None:
-        if not isinstance(poly, list):
-            return None, "polygon must be a list of [lat, lon] or null"
-        clean = []
-        for p in poly:
-            ok = (isinstance(p, (list, tuple)) and len(p) == 2
-                  and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                          and math.isfinite(v) for v in p))
-            if not ok:
-                return None, "polygon holds %r, not a finite [lat, lon]" % (p,)
-            clean.append([float(p[0]), float(p[1])])
-        poly = clean
-    at = raw.get("verified_at")
-    if at is not None and not isinstance(at, str):
-        return None, "verified_at must be an RFC 3339 string or null"
+        poly, why = _latlons_or_why(poly, "polygon")
+        if why:
+            return None, why
+    for key in ("verified_at", "read_at"):
+        v = raw.get(key)
+        if v is not None and not isinstance(v, str):
+            return None, "%s must be an RFC 3339 string or null" % key
     for key in ("state", "reason", "lockout"):
         v = raw.get(key)
         if v is not None and not isinstance(v, str):
             return None, "%s must be a string or null" % key
+    shapes, why = _shapes_or_why(raw.get("shapes"))
+    if why:
+        return None, why
+    params, why = _params_or_why(raw.get("params"))
+    if why:
+        return None, why
+    home = raw.get("home_hae_m")
+    if home is not None and not _finite(home):
+        return None, "home_hae_m must be a number or null, got %r" % (home,)
+    at, read_at = raw.get("verified_at"), raw.get("read_at")
     return {"vehicle_id": vid,
             "state": str(raw.get("state") or "")[:32],
             "polygon": poly,
             "verified": verified,
             "verified_at": at[:40] if at else None,
             "reason": str(raw.get("reason") or "")[:300],
-            "lockout": (str(raw["lockout"])[:300] if raw.get("lockout") else None)}, None
+            "lockout": (str(raw["lockout"])[:300] if raw.get("lockout") else None),
+            "read_at": read_at[:40] if read_at else None,
+            "shapes": shapes,
+            "params": params,
+            "home_hae_m": None if home is None else float(home)}, None
 
 
 def parse_utc(text) -> float | None:
@@ -596,10 +609,11 @@ def parse_utc(text) -> float | None:
     return when.timestamp()
 
 
-def age_s(confirm: dict | None, now: float) -> float | None:
-    """Seconds since the confirmation's read-back, by the OCS clock. None when it
-    carries no usable `verified_at` -- a blank, not a guess."""
-    at = parse_utc(confirm.get("verified_at")) if confirm else None
+def age_s(confirm: dict | None, now: float, key: str = "read_at") -> float | None:
+    """Seconds since the confirmation's `key` time (the read; "verified_at" for when
+    RoboCommand's polygon was last seen on it), by the OCS clock. None when it carries
+    no usable time -- a blank, not a guess."""
+    at = parse_utc(confirm.get(key)) if confirm else None
     return None if at is None else now - at
 
 
@@ -611,49 +625,151 @@ def same_polygon(a, b, tol: float = MATCH_TOL_DEG) -> bool:
                for p, q in zip(a, b))
 
 
+def same_ring(a, b, tol: float = MATCH_TOL_DEG) -> bool:
+    """Two OPEN polygons that are one ring: from any starting vertex, in either
+    direction, each coordinate within `tol` degrees. QGC keeps the order it downloaded;
+    a polygon put back by hand need not."""
+    if not a or not b or len(a) != len(b):
+        return False
+    n = len(a)
+    for ring in (list(b), list(b)[::-1]):
+        for k in range(n):
+            if same_polygon(a, ring[k:] + ring[:k], tol):
+                return True
+    return False
+
+
 def matches(fence: CourseFence, confirm: dict | None) -> bool:
-    """Does this confirmation's polygon equal the open form of the fence?"""
+    """Was the adapter told the polygon the bridge holds now (is it up to date)?"""
     return (fence.polygon is not None and confirm is not None
             and same_polygon(confirm.get("polygon"), fence.open_polygon))
 
 
-def confirmation_problem(vid: str, fence: CourseFence, confirm: dict | None,
-                         now: float, max_age_s: float) -> str | None:
-    """Why `vid` may not be declared, or None when its autopilot is known to hold
-    the fence. The rule, in the order the operator can act on it:
+# ---- what a declaration with an aircraft carries ----------------------------
 
-      * there must be a fence for this course at all;
-      * the aircraft's latest `ocs_fence` must say `verified` (read back);
-      * its polygon must equal the fence, each coordinate within 1e-6 deg;
-      * and that read-back must be no older than `max_age_s` by OUR clock.
+@dataclass(frozen=True)
+class AircraftFence:
+    """What a declaration with this aircraft would carry, read off its own autopilot,
+    or why it cannot be declared. `problems` empty: nothing on the aircraft's side stops
+    it -- RoboCommand's own rule is judged on top (declaration_problems)."""
 
-    The message names the vehicle and the one thing that is missing.
+    vehicle_id: str
+    #: The pilot's polygon, CLOSED, as RunDeclaration.uav_geofence carries it. None: none.
+    polygon: tuple[LatLon, ...] | None = None
+    #: Home HAE + FENCE_ALT_MAX: RunDeclaration.uav_geofence_max_altitude_hae_m. None: unknown.
+    ceiling_hae_m: float | None = None
+    #: How the ceiling was made, for the page and a refusal.
+    ceiling_from: str | None = None
+    #: Why it cannot be declared, in the order the operator can act on them.
+    problems: tuple[str, ...] = ()
+    #: Worth knowing before flight, never a reason to refuse.
+    notes: tuple[str, ...] = ()
+    #: Seconds since the read, by the OCS clock; None when there has been none.
+    read_age_s: float | None = None
+
+
+def aircraft_fence(vid: str, confirm: dict | None, ours, now: float,
+                   max_age_s: float) -> AircraftFence:
+    """What a declaration with `vid` carries, from its latest `ocs_fence` (as
+    parse_confirmation keeps it).
+
+    ours  OPEN polygons the OCS put there itself -- RoboCommand's for the course in
+          hand, and the one the adapter says it was told -- which are never the pilot's.
+
+    The rule, in the order the operator can act on it:
+      * a read of the autopilot no older than `max_age_s` by OUR clock (the adapter
+        reads only while the aircraft is disarmed and heard on the radio);
+      * among the inclusion polygons it held, exactly ONE that is not one of `ours`:
+        the pilot's, drawn in QGC. RunDeclaration carries a single polygon, and the
+        OCS never chooses between two of the pilot's;
+      * FENCE_ALT_MAX and home HAE both known: the ceiling is their sum.
     """
-    if fence.polygon is None:
-        return ("%s: no UAV geofence for this course (%s) -- an aircraft cannot be "
-                "declared without one" % (vid, fence.reason or "none"))
-    cid = fence.course_id or "this course"
+    def refused(why: str, age=None) -> AircraftFence:
+        return AircraftFence(vid, problems=(why,), read_age_s=age)
+
     if confirm is None:
-        return ("%s: autopilot fence not confirmed (no ocs_fence received from it yet)"
-                % vid)
-    if not confirm.get("verified"):
-        detail = confirm.get("reason") or "no reason given"
-        return ("%s: autopilot fence not confirmed (state %s: %s)"
-                % (vid, confirm.get("state") or "unknown", detail))
-    if not matches(fence, confirm):
-        poly = confirm.get("polygon")
-        what = ("it was cleared: no polygon" if poly == []
-                else "it holds no polygon at all" if poly is None
-                else "%d vertices, the fence has %d" % (len(poly), fence.vertices))
-        return ("%s: autopilot holds a different polygon than the %s fence (%s)"
-                % (vid, cid, what))
+        return refused("%s: nothing read from its autopilot yet (no ocs_fence: is fleet_link "
+                       "running, and the radio up?)" % vid)
+    if confirm.get("read_at") is None or confirm.get("shapes") is None:
+        return refused("%s: its autopilot's fence has not been read yet (%s)"
+                       % (vid, confirm.get("reason") or confirm.get("state") or "no reason given"))
     age = age_s(confirm, now)
     if age is None:
-        return ("%s: fence confirmation has no readable verified_at, so its age "
-                "is unknown" % vid)
+        return refused("%s: the fence read has no readable read_at, so its age is unknown" % vid)
     if age < -_FUTURE_S:
-        return ("%s: fence confirmation is dated %.0f s in the future -- the clocks "
-                "disagree" % (vid, -age))
+        return refused("%s: the fence read is dated %.0f s in the future -- the clocks disagree"
+                       % (vid, -age), age)
     if age > max_age_s:
-        return "%s: fence confirmation %.0f s old (limit %.0f s)" % (vid, age, max_age_s)
-    return None
+        return refused("%s: its autopilot's fence was last read %.0f s ago (limit %.0f s) -- it is "
+                       "read only while disarmed and heard on the radio" % (vid, age, max_age_s), age)
+
+    shapes = confirm["shapes"]
+    polygons = [[(p[0], p[1]) for p in s["points"]] for s in shapes
+                if s["type"] == "polygon" and s["inclusion"]]
+    ours = [o for o in ours if o]
+    pilots = [p for p in polygons if not any(same_ring(p, o) for o in ours)]
+    problems, notes = [], []
+    polygon = None
+    if len(pilots) == 1:
+        polygon = tuple(pilots[0]) + (pilots[0][0],)
+    elif not pilots:
+        problems.append("%s: its autopilot holds %s -- draw Ekko's own fence %s in QGC and upload it"
+                        % (vid, "only RoboCommand's polygon" if polygons else "no inclusion polygon",
+                           "inside RoboCommand's" if polygons else "inside the course"))
+    else:
+        problems.append("%s: its autopilot holds %d inclusion polygons besides RoboCommand's, and a "
+                        "declaration carries one -- leave only Ekko's own in QGC" % (vid, len(pilots)))
+
+    params = confirm.get("params") or {}
+    alt_max, home = params.get("FENCE_ALT_MAX"), confirm.get("home_hae_m")
+    ceiling = ceiling_from = None
+    if alt_max is None:
+        problems.append("%s: FENCE_ALT_MAX has not been read from its autopilot, so there is no "
+                        "ceiling to declare" % vid)
+    elif home is None:
+        problems.append("%s: its home altitude is unknown (no fresh position on the radio at the "
+                        "read, or fleet.toml geoid_separation_m unset), so there is no ceiling to "
+                        "declare" % vid)
+    else:
+        ceiling = round(home + alt_max, 2)
+        ceiling_from = "home %s m HAE + FENCE_ALT_MAX %s m" % (fmt_m(home), fmt_m(alt_max))
+
+    ftype, enable, auto, options = (params.get(n) for n in (
+        "FENCE_TYPE", "FENCE_ENABLE", "FENCE_AUTOENABLE", "FENCE_OPTIONS"))
+    if ftype is not None and not int(ftype) & FENCE_TYPE_POLYGON:
+        notes.append("FENCE_TYPE %g has no polygon bit (4): the autopilot does not enforce the "
+                     "polygon" % ftype)
+    if ftype is not None and not int(ftype) & FENCE_TYPE_ALT_MAX:
+        notes.append("FENCE_TYPE %g has no altitude bit (1): FENCE_ALT_MAX, the declared ceiling, "
+                     "is not enforced" % ftype)
+    if enable == 0 and auto == 0:
+        notes.append("the fence is off (FENCE_ENABLE 0, FENCE_AUTOENABLE 0): enable it in QGC "
+                     "before flight")
+    if options is not None and int(options) & FENCE_OPTIONS_UNION and len(polygons) > 1:
+        notes.append("FENCE_OPTIONS %g makes the inclusion areas a union: the aircraft is held "
+                     "to the largest of them, not to the polygon declared" % options)
+    circles = sum(1 for s in shapes if s["type"] == "circle")
+    exclusions = sum(1 for s in shapes if s["type"] == "polygon" and not s["inclusion"])
+    if circles or exclusions:
+        notes.append("its autopilot also holds %s: enforced by it, never declared" % " and ".join(
+            "%d %s%s" % (n, what, "" if n == 1 else "s")
+            for n, what in ((circles, "circle"), (exclusions, "exclusion polygon")) if n))
+    return AircraftFence(vid, polygon, ceiling, ceiling_from, tuple(problems), tuple(notes), age)
+
+
+def declaration_problems(af: AircraftFence, corners, transit,
+                         max_ceiling_m: float = RC_MAX_CEILING_HAE_M) -> list[str]:
+    """Everything that keeps `af` out of a declaration: the aircraft's own problems, then
+    RoboCommand's rule (rc_declaration_problems) on the polygon and ceiling read off it,
+    each naming the aircraft and where the value came from."""
+    out = list(af.problems)
+    for p in rc_declaration_problems(af.polygon, corners, transit, af.ceiling_hae_m, max_ceiling_m):
+        if p.startswith("uav_geofence_max_altitude_hae_m"):
+            if af.ceiling_hae_m is None:
+                continue                       # af.problems says why there is none
+            p += " (%s%s)" % (af.ceiling_from, "; lower FENCE_ALT_MAX in QGC"
+                              if af.ceiling_hae_m > max_ceiling_m else "")
+        else:
+            p += " (the polygon drawn in QGC)"
+        out.append("%s: %s" % (af.vehicle_id, p))
+    return out

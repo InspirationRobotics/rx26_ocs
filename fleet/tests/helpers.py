@@ -224,7 +224,9 @@ class FakeAutopilot:
     our next frame(s) of a type before they arrive, `drop_replies` loses its own next reply of a
     type, `nack` rejects every upload with that MAV_MISSION_RESULT, `nack_without_polygon_bit`
     rejects one while FENCE_TYPE lacks bit 4 (as Ekko's bring-up notes), `shift_m` commits every
-    vertex that far north (a readback mismatch), `silent_missions` answers no mission traffic."""
+    vertex that far north (a readback mismatch), `silent_missions` answers no mission traffic,
+    `deny_downloads` answers that many fence downloads with MISSION_ACK DENIED (as ArduPilot does while
+    QGC is uploading)."""
 
     def __init__(self, *, params=None, fence=None, sysid=1, compid=1):
         self.params = dict({"FENCE_TYPE": 7.0, "FENCE_ENABLE": 0.0, "FENCE_AUTOENABLE": 0.0}
@@ -240,7 +242,8 @@ class FakeAutopilot:
         self.nack_without_polygon_bit = True
         self.shift_m = 0.0
         self.silent_missions = False
-        self.on_count = None                             # called when an upload's MISSION_COUNT arrives
+        self.deny_downloads = 0
+        self.on_count = None                            # called when an upload's MISSION_COUNT arrives
         self.uploads = 0                                 # completed (committed) uploads
         self._recv = None                                # an upload in progress: [item or None]
         self._recv_from = None
@@ -266,6 +269,10 @@ class FakeAutopilot:
         if getattr(msg, "mission_type", None) != 1 or self.silent_missions:
             return
         if name == "MISSION_REQUEST_LIST":
+            if self.deny_downloads:
+                self.deny_downloads -= 1
+                self._reply("MISSION_ACK", "mission_ack", *src, 14, 1)      # MAV_MISSION_DENIED
+                return
             self._reply("MISSION_COUNT", "mission_count", *src, len(self.fence), 1)
         elif name == "MISSION_REQUEST_INT":
             if msg.seq < len(self.fence):

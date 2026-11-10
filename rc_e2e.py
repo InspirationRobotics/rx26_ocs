@@ -42,6 +42,7 @@ sys.path.insert(0, str(HERE))
 from bench_stage2 import _PKG  # noqa: E402,F401 -- puts the boat's package on sys.path
 from crusader_groundstation.ocs_link import OcsLink, fake_report, rfc3339  # noqa: E402
 from rc_box_tests import centre_of  # noqa: E402
+from fake_vehicle import fence_read, open_polygon, pilot_polygon  # noqa: E402
 
 BOX = "inspiration@192.168.65.2"
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", BOX]
@@ -119,8 +120,10 @@ def set_key(text: str, section: str, key: str, value: str) -> str:
 
 
 def isolated(text: str, tmp: Path) -> str:
-    """bridge.toml with the run state in `tmp`, the vehicle link on loopback, no beacon."""
-    for section, key, value in (("tcp", "host", '"127.0.0.1"'),
+    """bridge.toml with the run state in `tmp`, the vehicle link on loopback, no beacon, and
+    RoboCommand pinned to the sim box rather than searched for."""
+    for section, key, value in (("robocommand", "host", '"%s"' % BOX.split("@")[-1]),
+                                ("tcp", "host", '"127.0.0.1"'),
                                 ("discovery", "enabled", "false"),
                                 ("paths", "seq_store", '"%s"' % (tmp / "seq.json").as_posix()),
                                 ("paths", "wire_log", '"%s"' % (tmp / "wire").as_posix())):
@@ -254,11 +257,9 @@ class Vehicle:
             self._owe_fence.set()
 
     def _fence_frame(self) -> dict:
-        poly = [[p["latitude"], p["longitude"]] for p in self.fence[:-1]]     # OPEN form
-        return {"ocs_fence": {"vehicle_id": self.vid, "state": "done", "polygon": poly,
-                              "verified": True, "verified_at": rfc3339(),
-                              "reason": "written and read back: %d vertices" % len(poly),
-                              "lockout": None}}
+        rc = open_polygon(self.fence)
+        return fence_read(self.vid, rc, [rc, pilot_polygon(rc)],
+                          "written and read back: %d vertices, the pilot's inside" % len(rc))
 
     def _heartbeat(self) -> dict:
         r = fake_report(self.vid, TEAM, self._t0)
@@ -399,8 +400,9 @@ TESTS = [
      "absent": [{"type": "request", "team": TEAM}], "timeout_s": 6,
      "act": act_declare_blank},
     {"id": "E3", "title": "With a call sign, RoboCommand accepts the fence and starts the run",
-     "doing": "Declaring again with call sign %s: USV1 + UAV1, the course fence, ceiling "
-              "40 m HAE." % CALLSIGN,
+     "doing": "Declaring again with call sign %s: USV1 + UAV1, the stand-in pilot's fence "
+              "read off UAV1 (inside the course fence), ceiling 39 m HAE (home 9 + "
+              "FENCE_ALT_MAX 30)." % CALLSIGN,
      "expect": "A blue REQUEST card from ASTA with the call sign and ceiling, the server's "
                "'geofence and ceiling OK', then a green COMMAND run_start for ASTA.",
      "match": [{"type": "request", "kind": "run_declaration", "team": TEAM,

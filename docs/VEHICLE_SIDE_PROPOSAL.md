@@ -254,7 +254,7 @@ codec already names.
    or derive HAE from the receiver (E5)? The OCS stand-in copies whatever the
    aircraft uses.
 2. **`current_task`.** The stand-in sends the literal TASK_NONE, mirroring
-   `heartbeat_core.py:138`. Handbook 3.4.11: only a transition into a task value
+   `heartbeat_core.py:145`. Handbook 3.4.11: only a transition into a task value
    begins an attempt, so a heartbeat that stays TASK_NONE never starts one. Only
    Ekko can know its task; the fix is a
    task-state source on the aircraft, carried in its own heartbeat (E1).

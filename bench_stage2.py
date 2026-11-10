@@ -343,6 +343,46 @@ def main() -> int:
           "sent %d times, RoboCommand got it %d time(s), the resend was answered %s"
           % (resent, docked() - docked0, verdicts[n_receipts:]))
 
+    print("\nB15-B18  tiers: a vehicle's ocs_tiers, the declaration, run_end (raw frames, no new client method)")
+    import json
+    boat2 = RawClient(TCP_PORT)
+    boat2.send_raw(encode(json.dumps({"ocs_hello": {"vehicle_id": "UUV1", "link": "wifi"}}).encode()))
+    tiers = {"task1": "TIER_ADVANCED", "task2": "TIER_NONE", "task3": "TIER_CORE", "task4": "TIER_NONE"}
+
+    def runs() -> list[dict]:
+        out = [json.loads(f).get("ocs_run") for f in list(boat2.got)]
+        return [r for r in out if r]
+
+    def ask() -> dict:
+        n = len(runs())
+        boat2.send_raw(encode(json.dumps({"ocs_tiers": {
+            "vehicle_id": "UUV1", "tiers": tiers, "mission": "bench", "sent_at": rfc3339()}}).encode()))
+        settle(1.0)
+        return runs()[-1] if len(runs()) > n else {}
+
+    settle(1.0)
+    check("B15", bool(runs()) and runs()[0]["state"] == "DECLARED",
+          "a vehicle that connects is sent ocs_run: %s" % [r["state"] for r in runs()])
+    refused = ask().get("reply")
+    check("B16", bool(refused) and refused["ok"] is False and "DECLARED" in refused["reason"]
+          and bridge._tiers["task1"] == "TIER_CORE",
+          "ocs_tiers while DECLARED is refused in words: %s" % refused)
+    bridge.end()
+    settle(1.0)
+    end_seen = any("run_end" in json.dumps(c) for c in commands)
+    accepted = ask().get("reply")
+    check("B17", end_seen and bool(accepted) and accepted["ok"] is True and bridge._tiers == tiers
+          and bridge._tiers_source == "UUV1 (mission bench)",
+          "run_end reached the boat (%s); once ended ocs_tiers is accepted: %s from %s"
+          % (end_seen, accepted, bridge._tiers_source))
+    bridge.set_active("USV1", True)
+    msg = bridge.declare()
+    settle(1.0)
+    check("B18", bridge._declared_tiers == tiers and runs()[-1]["declared_tiers"] == tiers
+          and runs()[-1]["state"] == "DECLARED",
+          "the declaration carries the vehicle's tiers and ocs_run says so: %s" % msg)
+    boat2.close()
+
     link.stop()
     bridge.stop()
 

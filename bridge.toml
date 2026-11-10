@@ -1,18 +1,15 @@
 # rx_bridge configuration. Copy per machine; do not commit course-specific edits.
 #
-# The addresses below are the BENCH setup: a laptop talking to the RoboNation
-# stub on another machine. At the competition, `robocommand.host` becomes the
-# course's .2 address and the OCS takes its own address from DHCP -- never set
-# a static address on the RoboCommand-facing interface.
+# RoboCommand's broker is found by its course topic ([robocommand] host = "auto"),
+# so one file works on every course network and at the Team Village demo. The
+# OCS takes its own address on that network from DHCP -- never set a static
+# address on the RoboCommand-facing interface.
 
 team_id = "ASTA"
 
-# RETIRED -- the bridge no longer declares or sends this. The UAV geofence is per
-# COURSE now (four courses, four places) and is worked out when RoboCommand's
-# RxCourse arrives: a [[geofence.course]] entry at the bottom of this file if there
-# is one for that course, otherwise the course boundary pulled inward by
-# [geofence] boundary_margin_m. See the [geofence] section below and
-# rx_bridge/geofence.py.
+# RETIRED -- the bridge no longer declares or sends this. The UAV geofence declared
+# is the one the pilot draws in QGC, read back off Ekko's autopilot; see the
+# [geofence] section below and rx_bridge/geofence.py.
 #
 # The key is kept ONLY because the drone repo's tools/scripts/check_config.py
 # (Drone/rx26_uav) still reads it, compares it with uav_params.yaml and fails
@@ -68,18 +65,20 @@ type = "TYPE_UAV"
 # down the radio -- falling back to WiFi if the radio goes quiet for [limits]
 # link_prefer_s. Crusader has no preference: it only has WiFi.
 prefer = "radio"
-registration = "ASTA-53554"     # Chris, 7 Nov 2026: stamped by the OCS on every UAV1 heartbeat
+registration = "ASTA-53554"     # Chris, 7 Nov 2026
+# registration: the team-wide default for Ekko's CAAS registration, which the OCS
+# stamps on every UAV1 heartbeat as Heartbeat.uav_registration. RoboCommand wants it
+# only when the team has more than one UAV registered. It can be typed on the page
+# (not during a run), and "Save as default" there keeps it on THIS laptop
+# (run/operator.json), which wins over this line. Blank everywhere: the field stays
+# blank. A heartbeat carrying a different one is dropped as misconfigured (counter
+# "misreg.").
+#
 # Both vehicle clients republish a top-level key they do not know to
 # /crsd/ocs_command or /uav/ocs_command and carry on (see docs/VEHICLE_LINK.md),
-# so `ocs_info` (the course, and for a UAV the declared geofence) is safe to
+# so `ocs_info` (the course, and for a UAV RoboCommand's polygon) is safe to
 # send to every vehicle. Set send_info = false on any vehicle whose client is
 # found to choke on it.
-#
-# registration = "..."      # Ekko's CAAS registration, stamped on every heartbeat
-#                           # as Heartbeat.uav_registration. RoboCommand wants it only
-#                           # when the team has more than one UAV registered. Blank:
-#                           # the field stays blank. A heartbeat carrying a different
-#                           # one is dropped as misconfigured (counter "misreg.").
 
 [team]
 # Our broker. On the bench this is the OCS itself; the vehicles publish here.
@@ -116,8 +115,10 @@ enabled = true
 #
 # Off unless enabled = true: a config without this section must not start
 # broadcasting. Sent from every local address except loopback, link-local,
-# anything inside never_on, and anything in the same /24 as [robocommand] host --
-# the course network is never spoken on.
+# anything inside never_on, and anything in the same /24 as RoboCommand's broker
+# or the very address that reaches it -- the course network is never spoken on.
+# With [robocommand] host = "auto" an address is also held back until the search
+# has swept its /24, or has found RoboCommand.
 enabled = true
 port = 37565              # UDP; paired with [tcp] port. Both sides must agree.
 interval_s = 1.0          # at most 2.0: the boat forgets a beacon after 5 s
@@ -126,9 +127,14 @@ never_on = ["192.168.65.0/24", "192.168.66.0/24",
             "192.168.67.0/24", "192.168.68.0/24"]   # Alpha, Bravo, Charlie, Delta
 
 [robocommand]
-# The simulated RoboNation server. See README.md for why this is on its own
-# network segment and not a port on the team router.
-host = "192.168.69.3"
+# "auto": find the broker by the course it keeps retained on
+# robocommand/robotx/course -- each interface's default gateway first (handbook
+# 3.4.3: the gateway is the course's RoboCommand), then .2 and .3 of each local
+# /24, then a sweep of each /24 for TCP 1883 (rx_bridge/rcfind.py). The page
+# lists every host that answered and what it said. An address here pins the
+# broker and skips the search: 192.168.69.3 at the Singapore screening
+# (7 Nov 2026), 192.168.65.2-192.168.68.2 for courses Alpha-Delta.
+host = "auto"
 port = 1883
 
 [tiers]
@@ -160,87 +166,44 @@ seq_store = "run/seq.json"
 wire_log  = "run/wire"
 
 [uav]
-# pilot_callsign: what the call-sign box next to Declare starts with. It goes out as
-# RunDeclaration.uav_pilot_callsign whenever an aircraft is declared: the pilot's
-# MyDroneFleets call sign for THIS run, first name + UAPL number. Per run, so it is
-# typed on the page; blank here means the box starts empty and Declare stays off
+# pilot_callsign: the team-wide default for the call-sign box next to Declare. It
+# goes out as RunDeclaration.uav_pilot_callsign whenever an aircraft is declared:
+# the pilot's MyDroneFleets call sign for THIS run, first name + UAPL number. Typed
+# on the page; "Save as default" there keeps it on THIS laptop (run/operator.json,
+# never committed), which wins over this line. Blank everywhere: Declare stays off
 # until someone types it.
 pilot_callsign = ""
 
 [geofence]
-# The UAV geofence is per course. When RoboCommand's RxCourse is accepted the OCS
-# declares, and tells Ekko, one of these -- "table, else the boundary":
+# THE UAV GEOFENCE (Chase, 7 Nov 2026). When RoboCommand's RxCourse arrives the OCS
+# makes RoboCommand's polygon from it -- the course boundary, joined with
+# RxCourse.uav_transit_area when the two share an edge, shrunk inward by
+# boundary_margin_m -- and fleet_link puts that on Ekko's autopilot, once, so QGC
+# shows it (Plan view, Download). The pilot draws Ekko's OWN fence inside it in QGC
+# and uploads. A declaration carries what the pilot drew, read back off the
+# autopilot over the radio, and the ceiling Ekko itself enforces: home altitude
+# (HAE) + FENCE_ALT_MAX. Nothing in this file is declared: set FENCE_ALT_MAX in QGC.
 #
-#   1. a [[geofence.course]] entry below whose course_id matches -- used ONLY if
-#      every vertex, and every point along every edge, is inside the course or its
-#      UAV transit area (within 0.5 m). An entry that is outside is refused with
-#      the vertex or edge named, and the course gets NO fence: it never silently
-#      falls back to (2).
-#   2. otherwise the course boundary -- joined with RxCourse.uav_transit_area when
-#      the two share an edge -- shrunk inward by boundary_margin_m. Needs a simple
-#      convex shape and a margin small enough not to collapse it; if not, no fence
-#      and a finding on the page saying what to do (a transit area that cannot be
-#      joined leaves a course-only fence, and says so).
+# Before every declaration with an aircraft the OCS applies RoboCommand's own check
+# (their test server's geofence_problems): at least 4 points, closed, every point
+# along every edge within the course or transit area to 1 m, and a ceiling above 0
+# and at most ceiling_limit_hae_m. RoboCommand REFUSES SILENTLY -- no reply, the run
+# just never starts -- so the OCS refuses first, in words, on the page.
 #
-# There is deliberately no entry for ALPHA: the box in `uav_geofence` above is
-# larger than the ALPHA boundary, so it would be refused. ALPHA uses (2).
-#
-# Before every declaration with an aircraft the OCS also applies RoboCommand's own
-# check (their test server's geofence_problems): at least 4 points, closed, every
-# point along every edge within the course or transit area to 1 m, and a ceiling
-# above 0 and at most ceiling_limit_hae_m. RoboCommand REFUSES SILENTLY -- no reply,
-# the run just never starts -- so the OCS refuses first, in words, on the page.
+# [[geofence.course]] entries and max_altitude_hae_m went with that change, and the
+# bridge refuses to start with either, so nobody declares a fence written here
+# believing it is used. Chris's SV1 and SV3 fences of 7 Nov 2026 were drawn in QGC
+# (Desktop\test.plan and Desktop\sv3plan.plan); their vertices are in git, bridge.toml
+# at commit 2cbe11b.
 
-max_altitude_hae_m = 40.0 # RunDeclaration.uav_geofence_max_altitude_hae_m: the UAV
-                          # ceiling, metres above the WGS84 ellipsoid (HAE, not AMSL).
-                          # PROPOSED 2026-10-31, Chase to confirm. Must cover Ekko's
-                          # real ceiling, home HAE + FENCE_ALT_MAX (12 m), with room;
-                          # check GPS_RAW_INT.alt_ellipsoid at home on the day.
-                          # Removing the key blocks every declaration with an aircraft.
 ceiling_limit_hae_m = 50.0  # The most RoboCommand accepts: their test server's
                           # MAX_UAV_ALTITUDE_HAE_M. Handbook 5.3.3 says 60 m AMSL.
 
-boundary_margin_m = 2.0   # Chosen so the declared vertices are strictly inside the
-                          # boundary, never on it, where a float-rounding validation
-                          # could reject them. Chase's to change.
+boundary_margin_m = 2.0   # How far inside the course RoboCommand's polygon sits, so a
+                          # fence drawn along it is strictly inside the boundary, never
+                          # on it, where a float-rounding validation could reject it.
+                          # Chase's to change.
 
-confirm_max_age_s = 180   # A UAV is not declared unless its autopilot was read back
-                          # holding this course's fence within this many seconds
-                          # (the radio adapter re-verifies every 60 s). The gate:
-                          # docs/VEHICLE_LINK.md "ocs_fence".
-
-# Example -- a hand-drawn fence for one course. Closed (first == last), every vertex
-# inside that course's boundary. Uncomment and edit; course_id is as RoboCommand
-# sends it. A TOML trap: keep every [[geofence.course]] BELOW this [geofence]
-# header and keep top-level keys above all headers.
-#
-# [[geofence.course]]
-# course_id = "BRAVO"
-# uav_geofence = [
-#     [1.28010, 103.85520],
-#     [1.28010, 103.85625],
-#     [1.28110, 103.85625],
-#     [1.28010, 103.85520],
-# ]
-
-# Chris, 7 Nov 2026: drawn in QGC (Desktop\test.plan, polygon 1), inside SV1 by 3.5-4.6 m.
-[[geofence.course]]
-course_id = "SV1"
-uav_geofence = [
-    [1.444790255, 103.784949607],
-    [1.444801231, 103.785038667],
-    [1.444583736, 103.785017662],
-    [1.444575146, 103.784963451],
-    [1.444790255, 103.784949607],
-]
-
-# Chris, 7 Nov 2026: drawn in QGC (Desktop\sv3plan.plan, polygon 1), inside SV3.
-[[geofence.course]]
-course_id = "SV3"
-uav_geofence = [
-    [1.444685263, 103.785312892],
-    [1.444750956, 103.785376074],
-    [1.444618564, 103.785376074],
-    [1.444593896, 103.785198898],
-    [1.444685263, 103.785312892],
-]
+confirm_max_age_s = 180   # A UAV is not declared unless its autopilot's fence was read
+                          # within this many seconds (fleet_link reads it every 30 s
+                          # while Ekko is disarmed and heard on the radio).

@@ -128,7 +128,8 @@ executable form of what Ekko must implement): collect parts by
 two generations); when all `n_parts` are in, concatenate them in part order,
 re-derive the epoch from the assembled polygon and compare it with the one on
 the air — a mismatch discards the parts and is an error. The result is
-**information**: compare it with the aircraft's own fence and alarm. Never
+**information**: RoboCommand's polygon for the course, which the aircraft's own
+fence (the pilot's, drawn in QGC) must lie inside — check that and alarm. Never
 upload it.
 
 ## Uplink: RXL → RxReport JSON
@@ -177,12 +178,12 @@ autopilot's own MAVLink on the radio — a port of Ekko's
 
 | Field | From |
 |---|---|
-| `state` | STATE_MANUAL if disarmed; STATE_AUTO if armed in AUTO, GUIDED, GUIDED_NOGPS, RTL, SMART_RTL, LAND, LOITER, AUTO_RTL, CIRCLE, FOLLOW, ZIGZAG; else STATE_MANUAL (HEARTBEAT from compid 1). Never UNKNOWN |
+| `state` | STATE_AUTO if armed in AUTO, GUIDED, GUIDED_NOGPS, RTL, SMART_RTL, LAND, AUTO_RTL, CIRCLE, FOLLOW, ZIGZAG, or disarmed in GUIDED (switched to the autonomous mode, waiting on the ground for RunStart); else STATE_MANUAL, LOITER included: it is flown on the sticks (HEARTBEAT from compid 1). Never UNKNOWN |
 | `position`, `heading_deg`, `spd_mps` | GLOBAL_POSITION_INT lat/lon, `hdg`, `hypot(vx, vy)` |
 | `altitude_hae_m` | GLOBAL_POSITION_INT.alt (AMSL) + `geoid_separation_m` |
 | `roll_deg`, `pitch_deg` | ATTITUDE |
 | `flight_phase` | EXTENDED_SYS_STATE.landed_state: ON_GROUND → GROUNDED; IN_AIR, TAKEOFF, LANDING → AIRBORNE |
-| `current_task` | the literal **TASK_NONE** — exactly what `heartbeat_core.py:138` sends ("no task-state source exists on the aircraft yet"). A mirror of the aircraft's reporter, not our guess |
+| `current_task` | the literal **TASK_NONE** — exactly what `heartbeat_core.py:145` sends ("no task-state source exists on the aircraft yet"). A mirror of the aircraft's reporter, not our guess |
 | `vehicle_type`, `depth_m` | config, 0.0 |
 | `sent_at` | the time of the **newest input used**, not now — old data must not look fresh |
 
@@ -421,11 +422,14 @@ the catalogue.
     count byte; at most 15 corners, refused beyond; repeated every 10 s
     indefinitely.
 15. **GEOFENCE_INFO, id 0x27, is new.** The catalogue has no message for the
-    UAV geofence. 0x27 is free in the catalogue, the Mesh bench, the dialect
-    (native 42027 unused) and `boat_link.py` (`rxl_codec.py:105-111`).
+    UAV geofence. It carries RoboCommand's polygon for the course
+    (`ocs_info.uav_geofence`). 0x27 is free in the catalogue, the Mesh bench,
+    the dialect (native 42027 unused) and `boat_link.py` (`rxl_codec.py:105-111`).
     Information only for the companion. The autopilot gets the same polygon
-    separately, as an ArduPilot inclusion fence written by the adapter itself over
-    MAVLink when `fence_upload = true` (`fleet/fence_upload.py`; fleet/README.md).
+    separately, as an ArduPilot inclusion fence written by the adapter itself
+    over MAVLink when `fence_upload = true`; the pilot draws Ekko's own fence
+    inside it in QGC, and that one is what the OCS declares
+    (`fleet/fence_upload.py`; fleet/README.md).
 16. **The affected-type mask** is defined: bit n = VehicleType n.
 17. **HEARTBEAT.phase** is numbered 0-4 with 0xFF = none (the catalogue lists
     the names only). The adapter relays at most 2 Hz of Ekko's heartbeat (the

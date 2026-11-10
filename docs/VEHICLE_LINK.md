@@ -73,7 +73,8 @@ address is skipped — and listed with its reason on the operator page — if it
 | loopback (`127/8`) or unspecified | nothing off the laptop can hear it |
 | link-local (`169.254/16`) | an interface with no real address (Tailscale's, an unplugged NIC's) |
 | inside a `[discovery] never_on` subnet — default **Alpha `192.168.65.0/24`, Bravo `.66`, Charlie `.67`, Delta `.68`** | the RoboCommand-facing DHCP networks |
-| in the same /24 as `[robocommand] host` | catches a bench stub on a subnet that is not one of the four, or a renumbered course. A hostname there adds no rule (it is not resolved) — put its subnet in `never_on` |
+| in the same /24 as RoboCommand's broker — the one `[robocommand] host` pins, or the one the bridge found by its course topic (`host = "auto"`, `rx_bridge/rcfind.py`) — or the very address the bridge reaches it from | catches a course network that is not one of the four (the Singapore screening's was `192.168.69.0/24`) and a bench stub. A pinned hostname adds no /24 rule (it is not resolved) — put its subnet in `never_on` |
+| with `host = "auto"`, until RoboCommand is found: in a /24 the search has not swept yet | that network may be the course network. A network is swept the first time it is seen, so this lasts seconds (`Finder.hold_reason`) |
 
 `never_on`, when set in `bridge.toml`, **replaces** the default rather than adding
 to it; the bridge logs a WARNING at start if a course subnet is missing from it.
@@ -307,33 +308,31 @@ over the radio; see EKKO_RADIO_LINK.md, *Readiness round trip*.
               "uav_geofence": [{"latitude": 1.2801, "longitude": 103.8552}, ...] | null}}
 ```
 
-`uav_geofence` is the UAV geofence **for the course in hand** (next section), closed
-(first point == last), in `RunDeclaration.uav_geofence`'s own JSON shape — built from
-a real `RunDeclaration` so it cannot drift from what RoboCommand was declared
-(`_fence_json`). RoboCommand never sends a geofence — the team declares it — so the
-fence is ours, forwarded so the aircraft can hold it. It goes to `TYPE_UAV` vehicles
-only, and **to them the key is always there**: both keys are explicit, and the pair
-says which of three things is true:
+`uav_geofence` is **RoboCommand's polygon for the course in hand** (next section),
+closed (first point == last), in `RunDeclaration.uav_geofence`'s own JSON shape
+(`_fence_json`). It is the outer limit RoboCommand accepts, put on Ekko's autopilot so
+the pilot can draw Ekko's own fence inside it in QGC. **It is never what is declared**:
+a declaration carries the pilot's polygon, read back off the autopilot
+([`ocs_fence`](#ocs_fence--what-the-autopilot-holds-vehicle--ocs) and the gate below). It
+goes to `TYPE_UAV` vehicles only, and **to them both keys are always there**:
 
 | `course` | `uav_geofence` | Means | What the radio adapter does |
 |---|---|---|---|
-| `null` | `null` | this OCS has received **no course** since it started | clears the autopilot's polygon |
-| `{...}` | `null` | there IS a course and **no fence could be made for it** — a bad `[[geofence.course]]` entry, a boundary the inset cannot trust, a margin that collapses it | leaves the old fence standing; the OCS makes this a loud **course finding** on the page |
-| `{...}` | `[...]` | the fence for that course | writes it, reads it back, answers with an [`ocs_fence`](#ocs_fence--what-the-autopilot-holds-vehicle--ocs) |
+| `null` | `null` | this OCS has received **no course** since it started | nothing: the autopilot's fence stays as it is |
+| `{...}` | `null` | there IS a course and **no polygon could be made for it** — a boundary the inset cannot trust, a margin that collapses it | nothing, as above; the OCS makes this a loud **course finding** on the page |
+| `{...}` | `[...]` | RoboCommand's polygon for that course | writes it to the autopilot beside what the pilot drew, and reports every read of the fence in an `ocs_fence` |
 
-The first row is the only one that clears anything. **The course is never reset to
-`null` by a RoboCommand disconnect or an MQTT reconnect** — it is what RoboCommand
-last told us, replaced only by a newer accepted `RxCourse`, so a dropped link never
-tells an aircraft to forget its fence. (A restart of the OCS does lose it, until the
-retained course is redelivered.) Nothing is sent to clear a fence when a run ends:
-the next course replaces it. Each frame is a **complete snapshot**, never a delta
-(`_info_obj`).
+**The OCS never clears an aircraft's fence** (`fence_clear_without_course` was removed
+on 7 Nov 2026). The course is never reset to `null` by a RoboCommand disconnect or an
+MQTT reconnect either — it is what RoboCommand last told us, replaced only by a newer
+accepted `RxCourse`. (A restart of the OCS does lose it, until the retained course is
+redelivered.) Each frame is a **complete snapshot**, never a delta (`_info_obj`).
 
 Sent (`_send_info`) when:
 
 | Trigger | To | Link |
 |---|---|---|
-| a course that **differs** from the last one, `sent_at` ignored (RoboCommand re-delivers the retained course on every reconnect) — the fence is recomputed first, so the aircraft is told the NEW one | every vehicle | its best link |
+| a course that **differs** from the last one, `sent_at` ignored (RoboCommand re-delivers the retained course on every reconnect) — the polygon is recomputed first, so the aircraft is told the NEW one | every vehicle | its best link |
 | a declaration | the declared UAVs | its best link |
 | a `(vehicle, link)` socket comes up — `_on_link_change` | that vehicle | **pinned to the socket that came up**, no fallback |
 
@@ -343,29 +342,24 @@ tolerate it today: their `ocs_link._deliver` hands any JSON object to the node, 
 republishes it raw to `/crsd/ocs_command` or `/uav/ocs_command`. Set
 `send_info = false` on any client found to choke on it.
 
-#### Where the fence comes from — `rx_bridge/geofence.py`
+#### Where RoboCommand's polygon comes from — `rx_bridge/geofence.py`
 
-There are four courses (ALPHA .. DELTA), each a different place, so the fence is
-worked out per course when an `RxCourse` is accepted — **"table, else the boundary"**:
+Worked out per course when an `RxCourse` is accepted (`geofence.for_course`): **the course
+boundary joined with its `uav_transit_area`, shrunk inward by `[geofence]
+boundary_margin_m`** (default 2.0 m, so its vertices sit strictly inside what RoboCommand
+accepts, never on the edge, where float rounding could reject them). The transit area is
+where Ekko takes off and lands; when it does not share a whole edge with the course, or
+the two together are not convex, the course alone is inset and `uav_geofence_source`
+says the transit area was left out. Needs a simple **convex** boundary of at least three
+distinct corners and a margin that does not collapse it; otherwise no polygon, and a
+course finding that says which. Computed in a local flat metre frame (WGS84 radii at the
+boundary's latitude). No course yet: no polygon (`null`).
 
-1. **A `[[geofence.course]]` entry** in `bridge.toml` whose `course_id` matches
-   (`uav_geofence` = a closed `[[lat, lon], ...]`). Used **only if every vertex lies
-   inside the course boundary or within 0.5 m of it**. Otherwise: no fence for this
-   course, and a course finding naming the vertex that is outside. A bad entry never
-   falls through to (2) — somebody wrote it on purpose.
-2. **Otherwise the boundary, shrunk inward by `[geofence] boundary_margin_m`**
-   (default 2.0 m, chosen so the declared vertices are strictly inside the boundary,
-   never on it, where a float-rounding validation could reject them). Needs a simple
-   **convex** boundary of at least three distinct corners, and a margin that does not
-   collapse it; otherwise no fence and a finding that says which ("margin of 2.0 m
-   collapses a course 3.0 m wide", "boundary not convex: add a `[[geofence.course]]`
-   entry for ALPHA"). Computed in a local flat metre frame (WGS84 radii at the
-   boundary's latitude); vertex *i* of the answer is the inset of corner *i*, same
-   winding.
-3. **No course yet:** no fence (`null`).
-
-The top-level `uav_geofence` of `bridge.toml` is **retired**: the bridge no longer
-declares or sends it. It stays in the file only because the drone repo's
+The per-course `[[geofence.course]]` table and `[geofence] max_altitude_hae_m` are
+**removed** (7 Nov 2026), and the bridge refuses to start with either in `bridge.toml`:
+Ekko's own fence is drawn in QGC, and its ceiling is read off its autopilot. The
+top-level `uav_geofence` of `bridge.toml` is **retired** too: the bridge neither
+declares nor sends it. It stays in the file only because the drone repo's
 `tools/scripts/check_config.py` still compares it with `uav_params.yaml`.
 
 ### `ocs_fence` — what the autopilot holds (vehicle → OCS)
@@ -373,24 +367,37 @@ declares or sends it. It stays in the file only because the drone repo's
 ```json
 {"ocs_fence": {"vehicle_id": "UAV1",
                "state": "done",
-               "polygon": [[1.2801, 103.8552], [1.2801, 103.85625], [1.2811, 103.85625]],
+               "polygon": [[1.2801, 103.8552], [1.2801, 103.85625], [1.2811, 103.85625], [1.2811, 103.8552]],
                "verified": true,
-               "verified_at": "2026-10-11T00:31:05.123Z",
-               "reason": "written and read back: 3 vertices, each within 1 m",
-               "lockout": null}}
+               "verified_at": "2026-11-07T00:31:05.123Z",
+               "reason": "read back: 2 inclusion polygons",
+               "lockout": null,
+               "read_at": "2026-11-07T00:31:05.123Z",
+               "shapes": [{"type": "polygon", "inclusion": true,
+                           "points": [[1.2801, 103.8552], [1.2801, 103.85625], [1.2811, 103.85625], [1.2811, 103.8552]]},
+                          {"type": "polygon", "inclusion": true,
+                           "points": [[1.2803, 103.8554], [1.2803, 103.8560], [1.2809, 103.8558]]}],
+               "params": {"FENCE_TYPE": 5, "FENCE_ENABLE": 0, "FENCE_AUTOENABLE": 1,
+                          "FENCE_ALT_MAX": 30, "FENCE_OPTIONS": 0},
+               "home_hae_m": 9.0}}
 ```
 
-Sent by the radio adapter (`fleet/ocs_adapter.py`) after it has written a fence to
-Ekko's autopilot and read it back: right after its `ocs_hello` on every (re)connect,
-whenever any field changes, and at least every 60 s while verified.
+Sent by the radio adapter (`fleet/ocs_adapter.py`) after each read of Ekko's fence — every
+30 s while the aircraft is disarmed and heard on the radio — on every (re)connect, and
+whenever anything in it changes. Nothing is sent until there is something to say (a read,
+or RoboCommand's polygon).
 
 | Field | Meaning |
 |---|---|
 | `vehicle_id` | must be a vehicle **this connection** has identified itself as, and an aircraft |
-| `state` | the upload's own state: `off`, `waiting`, `busy`, `held`, `done`, `gave up` |
-| `polygon` | the **OPEN** polygon it was given (no closing vertex), `[[lat, lon], ...]`; `null` = none known; `[]` = the autopilot's fence was **cleared and read back empty** (what the adapter does for `course: null, uav_geofence: null`) |
-| `verified` | a real boolean — the autopilot was READ BACK holding exactly `polygon` |
-| `verified_at` | RFC 3339 UTC of that read-back, or `null` |
+| `state` | the upload of RoboCommand's polygon: `off`, `waiting`, `busy`, `held`, `done`, `gave up` |
+| `polygon` | RoboCommand's polygon the adapter was told, **OPEN** (no closing vertex), `[[lat, lon], ...]`; `null` = none |
+| `verified` | a real boolean — RoboCommand's `polygon` was among the shapes last read. Evidence; the gate does not need it |
+| `verified_at` | RFC 3339 UTC of the last read that found it there, or `null` |
+| `read_at` | RFC 3339 UTC of the last read of the autopilot's fence, or `null`: never read |
+| `shapes` | what that read found, each OPEN: `{"type": "polygon", "inclusion": bool, "points": [[lat, lon], ...]}` or `{"type": "circle", "inclusion": bool, "center": [lat, lon], "radius_m": r}`; `null` when never read |
+| `params` | the `FENCE_TYPE`, `FENCE_ENABLE`, `FENCE_AUTOENABLE`, `FENCE_ALT_MAX` and `FENCE_OPTIONS` read; one it could not read is absent |
+| `home_hae_m` | Ekko's home altitude above the WGS84 ellipsoid at the read (`GLOBAL_POSITION_INT` plus `fleet.toml geoid_separation_m`), or `null` |
 | `reason` | free text, cut to 300 characters |
 | `lockout` | `null`, or a string: the aircraft will not arm where it is. Shown, never gated on |
 
@@ -400,47 +407,58 @@ The bridge (`_on_fence`):
   governor or a sequence number — it is not a report;
 - believes a body only about a vehicle **its connection has identified itself as**
   (hello, or a first report). From an unidentified socket, naming another vehicle,
-  naming a vehicle that is not an aircraft, or malformed (`verified` not a boolean,
-  a polygon that is not finite `[lat, lon]` pairs): the frame is **ignored,
-  counted** (`counters.fence_frames_ignored`), logged, wire-logged
-  (`ocs_fence IGNORED: <why>`, event `fence_ignored`) and the socket stays up;
-- wire-logs every accepted one like any other vehicle frame (`veh tcp://in/<link>`,
-  note `ocs_fence vehicle=UAV1 state=done verified=True vertices=4`);
-- needs no clean-up when the link closes: freshness is judged from `verified_at`, so
-  a confirmation from a dead adapter simply ages out.
+  naming a vehicle that is not an aircraft, or malformed (`verified` not a boolean, a
+  polygon or shape that is not finite `[lat, lon]` pairs, a circle without a finite
+  center and radius): the frame is **ignored, counted** (`counters.fence_frames_ignored`),
+  logged, wire-logged (`ocs_fence IGNORED: <why>`, event `fence_ignored`) and the socket
+  stays up;
+- wire-logs every accepted one like any other vehicle frame (`veh tcp://in/<link>`);
+- needs no clean-up when the link closes: freshness is judged from `read_at`, so a read
+  from a dead adapter simply ages out.
 
-#### The pre-run gate: refuse to declare
+#### What a declaration with an aircraft carries — and the gate
 
-**The bridge does not declare a run that includes a `TYPE_UAV` unless that
-vehicle's autopilot is confirmed to hold the fence being declared.** For every
-aircraft going into the declaration (`Bridge._uav_gate`, rule in
-`geofence.confirmation_problem`), the latest `ocs_fence` must have:
+**A declaration with a `TYPE_UAV` carries what was read off its autopilot, and the bridge
+declares nothing it has not read** (`geofence.aircraft_fence`, then RoboCommand's own check,
+through `Bridge._uav_rules`). For the aircraft in the declaration, its latest `ocs_fence`
+must have:
 
-1. `verified: true`,
-2. a `polygon` equal — each coordinate within 1e-6 deg — to the OPEN form of the
-   current course's fence, and
-3. a `verified_at` no older than `[geofence] confirm_max_age_s` (default 180 s; the
-   adapter re-verifies every 60 s) **by the OCS clock**. A timestamp that is missing,
-   unreadable or more than 5 s in the future is not believed.
+1. a `read_at` no older than `[geofence] confirm_max_age_s` (default 180 s; the adapter
+   reads every 30 s while disarmed) **by the OCS clock**. A timestamp that is missing,
+   unreadable or more than 5 s in the future is not believed;
+2. among its inclusion polygons, **exactly one that is not RoboCommand's** — neither the
+   course's polygon nor the one the adapter says it was told, matched from any start vertex
+   in either direction. That is the pilot's, drawn in QGC, and closed it is
+   `RunDeclaration.uav_geofence`. With none the pilot has not drawn one; with two the OCS
+   will not choose;
+3. `FENCE_ALT_MAX` and `home_hae_m` both known: `uav_geofence_max_altitude_hae_m` = home HAE
+   + FENCE_ALT_MAX (ArduPilot's FENCE_ALT_MAX is metres above home).
 
-With **no fence for the course, an aircraft cannot be declared at all.** A cleared
-(`[]`) confirmation is a polygon that does not match, like any other. The USV and UUV
-are not affected.
+Then RoboCommand's own rule, which it applies **silently** — a refused declaration gets no
+reply and the run never starts (`geofence.rc_declaration_problems`, a transcription of their
+test server's): at least 4 points, nowhere more than 1 m outside the course and its transit
+area, and a ceiling above 0 and at most `[geofence] ceiling_limit_hae_m` (50, theirs). And
+the pilot's call sign must not be blank: the box beside Declare, else the saved default,
+else `[uav] pilot_callsign`.
+
+Shown with it, never gating: a `FENCE_TYPE` without the polygon or altitude bit, a fence
+that is off (`FENCE_ENABLE` 0 and `FENCE_AUTOENABLE` 0), `FENCE_OPTIONS` union with more than
+one inclusion polygon (the aircraft is then held to the largest, not to the polygon
+declared), and circles or exclusion polygons (enforced by the autopilot, never declared).
+RoboCommand's polygon need not be on the autopilot to declare: what is declared, and
+judged, is the pilot's.
 
 The check lives with the other declaration preconditions: `Bridge.declare_blocker()`
-(state, then the two-vehicle floor, then this gate) is what `declare()` asks first —
-so the page's button (`run.may_declare`, `run.declare_blocker` in the snapshot) and
-`POST /api/declare` cannot disagree, and the endpoint refuses on its own whatever
-the page showed. The refusal names the vehicle and what is missing:
+(state, then `min_declared`, then this) is what `declare()` asks first — so the page's
+button (`run.may_declare`, `run.declare_blocker`) and `POST /api/declare` cannot disagree,
+and the endpoint refuses on its own whatever the page showed. A refusal names the vehicle
+and what is missing:
 
-    cannot declare -- UAV1: autopilot fence not confirmed (state held: armed: not writing)
-    cannot declare -- UAV1: autopilot fence not confirmed (no ocs_fence received from it yet)
-    cannot declare -- UAV1: autopilot holds a different polygon than the ALPHA fence (4 vertices, the fence has 4)
-    cannot declare -- UAV1: fence confirmation 412 s old (limit 180 s)
-    cannot declare -- UAV1: no UAV geofence for this course (no course received yet) -- an aircraft cannot be declared without one
-
-The declaration itself carries the course's fence, closed
-(`RunDeclaration.uav_geofence`), whenever there is one.
+    cannot declare -- UAV1: nothing read from its autopilot yet (no ocs_fence: is fleet_link running, and the radio up?)
+    cannot declare -- UAV1: its autopilot's fence was last read 412 s ago (limit 180 s) -- it is read only while disarmed and heard on the radio
+    cannot declare -- UAV1: its autopilot holds only RoboCommand's polygon -- draw Ekko's own fence inside RoboCommand's in QGC and upload it
+    cannot declare -- UAV1: its autopilot holds 2 inclusion polygons besides RoboCommand's, and a declaration carries one -- leave only Ekko's own in QGC
+    cannot declare -- the UAV pilot's call sign is blank: type it next to Declare (MyDroneFleets: first name + UAPL number)
 
 ### `ocs_directive` — stand by in auto
 
@@ -450,11 +468,69 @@ The declaration itself carries the course's fence, closed
 ```
 
 Sent to each declared vehicle right after the declaration is published
-(`_send_standby_auto`, `bridge.py:1078-1113`). Advisory: it changes no flight
+(`_send_standby_auto` -> `_send_directive`). Advisory: it changes no flight
 mode; the RC e-stop stays the only safety path. No MQTT fallback; a vehicle
 with no socket is logged as `NOT DELIVERED`. The radio adapter does not put it
 on the air (there is no RXL message for it) and counts it under
 `directives_ignored`.
+
+### `ocs_directive` run_end — the run is over
+
+```json
+{"ocs_directive": {"action": "run_end", "declaration_seq": 7, "run_id": 3,
+                   "vehicles": ["USV1"], "sent_at": "..."}}
+```
+
+Sent by `end()` when the end is accepted, to the declared vehicles that are **not
+aircraft** (`_send_directive`, the same code as `standby_auto`). `run_id` is null if the
+run never started. Advisory: the boat only clears its RunStart latch. Ekko's radio adapter
+is sent nothing new.
+
+### `ocs_tiers` — a vehicle's tiers for the next declaration (vehicle → OCS)
+
+```json
+{"ocs_tiers": {"vehicle_id": "USV1",
+               "tiers": {"task1": "TIER_ADVANCED", "task2": "TIER_NONE",
+                         "task3": "TIER_CORE", "task4": "TIER_NONE"},
+               "mission": "survey_all_core", "sent_at": "2026-11-09T03:04:05.123Z"}}
+```
+
+Sets the tiers the next `RunDeclaration` carries (`Bridge.set_tiers`, in memory only:
+`bridge.toml [tiers]` again after a restart). The page sets the same four values
+(`POST /api/tiers`) and shows who set them last (`USV1 (mission survey_all_core)`, `page`,
+`bridge.toml`) and when. Refused while the run is DECLARED or RUNNING.
+
+Never a report: no governor, no seq, never RoboCommand. Like `ocs_fence` it is believed
+only from the vehicle the connection identified itself as (hello or report), and refused
+when: the socket is unidentified; `vehicle_id` is not that vehicle; it is an aircraft (an
+aircraft is sent nothing new); any of `task1`..`task4` is missing, extra, or not one of
+`TIER_NONE|TIER_CORE|TIER_ADVANCED|TIER_DISRUPTIVE` (`TIER_UNKNOWN` is never legal);
+`mission` is not text. Wire-logged once (`ocs_tiers vehicle=... mission=...`, or
+`ocs_tiers REFUSED: <why>`, event `tiers_refused`); the socket stays up. The vehicle is
+answered with an `ocs_run` whose `reply` is `{"ok", "reason"}`. The OCS applies no
+combination rules of its own: no tier needs a vehicle type or count here.
+
+### `ocs_run` — the run state and the tiers (OCS → non-UAV vehicles)
+
+```json
+{"ocs_run": {"state": "COURSE_RX", "declaration_seq": null, "run_id": null,
+             "tiers": {"task1": "TIER_ADVANCED", "task2": "TIER_NONE",
+                       "task3": "TIER_CORE", "task4": "TIER_NONE"},
+             "tiers_source": "USV1 (mission survey_all_core)",
+             "tiers_set_at": "2026-11-09T03:04:05Z",
+             "declared_tiers": null,
+             "reply": {"ok": false, "reason": "a run is DECLARED: end it before changing tiers"},
+             "sent_at": "..."}}
+```
+
+A complete snapshot, never a delta; information only. `state` is the OCS run state
+(DISCONNECTED, CONNECTED, COURSE_RX, DECLARED, RUNNING, ENDED); `tiers` is what the next
+declaration will carry (the current one's while DECLARED/RUNNING); `declared_tiers` is what the
+current or last declaration of this process carried, null before one (and after a restart).
+`reply` is present only in the direct answer to an `ocs_tiers`. Sent to every connected
+vehicle that is not an aircraft and has `send_info` true: when its link comes up (next to
+`ocs_info`), after any tier change, on declaring, on an accepted RunStart and on end. One
+link, no MQTT fallback.
 
 ### `ocs_receipt` — what became of a numbered task report
 
@@ -497,14 +573,27 @@ never repeats an old key; the same seq with a new `sent_at` is a new report.
 | `dropped_not_preferred`, `dropped_not_preferred_by_kind` | the link-preference drops, total and per kind |
 | `link`, `peer` | `"tcp"` while any socket is up, else what it last spoke on; the wifi socket's label |
 
-Geofence fields (`geofence.py`, `_on_fence`): `uav_geofence` (the CURRENT course's fence,
-closed `[{latitude, longitude}]`, or `null`), `uav_geofence_source` (`"table: ALPHA"`,
-`"course boundary inset 2.0 m"`, or `null`) and `uav_geofence_reason` (why there is none, else
-`null`); `fence_confirm` — `{"UAV1": {<the ocs_fence as received>, "age_s", "matches_course_fence"}}`
-for each aircraft that has sent one, `age_s` being null when `verified_at` is unreadable —
-`fence_confirm_max_age_s`; `run.may_declare` (the whole verdict) and `run.declare_blocker`
-(its reason, or `null`); `counters.fence_frames_ignored`. A fence that could not be made is
-also in `course_findings`.
+Geofence fields (`geofence.py`, `_on_fence`): `uav_geofence` (RoboCommand's polygon for the
+CURRENT course, closed `[{latitude, longitude}]`, or `null`), `uav_geofence_source`
+(`"course + transit area inset 2.0 m"`, `"course boundary inset 2.0 m"`, or `null`) and
+`uav_geofence_reason` (why there is none, else `null`); `fence_confirm` — `{"UAV1": {<the
+ocs_fence as received>, "age_s", "verified_age_s", "matches_course_fence"}}` for each aircraft
+that has sent one, `age_s` from `read_at` and `verified_age_s` from `verified_at`, each null
+when unreadable — `fence_confirm_max_age_s`; `uav` — `in_declaration`, `ceiling_limit_hae_m`
+and, per aircraft, `declaration`: what a declaration would carry now (`polygon`,
+`ceiling_hae_m`, `ceiling_from`, `read_age_s`) with its `problems` and `notes`;
+`run.may_declare` (the whole verdict) and `run.declare_blocker` (its reason, or `null`);
+`counters.fence_frames_ignored`. A polygon that could not be made is also in
+`course_findings`.
+
+The pilot's call sign and each aircraft's registration (`operator`, `rx_bridge/operatorstore.py`):
+`callsign` and `registration[vid]`, each `{value, from, saved, config}` — `from` is `typed`
+(on the page, this run of the OCS), `saved` (this laptop's default, `run/operator.json`) or
+`config` (`bridge.toml`), in that order of precedence, and a box emptied on the page stays
+empty. `POST /api/operator {"callsign"?, "registration"?: {vid: value}, "save"?: true}`
+changes them; a registration cannot change while a run is RUNNING (it is on every
+heartbeat). With `[robocommand] host = "auto"`, `rc_search` is the search for RoboCommand's
+broker (`rcfind.Finder.snapshot`) and `endpoints.robocommand` says what it found.
 
 Top level: `link_prefer_s`, `tcp_peers`, `counters.dropped_not_preferred`
 (not part of `dropped_rate`: those frames never reached the governor), and
@@ -516,7 +605,7 @@ vehicle silent"** — its socket says nothing about the vehicle. The console
 Wire log (`run/wire/*.jsonl`): uplink frames as `veh tcp://in/<link>`, downlink
 as `vtx tcp://<vehicle>/<link>` (or the MQTT command topic), each with
 `decoded`; events `link_up`, `link_down`, `hello_refused`, `ocs_info`, `resend`,
-`standby_auto`, `readiness_seq`, `readiness_mismatch`, `undecodable`, `geofence` /
+`standby_auto`, `run_end`, `ocs_run`, `tiers`, `tiers_refused`, `readiness_seq`, `readiness_mismatch`, `undecodable`, `geofence` /
 `geofence_none` (a course was accepted and what its fence is), `fence_ignored`. An
 `ocs_fence` is logged as `veh tcp://in/<link>` with its decoded body.
 

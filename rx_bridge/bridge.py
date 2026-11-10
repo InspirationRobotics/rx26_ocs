@@ -40,17 +40,21 @@ from google.protobuf import json_format
 
 import paho.mqtt.client as mqtt
 
-from . import benchauto, geofence, linkpolicy, validate
+from . import benchauto, geofence, linkpolicy, rcfind, validate
 from .active import ACTIVE_WINDOW_S, choose_active
 from .beacon import BeaconSender, off_snapshot
-from .config import LINKS, Config
+from .config import LINKS, TIERS, Config
 from .governor import Governor
+from .operatorstore import OperatorError, OperatorStore
 from .proto import common_pb2, rx_commands_pb2, rx_common_pb2, rx_course_pb2
 from .proto import rx_reports_pb2, rx_requests_pb2
 from .runstate import RunMachine
 from .seqstore import SeqStore
 from .tcpserver import DEFAULT_LINK, Conn, TcpServer
 from .wirelog import WireLog
+
+#: The four tasks of a declaration, in RunDeclaration's order.
+TASKS = ("task1", "task2", "task3", "task4")
 
 
 #: Handbook 3.1's floor, for the warning below. The value actually enforced
@@ -120,7 +124,7 @@ class Counters:
     dropped_rate: int = 0
     dropped_invalid: int = 0
     dropped_mistyped: int = 0
-    #: Aircraft heartbeats carrying a uav_registration other than bridge.toml's.
+    #: Aircraft heartbeats carrying a uav_registration other than the OCS's.
     dropped_misregistered: int = 0
     stale: int = 0
     commands_routed: int = 0
@@ -170,6 +174,11 @@ class Bridge:
         self._lock = threading.RLock()
         self.machine = RunMachine()
         self.seqs = SeqStore(cfg.seq_store)
+        #: The pilot's call sign and each aircraft's registration: typed on the page,
+        #: saved as this laptop's defaults, bridge.toml's as the fallback.
+        self.operator = OperatorStore(
+            cfg.operator_path, callsign=cfg.uav_pilot_callsign,
+            registrations={v.id: v.registration for v in cfg.vehicles if v.is_uav}, log=log)
         self.counters = Counters()
         self.hb_rate = HeartbeatRate()
         #: Findings from the last RxCourse. Advisory -- see validate.check_course.
@@ -197,20 +206,21 @@ class Bridge:
         #: none, body name). Bounded. ReadinessConfirm names a report by OUR
         #: seq, which the vehicle never saw -- see _resolve_confirm.
         self._seq_map: OrderedDict[tuple[str, int], tuple[int, str]] = OrderedDict()
-        #: The UAV geofence for the course in hand (geofence.CourseFence): the table
-        #: entry or the boundary inset, or None-with-a-reason. Recomputed whenever a
-        #: RxCourse is accepted and NEVER reset by a disconnect: the course is what
-        #: RoboCommand last told us, and a dropped link does not un-tell us.
+        #: RoboCommand's UAV polygon for the course in hand (geofence.CourseFence): the
+        #: course and transit area inset, or None-with-a-reason. What the aircraft is
+        #: told (`ocs_info`) and fleet_link puts on it for the pilot to draw inside --
+        #: NOT what is declared (that is read off the aircraft: _aircraft_fence).
+        #: Recomputed whenever a RxCourse is accepted and NEVER reset by a disconnect:
+        #: the course is what RoboCommand last told us, and a dropped link does not
+        #: un-tell us.
         self._fence = geofence.NO_COURSE
-        #: The same fence in RunDeclaration.uav_geofence's own JSON shape (None when
-        #: there is none), built from a real RunDeclaration so what a vehicle is told
-        #: cannot drift from what RoboCommand is sent. Set with `_fence`.
+        #: The same polygon in RunDeclaration.uav_geofence's own JSON shape (None when
+        #: there is none), the shape `ocs_info` and the page carry. Set with `_fence`.
         self._fence_json: list | None = None
-        #: `[[geofence.course]]` as a dict, built once: the config is frozen.
-        self._fence_table = cfg.geofence_table
         #: vehicle_id -> {"body": the latest `ocs_fence` as geofence.parse_confirmation
         #: keeps it, "received_at": time.time(), "link": which link carried it}. Kept
-        #: per vehicle, newest wins. The gate reads it (_uav_gate); never forwarded.
+        #: per vehicle, newest wins. A declaration with that aircraft is made from it
+        #: (_aircraft_fence); never forwarded.
         self._fence_confirms: dict[str, dict] = {}
         #: The declaration_seq a course change arrived under, while DECLARED or
         #: RUNNING; None otherwise. Cleared by the next declaration or by ending.
@@ -218,6 +228,16 @@ class Bridge:
         #: The vehicles the last declaration named, for "all declared AUTO". Empty
         #: after a restart restores a run: the store keeps no vehicle list.
         self._declared: tuple[str, ...] = ()
+        #: The tiers the NEXT declaration carries (task1..task4 -> TIER_*): bridge.toml's
+        #: at start, then the page's or a vehicle's `ocs_tiers`. In memory only -- a
+        #: restart is bridge.toml again, and `_tiers_source` says which it is. Frozen
+        #: while DECLARED or RUNNING.
+        self._tiers: dict[str, str] = dict(zip(TASKS, cfg.tiers))
+        self._tiers_source = "bridge.toml"
+        self._tiers_set_at = time.time()
+        #: What the current / last declaration carried, or None before any by this
+        #: process (a restart that restored a run does not know it: blank, not guessed).
+        self._declared_tiers: dict[str, str] | None = None
         #: When every declared vehicle was last seen to become STATE_AUTO, or None.
         self._all_auto_since: float | None = None
         #: Task reports (every kind but heartbeat) with what became of each, newest
@@ -286,6 +306,17 @@ class Bridge:
         self.rc.on_message = self._on_rc_message
         self.rc.on_publish = self._on_rc_publish
 
+        # Where that client is pointed: bridge.toml's address, or -- with host = "auto" --
+        # none until the search finds RoboCommand's broker by its course topic, and then
+        # what it found (rcfind.py). The search owns the client's start in that case.
+        rcb = cfg.robocommand
+        self._rc_host: str | None = None if rcb.auto else rcb.host
+        self.rc_find = (
+            rcfind.Finder(rcb.port, cfg.rc_course_sub(), cfg.team_id,
+                          pause=self._rc_pause, on_found=self._rc_found,
+                          on_round=self._rc_round, log=self.log)
+            if rcb.auto else None)
+
         self.team = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id="ocs-team-" + cfg.team_id,
@@ -306,10 +337,13 @@ class Bridge:
         # The beacon that tells vehicles where that server is. It lives and dies
         # with the TCP server -- an address advertised for a socket that is not
         # listening is worse than none -- so it exists only when both are on.
+        # With host = "auto" it starts knowing no broker, and is held off every network
+        # the search has not swept until RoboCommand is found (rcfind.Finder.hold_reason).
         d = cfg.discovery
         self.beacon = (
             BeaconSender(cfg.team_id, port=d.port, interval_s=d.interval_s,
-                         never_on=d.never_on, broker_host=cfg.robocommand.host,
+                         never_on=d.never_on, broker_host=self._rc_host,
+                         hold=self.rc_find.hold_reason if self.rc_find else None,
                          log=self.log)
             if d.enabled and self.tcp is not None else None
         )
@@ -339,16 +373,11 @@ class Bridge:
             self.cfg.team.host, self.cfg.team.port, self.cfg.team.keepalive
         )
         self.team.loop_start()
-        self.rc.connect_async(
-            self.cfg.robocommand.host,
-            self.cfg.robocommand.port,
-            self.cfg.robocommand.keepalive,
-        )
-        self.rc.loop_start()
-        self.log(
-            "bridge up: team=%s robocommand=%s"
-            % (self.cfg.team.host, self.cfg.robocommand.host)
-        )
+        if self.rc_find is None:
+            self._rc_dial(self.cfg.robocommand.host)
+        else:
+            self.rc_find.start()
+        self.log("bridge up: team=%s robocommand=%s" % (self.cfg.team.host, self._rc_endpoint()))
         if self.cfg.min_declared < _POR_MIN_VEHICLES:
             # Every start, not once: a floor lowered for a bench and left
             # there is only caught by saying so until somebody fixes it.
@@ -375,6 +404,8 @@ class Bridge:
                         "are not the vehicles'" % ids)
 
     def stop(self) -> None:
+        if self.rc_find is not None:
+            self.rc_find.stop()             # first: it would start the client again
         self.stop_vehicle_link()
         for c in (self.rc, self.team):
             c.loop_stop()
@@ -382,6 +413,48 @@ class Bridge:
         self.wire.close()
 
     # ---- RoboCommand side -------------------------------------------------
+
+    def _rc_dial(self, host: str) -> None:
+        """Point the RoboCommand client at `host` and start it; paho redials from here."""
+        with self._lock:
+            self._rc_host = host
+        rcb = self.cfg.robocommand
+        self.rc.connect_async(host, rcb.port, rcb.keepalive)
+        self.rc.loop_start()
+
+    def _rc_pause(self) -> bool:
+        """Before a search round: stop the RoboCommand client, so a probe never overlaps
+        it -- the handbook's one OCS connection. False, with the client left running, if
+        it connected meanwhile."""
+        self.rc.loop_stop()
+        if self.rc.is_connected():
+            self.rc.loop_start()
+            return False
+        return True
+
+    def _rc_found(self, found: rcfind.Found) -> None:
+        """A search round found RoboCommand: the beacon leaves that network now, before
+        the client connects there."""
+        if self.beacon is not None:
+            self.beacon.set_broker(found.host, found.via)
+        self.wire.event("rc_found", "%s:%d from %s, course %s (%s)"
+                        % (found.host, found.port, found.via or "?",
+                           found.course_id or "(no course_id)", found.why))
+        self._rc_dial(found.host)
+
+    def _rc_round(self, _round: rcfind.Round) -> None:
+        """Every search round: a network it swept may now carry the beacon."""
+        if self.beacon is not None:
+            self.beacon.rescan()
+
+    def _rc_endpoint(self) -> str:
+        """Where the RoboCommand client is pointed, for the page and the console."""
+        port = self.cfg.robocommand.port
+        if self.rc_find is None:
+            return "%s:%d" % (self.cfg.robocommand.host, port)
+        host = self._rc_host
+        return ("%s:%d (auto: found by its course topic)" % (host, port) if host
+                else "auto: searching for %s on TCP %d" % (self.cfg.rc_course_sub(), port))
 
     def _on_rc_connect(self, client, _ud, _flags, reason, _props=None) -> None:
         if reason != 0:
@@ -395,6 +468,11 @@ class Bridge:
             v = self.machine.on_connect()
         self.links["robocommand"] = True
         self._on_rc_connect_stable()
+        if self.rc_find is not None:
+            self.rc_find.link(True)
+        if self.beacon is not None:
+            # The exact address the course network is reached from, whatever its mask.
+            self.beacon.set_broker(self._rc_host, rcfind.local_address(client))
         self.log("RoboCommand: " + v.reason)
         self.wire.event("connect", v.reason)
 
@@ -402,6 +480,8 @@ class Bridge:
         with self._lock:
             v = self.machine.on_disconnect()
         self.links["robocommand"] = False
+        if self.rc_find is not None:
+            self.rc_find.link(False)
         self.log("RoboCommand lost (%s): %s" % (reason, v.reason))
         self.wire.event("disconnect", "%s: %s" % (reason, v.reason))
         self._check_duplicate_ocs()
@@ -482,13 +562,13 @@ class Bridge:
         # all, and their frame is authoritative even when it is odd. Say so
         # loudly instead, in the window where a person can still act on it.
         findings = [str(f) for f in validate.check_course(course)]
-        # The UAV geofence for THIS course, from the course alone (and the static
-        # table and margin in bridge.toml), so a redelivered course recomputes the
-        # same answer. A fence we had to refuse is one more finding: the page shows
-        # it beside the others, where the operator is looking before declaring.
+        # RoboCommand's UAV polygon for THIS course, from the course alone (and the
+        # margin in bridge.toml), so a redelivered course recomputes the same answer.
+        # One that cannot be made is one more finding: the page shows it beside the
+        # others, where the operator is looking before the pilot draws.
         fence = geofence.for_course(
             course.course_id, [(c.latitude, c.longitude) for c in course.corners],
-            self._fence_table, self.cfg.geofence_margin_m,
+            self.cfg.geofence_margin_m,
             [(p.latitude, p.longitude) for p in course.uav_transit_area])
         if fence.polygon is None and self.cfg.has_uav():
             findings.append("UAV geofence: " + (fence.reason or "none"))
@@ -518,12 +598,13 @@ class Bridge:
             % (course.course_id, course.pinger_freq_hz, len(course.corners), v.reason)
         )
         if fence.polygon is not None:
-            self.log("UAV geofence for %s: %s, %d vertices"
+            self.log("RoboCommand's UAV polygon for %s (put on the aircraft for the pilot to "
+                     "draw inside): %s, %d vertices"
                      % (course.course_id, fence.source, fence.vertices))
             self.wire.event("geofence", "%s: %s, %d vertices"
                             % (course.course_id, fence.source, fence.vertices))
         else:
-            self.log("UAV GEOFENCE NONE for %s: %s" % (course.course_id, fence.reason))
+            self.log("NO RoboCommand UAV polygon for %s: %s" % (course.course_id, fence.reason))
             self.wire.event("geofence_none", "%s: %s" % (course.course_id, fence.reason))
         if findings:
             detail = "; ".join(findings)
@@ -537,7 +618,7 @@ class Bridge:
                             % self._course_changed_since)
         if changed:
             # Information only -- the vehicle decides what, if anything, to do.
-            # The new fence is already in place (above), so every aircraft is told
+            # The new polygon is already in place (above), so every aircraft is told
             # THIS course's, or an explicit null when there is none.
             self._send_info(self.cfg.vehicle_ids, "course")
 
@@ -584,6 +665,7 @@ class Bridge:
             # never granted.
             if v.ok:
                 self._route_command(cmd, which)
+                self._send_run("run start")
         else:
             # Task 4 lands here, and the handbook requires the OCS to route it
             # to the vehicle it names. It is advisory input for the mission
@@ -795,6 +877,10 @@ class Bridge:
             # Not a report and never one: it is read here and goes nowhere else --
             # not the governor, not a seq, not RoboCommand.
             return self._on_fence(payload, obj, conn)
+        if isinstance(obj, dict) and "ocs_tiers" in obj:
+            # Likewise never a report: a vehicle's tiers for the next declaration.
+            # Answered with an `ocs_run` carrying `reply`; nothing else sees it.
+            return self._on_tiers(payload, obj, conn)
 
         report = rx_reports_pb2.RxReport()
         try:
@@ -891,12 +977,14 @@ class Bridge:
 
     def _on_fence(self, payload: bytes, obj: dict, conn: Conn) -> None:
         """`{"ocs_fence": {...}}` -- the radio adapter saying what Ekko's autopilot
-        holds, read back. docs/VEHICLE_LINK.md has the frame; geofence.py has the rule
-        that decides whether the OCS may rely on it (the pre-run gate, _uav_gate).
+        held at its last read: every shape, the FENCE_* params, home HAE. A
+        declaration with that aircraft is made from it (geofence.aircraft_fence:
+        the pilot's polygon, and the ceiling home HAE + FENCE_ALT_MAX).
+        docs/VEHICLE_LINK.md has the frame.
 
         The latest one per vehicle is kept, newest wins; freshness is judged by the
-        gate from the frame's own `verified_at`, so a link that closes needs no
-        clean-up here: its confirmation simply ages out.
+        gate from the frame's own `read_at`, so a link that closes needs no clean-up
+        here: its read simply ages out.
 
         WHICH VEHICLE IS THE SOCKET'S, NOT THE BODY'S. A body is believed only about
         a vehicle this connection has identified itself as (its hello, or a report):
@@ -931,20 +1019,23 @@ class Bridge:
             before = (self._fence_confirms.get(vid) or {}).get("body") or {}
             self._fence_confirms[vid] = {"body": body, "received_at": time.time(),
                                          "link": conn.link}
-        poly = body["polygon"]
+        poly, shapes = body["polygon"], body["shapes"]
         self._wire_from_vehicle(
             conn.link, payload,
-            "ocs_fence vehicle=%s state=%s verified=%s vertices=%s"
+            "ocs_fence vehicle=%s state=%s verified=%s vertices=%s shapes=%s"
             % (vid, body["state"] or "-", body["verified"],
-               "-" if poly is None else len(poly)), obj)
-        # The console only on a CHANGE: the adapter repeats the frame every minute
-        # for as long as it is verified, and the wire log already has each one.
-        keys = ("state", "polygon", "verified", "reason", "lockout")
+               "-" if poly is None else len(poly), "-" if shapes is None else len(shapes)), obj)
+        # The console only on a CHANGE: the adapter sends one after every read (30 s),
+        # and the wire log already has each one.
+        keys = ("state", "polygon", "verified", "reason", "lockout", "shapes", "params")
         if any(before.get(k) != body[k] for k in keys):
-            self.log("fence confirmation %s: %s, %s%s%s"
+            alt = (body["params"] or {}).get("FENCE_ALT_MAX")
+            self.log("fence read %s: %s; RoboCommand's polygon %s; it holds %s, FENCE_ALT_MAX %s%s"
                      % (vid, body["state"] or "no state",
-                        "verified" if body["verified"] else "NOT verified",
-                        "" if poly is None else ", %d vertices" % len(poly),
+                        "on it" if body["verified"] else "NOT on it",
+                        "nothing read yet" if shapes is None else
+                        "%d shape(s)" % len(shapes) if shapes else "no fence items",
+                        "unread" if alt is None else "%g m" % alt,
                         " -- LOCKOUT: %s" % body["lockout"] if body["lockout"] else ""))
         return None
 
@@ -990,6 +1081,49 @@ class Bridge:
                 out[link] = max(t, out.get(link, t))
         return out
 
+    def _on_tiers(self, payload: bytes, obj: dict, conn: Conn) -> None:
+        """`{"ocs_tiers": {"vehicle_id", "tiers": {"task1".."task4": TIER_*}, "mission",
+        "sent_at"}}` -- a vehicle saying which tiers its mission means to declare. Sets
+        the tiers the next declaration carries (set_tiers), unless a run is DECLARED or
+        RUNNING. docs/VEHICLE_LINK.md has the frame.
+
+        Believed only about the vehicle this connection identified itself as (as
+        _on_fence), and never from an aircraft: an aircraft is sent nothing new. A bad or
+        refused one is answered to the vehicle that sent it (`ocs_run` with `reply`
+        ok=false and why) when there is a non-UAV vehicle to answer; the socket stays up.
+        Never a report, never a seq, never RoboCommand. Returns None either way.
+        """
+        b = obj.get("ocs_tiers")
+        sender = next((v for v in conn.vids if not self.cfg.vehicle(v).is_uav), None)
+        tiers, why = None, None
+        if not conn.vids:
+            why = "this socket has not said which vehicle it carries (no hello, no report yet)"
+        elif not isinstance(b, dict):
+            why = "ocs_tiers is not an object"
+        elif b.get("vehicle_id") not in conn.vids:
+            why = ("it names %s but this connection carries %s"
+                   % (b.get("vehicle_id"), ",".join(conn.vids)))
+        elif self.cfg.vehicle(b["vehicle_id"]).is_uav:
+            why = "%s is an aircraft: tiers are not taken from a UAV" % b["vehicle_id"]
+        elif not isinstance(b.get("mission", ""), str):
+            why = "mission must be text"
+        else:
+            tiers, why = _check_tiers(b.get("tiers"))
+        if tiers is None:
+            self.log("vehicle link %s: ocs_tiers REFUSED (%s)" % (conn.who, why))
+            self._wire_from_vehicle(conn.link, payload, "ocs_tiers REFUSED: %s" % why, obj)
+            self.wire.event("tiers_refused", "%s: %s" % (conn.who, why))
+            if sender is not None:
+                self._send_run("ocs_tiers refused", [sender],
+                               replies={sender: {"ok": False, "reason": why}})
+            return None
+        vid, mission = b["vehicle_id"], b.get("mission", "")[:64]
+        self._wire_from_vehicle(conn.link, payload,
+                                "ocs_tiers vehicle=%s mission=%s" % (vid, mission or "-"), obj)
+        self.set_tiers(tiers, "%s (mission %s)" % (vid, mission) if mission else vid,
+                       reply_to=vid)
+        return None
+
     def _on_link_change(self, vid: str, link: str, up: bool, conn: Conn) -> None:
         """A (vehicle, link) socket was filed or went away -- tcpserver's callback."""
         self.wire.event("link_up" if up else "link_down",
@@ -1000,6 +1134,7 @@ class Bridge:
             # the socket that came up, not on the vehicle's best link: a fresh
             # WiFi client is not served by a snapshot that went down the radio.
             self._send_info([vid], "%s link up" % link, link=link)
+            self._send_run("%s link up" % link, [vid], link=link)
             # A report that was this socket's first frame was receipted before the
             # socket was filed under its vehicle, so that receipt is still owed.
             self._flush_receipts()
@@ -1103,21 +1238,22 @@ class Bridge:
                     return
                 # uav_registration (8fc09f2) is stamped here, once, so every source
                 # of an aircraft's heartbeats -- its own client, the radio, the
-                # adapter's stand-in -- carries the one in bridge.toml. A reporter
-                # sending a DIFFERENT one is misconfigured, and Garuda relays these
-                # for Network Remote ID: dropped like a mistyped one, not published.
+                # adapter's stand-in -- carries the one the operator gave
+                # (operatorstore: typed, saved, or bridge.toml's). A reporter sending
+                # a DIFFERENT one is misconfigured, and Garuda relays these for
+                # Network Remote ID: dropped like a mistyped one, not published.
                 if spec.is_uav:
                     sent = report.heartbeat.uav_registration
-                    if sent and sent != spec.registration:
+                    ours = self.operator.registration(vehicle)
+                    if sent and sent != ours:
                         self.counters.dropped_misregistered += 1
-                        detail = "%s sent uav_registration %r but bridge.toml has %s" % (
-                            vehicle, sent, repr(spec.registration) if spec.registration
-                            else "none")
+                        detail = "%s sent uav_registration %r but the OCS has %s" % (
+                            vehicle, sent, repr(ours) if ours else "none")
                         self.log("DROP: " + detail)
                         self.wire.event("misregistered", detail)
                         return
-                    if spec.registration:
-                        report.heartbeat.uav_registration = spec.registration
+                    if ours:
+                        report.heartbeat.uav_registration = ours
 
             # BENCH AUTO (benchauto.py): the one rewrite of a vehicle's own value,
             # chosen by the operator on the command line. After the gates above
@@ -1316,21 +1452,42 @@ class Bridge:
         """The `ocs_info` frame for one vehicle, as a dict.
 
         A complete snapshot of what the OCS knows, never a delta: a vehicle that
-        reconnects, or missed one, is fully informed by the next. The geofence
-        is for aircraft only -- the other vehicles are not bound by it.
+        reconnects, or missed one, is fully informed by the next. `uav_geofence`
+        is for aircraft only: RoboCommand's polygon for the course, which the radio
+        adapter puts on the autopilot for the pilot to draw inside (fleet_link
+        fence_upload). It is never what is declared -- that is read back off the
+        aircraft.
 
         An aircraft ALWAYS gets both keys, and the pair means something:
         `course: null, uav_geofence: null` is "this OCS has received no course", and
-        `course: {...}, uav_geofence: null` is "there is a course but no fence could
-        be made for it" (a bad table entry, a boundary the inset cannot trust). The
-        radio adapter clears the autopilot's polygon in the first case only; in the
-        second it leaves the old one standing, which is why that case is also a
-        loud course finding. docs/VEHICLE_LINK.md.
+        `course: {...}, uav_geofence: null` is "there is a course but no polygon could
+        be made for it" (a boundary the inset cannot trust), also a loud course
+        finding. In neither case does the adapter touch the autopilot's fence.
+        docs/VEHICLE_LINK.md.
         """
         info: dict = {"course": self.course or None}
         if spec.is_uav:
             info["uav_geofence"] = self._fence_json
         return {"ocs_info": info}
+
+    def _deliver(self, vehicles, make, note: str, link: str | None = None
+                 ) -> tuple[list[str], list[str]]:
+        """Send each named vehicle the frame `make(vid)` builds (None: skip it), on one
+        link each (_send_to_vehicle), wire-logging every one that went. (reached as
+        "vid/link", missed as "vid"). The caller says what it all means in the console."""
+        reached, missed = [], []
+        for vid in vehicles:
+            obj = make(vid)
+            if obj is None:
+                continue
+            body = json.dumps(obj).encode("utf-8")
+            sent_on = self._send_to_vehicle(vid, body, link)
+            if sent_on is None:
+                missed.append(vid)
+                continue
+            reached.append("%s/%s" % (vid, sent_on))
+            self._wire_to_vehicle(vid, sent_on, body, obj, note)
+        return reached, missed
 
     def _send_info(self, vehicles, why: str, link: str | None = None) -> None:
         """Send `ocs_info` to each named vehicle that is connected and wants it.
@@ -1343,24 +1500,111 @@ class Bridge:
         """
         if self.tcp is None:
             return
-        reached, missed = [], []
-        for vid in vehicles:
+
+        def make(vid):
             spec = self.cfg.vehicle(vid)
-            if spec is None or not spec.send_info:
-                continue
-            obj = self._info_obj(spec)
-            body = json.dumps(obj).encode("utf-8")
-            sent_on = self._send_to_vehicle(vid, body, link)
-            if sent_on is None:
-                missed.append(vid)
-                continue
-            reached.append("%s/%s" % (vid, sent_on))
-            self._wire_to_vehicle(vid, sent_on, body, obj, "ocs_info (%s)" % why)
+            return self._info_obj(spec) if spec is not None and spec.send_info else None
+
+        reached, missed = self._deliver(vehicles, make, "ocs_info (%s)" % why, link)
+        self._say_delivered("ocs_info", why, reached, missed)
+
+    def _say_delivered(self, kind: str, why: str, reached, missed) -> None:
+        """The console line and the wire event for a snapshot (`ocs_info`, `ocs_run`):
+        nothing for a send that touched nobody."""
         if reached:
-            self.log("ocs_info (%s) -> %s" % (why, ", ".join(reached)))
+            self.log("%s (%s) -> %s" % (kind, why, ", ".join(reached)))
         if reached or missed:
-            self.wire.event("ocs_info", "%s: sent=%s not_connected=%s"
+            self.wire.event(kind, "%s: sent=%s not_connected=%s"
                             % (why, ",".join(reached), ",".join(missed)))
+
+    # ---- tiers and the run snapshot ---------------------------------------
+
+    def tiers_blocker(self) -> str | None:
+        """Why the tiers cannot change right now, in words, or None. A declaration
+        carries them, so they are fixed from declaring until the run is ended."""
+        with self._lock:
+            state = self.machine.state.name
+        if state in ("DECLARED", "RUNNING"):
+            return "a run is %s: end it before changing tiers" % state
+        return None
+
+    def _tiers_view(self) -> dict:
+        """The tiers as the page shows them and `ocs_run` carries them."""
+        with self._lock:
+            return {"current": dict(self._tiers), "source": self._tiers_source,
+                    "set_at": self._tiers_set_at,
+                    "declared": dict(self._declared_tiers) if self._declared_tiers else None,
+                    "blocker": self.tiers_blocker()}
+
+    def set_tiers(self, tiers, source: str, reply_to: str | None = None) -> tuple[bool, str]:
+        """Set the tiers the next declaration carries. (ok, what happened in words).
+
+        `source` is who asked, for the page: "page", or "<vehicle_id> (mission <name>)".
+        Refused, with the reason, while a run is DECLARED or RUNNING, and for anything
+        that is not all four of task1..task4 holding one of config.TIERS. Nothing in
+        the OCS ties a tier to a vehicle type or count (RoboCommand's own checks are not
+        ours to guess), so no combination is refused here. A change goes to every
+        connected non-UAV vehicle as an `ocs_run`; an unchanged or refused one only
+        answers `reply_to` (the vehicle that asked), whose `ocs_run` carries `reply`.
+        """
+        new, why = _check_tiers(tiers)
+        changed = False
+        if new is not None:
+            with self._lock:
+                why = self.tiers_blocker()
+                if why is None:
+                    changed = new != self._tiers
+                    if changed:
+                        self._tiers = new
+                        self._tiers_source, self._tiers_set_at = source, time.time()
+        ok = why is None
+        reason = ("tiers set for the next declaration by %s" % source if changed
+                  else "tiers unchanged" if ok else why)
+        self.log("tiers %s: %s" % ("SET" if changed else "kept" if ok else "REFUSED", reason)
+                 + ("  " + _tiers_line(new) if new else ""))
+        self.wire.event("tiers" if ok else "tiers_refused", reason)
+        replies = {reply_to: {"ok": ok, "reason": reason}} if reply_to else None
+        if changed:
+            self._send_run("tiers changed", replies=replies)
+        elif replies:
+            self._send_run("ocs_tiers answered", [reply_to], replies=replies)
+        return ok, reason
+
+    def _run_audience(self, vehicles=None) -> list[str]:
+        """Who is sent `ocs_run`: of `vehicles` (default: the fleet), those that are not
+        aircraft and want information. Ekko's radio adapter is sent nothing new."""
+        out = []
+        for vid in self.cfg.vehicle_ids if vehicles is None else vehicles:
+            spec = self.cfg.vehicle(vid)
+            if spec is not None and not spec.is_uav and spec.send_info:
+                out.append(vid)
+        return out
+
+    def _send_run(self, why: str, vehicles=None, link: str | None = None,
+                  replies: dict | None = None) -> None:
+        """Send `ocs_run`, the run state and the tiers, to each connected non-UAV vehicle
+        named (default: all of them). A complete snapshot, never a delta, sent when a
+        vehicle's link comes up, the tiers change, a run is declared, started or ended.
+        `replies` is vehicle_id -> {"ok", "reason"}: the answer to its `ocs_tiers`.
+        INFORMATION ONLY, like `ocs_info`: one link, no MQTT fallback."""
+        if self.tcp is None:
+            return
+        targets = self._run_audience(vehicles)
+        if not targets:
+            return
+        with self._lock:
+            m, tv = self.machine, self._tiers_view()
+            run = {"state": m.state.name, "declaration_seq": m.declaration_seq,
+                   "run_id": m.run_id, "tiers": tv["current"],
+                   "tiers_source": tv["source"], "tiers_set_at": _rfc3339_s(tv["set_at"]),
+                   "declared_tiers": tv["declared"], "sent_at": _rfc3339()}
+
+        def make(vid):
+            reply = (replies or {}).get(vid)
+            return {"ocs_run": dict(run, reply=reply) if reply else run}
+
+        reached, missed = self._deliver(targets, make, "ocs_run (%s)" % why, link)
+        self._say_delivered("ocs_run", why, reached, missed)
 
     def awaiting_auto(self) -> list[str]:
         """Declared vehicles not yet seen in STATE_AUTO.
@@ -1460,29 +1704,30 @@ class Bridge:
         Its own message type, not a field bolted onto RxCommand -- that schema
         is RoboNation's and must not grow team-local inventions.
         """
+        self._send_directive("standby_auto", vehicles, seq)
+
+    def _send_directive(self, action: str, vehicles, seq: int, **extra) -> None:
+        """`{"ocs_directive": {"action", "declaration_seq", **extra, "vehicles",
+        "sent_at"}}` to each named vehicle, advisory (see _send_standby_auto). One
+        shape for every action: `standby_auto` on declaring, `run_end` (with `run_id`)
+        on an accepted end."""
         if self.tcp is None:
             return
         obj = {"ocs_directive": {
-            "action": "standby_auto",
+            "action": action,
             "declaration_seq": seq,
+            **extra,
             "vehicles": list(vehicles),
             "sent_at": _rfc3339(),
         }}
-        body = json.dumps(obj).encode("utf-8")
-        reached, missed = [], []
-        for vid in vehicles:
-            link = self._send_to_vehicle(vid, body)
-            if link is None:
-                missed.append(vid)
-                continue
-            reached.append("%s/%s" % (vid, link))
-            self._wire_to_vehicle(vid, link, body, obj, "standby_auto seq=%d" % seq)
-        self.log("standby_auto -> %s%s"
-                 % (", ".join(reached) or "nobody",
+        reached, missed = self._deliver(vehicles, lambda vid: obj,
+                                        "%s seq=%d" % (action, seq))
+        self.log("%s -> %s%s"
+                 % (action, ", ".join(reached) or "nobody",
                     "" if not missed
                     else "  (NOT DELIVERED: %s -- no vehicle link)"
                          % ", ".join(missed)))
-        self.wire.event("standby_auto", "sent=%s missed=%s"
+        self.wire.event(action, "sent=%s missed=%s"
                         % (",".join(reached), ",".join(missed)))
 
     # ---- operator actions -------------------------------------------------
@@ -1491,29 +1736,29 @@ class Bridge:
         """Why a declaration cannot be made right now, in words, or None if it can.
 
         THE ONE PLACE the preconditions live, in the order the operator can act on
-        them: the run state, the handbook's two-vehicle floor, and then the UAV
-        fence gate. declare() asks it before it builds anything and the page's
-        button asks it every poll (snapshot `run.may_declare` and
-        `run.declare_blocker`), so the button and the endpoint cannot disagree --
-        the endpoint refuses on its own, whatever the page showed. The one thing
-        the page holds is the pilot's call sign, judged only when given -- so the
-        button's verdict is everything but that, and the page checks its box.
+        them: the run state, the handbook's two-vehicle floor, and then, with an
+        aircraft, what is read off it and the pilot's call sign (_uav_rules).
+        declare() asks it before it builds anything and the page's button asks it
+        every poll (snapshot `run.may_declare` and `run.declare_blocker`), so the
+        button and the endpoint cannot disagree -- the endpoint refuses on its own,
+        whatever the page showed.
         """
         return self._check_declare(now)[0]
 
-    def _check_declare(self, now: float | None = None, callsign: str | None = None
-                       ) -> tuple[str | None, tuple[str, ...]]:
-        """(declare_blocker, the active set it was judged on). One call, so the
-        set the gate looked at is exactly the set a declaration then names."""
+    def _check_declare(self, now: float | None = None
+                       ) -> tuple[str | None, tuple[str, ...], geofence.AircraftFence | None]:
+        """(declare_blocker, the active set it was judged on, what the aircraft in it
+        would carry). One call, so what the gate looked at is exactly what a
+        declaration then names and carries."""
         with self._lock:
             if not self.machine.may_declare():
                 if self.machine.state.name == "RUNNING":
                     return ("cannot declare during a run -- end it first, "
-                            "then declare the next one"), ()
+                            "then declare the next one"), (), None
                 return (
                     "cannot declare in %s -- need the retained RxCourse first"
                     % self.machine.state.name
-                ), ()
+                ), (), None
 
             # Only what is actually on the water. See active_ids().
             now = time.time() if now is None else now
@@ -1526,57 +1771,87 @@ class Bridge:
                     "force one in from the page."
                     % (len(active), self.cfg.min_declared,
                        ", ".join(active) or "nothing")
-                ), active
+                ), active, None
 
-            problems = self._rc_rules(active, callsign) + self._uav_gate(active, now)
+            problems, af = self._uav_rules(active, now)
             if problems:
-                return "cannot declare -- " + "; ".join(problems), active
-            return None, active
+                return "cannot declare -- " + "; ".join(problems), active, af
+            return None, active, af
 
-    def _rc_rules(self, active, callsign: str | None) -> list[str]:
-        """What RoboCommand itself refuses a declaration with an aircraft for, and
-        refuses SILENTLY -- no reply, the run just never starts: its rules on the
-        fence and the ceiling (geofence.rc_declaration_problems), then a blank
-        pilot call sign when one is given. Empty for a declaration without an
-        aircraft. Caller holds the lock."""
-        if not self._any_uav(active):
-            return []
-        out = geofence.rc_declaration_problems(
-            self._fence.polygon,            # None: _uav_gate says why there is none
-            _latlons(self.course.get("corners")),
-            _latlons(self.course.get("uav_transit_area")),
-            self.cfg.geofence_ceiling_hae_m, self.cfg.geofence_ceiling_limit_hae_m)
-        if callsign is not None and not callsign.strip():
+    def _uav_rules(self, active, now: float
+                   ) -> tuple[list[str], geofence.AircraftFence | None]:
+        """(what stops a declaration with an aircraft, what it would carry). Empty and
+        None without one: the surface and underwater vehicles are bound by none of it.
+
+        The fence and the ceiling are the aircraft's OWN, read off its autopilot --
+        the polygon the pilot drew in QGC, home HAE + FENCE_ALT_MAX -- then judged by
+        RoboCommand's own rule, which it applies SILENTLY: no reply, the run just never
+        starts (geofence.declaration_problems). Then the pilot's call sign.
+        RunDeclaration has one fence, one ceiling and one pilot, so one aircraft per
+        declaration. Caller holds the lock."""
+        uavs = [vid for vid in active if self.cfg.vehicle(vid).is_uav]
+        if not uavs:
+            return [], None
+        if len(uavs) > 1:
+            return ["%s: a declaration carries one UAV fence, one ceiling and one pilot -- "
+                    "declare one aircraft at a time" % " and ".join(uavs)], None
+        af = self._aircraft_fence(uavs[0], now)
+        out = self._judge(af)
+        if not self.operator.callsign:
             out.append("the UAV pilot's call sign is blank: type it next to Declare "
                        "(MyDroneFleets: first name + UAPL number)")
-        return out
+        return out, af
 
-    def _uav_gate(self, active, now: float) -> list[str]:
-        """One problem per declared aircraft whose autopilot is not KNOWN to hold
-        this course's fence (geofence.confirmation_problem has the rule). Empty
-        when every aircraft going in is confirmed, and for a declaration with none:
-        the gate is about aircraft, and the surface and underwater vehicles are not
-        bound by the fence. Caller holds the lock."""
-        out = []
-        for vid in active:
-            if not self.cfg.vehicle(vid).is_uav:
-                continue
-            rec = self._fence_confirms.get(vid)
-            why = geofence.confirmation_problem(
-                vid, self._fence, rec["body"] if rec else None, now,
-                self.cfg.geofence_confirm_max_age_s)
-            if why:
-                out.append(why)
-        return out
+    def _aircraft_fence(self, vid: str, now: float) -> geofence.AircraftFence:
+        """What a declaration with `vid` would carry, from its latest `ocs_fence`:
+        never RoboCommand's polygon, which the OCS put there itself. Caller holds the lock."""
+        rec = self._fence_confirms.get(vid)
+        body = rec["body"] if rec else None
+        return geofence.aircraft_fence(
+            vid, body, (self._fence.open_polygon, body["polygon"] if body else None),
+            now, self.cfg.geofence_confirm_max_age_s)
+
+    def _judge(self, af: geofence.AircraftFence) -> list[str]:
+        """Everything that keeps `af` out of a declaration: its own problems, then
+        RoboCommand's rule against the course in hand. Caller holds the lock."""
+        return geofence.declaration_problems(
+            af, _latlons(self.course.get("corners")),
+            _latlons(self.course.get("uav_transit_area")),
+            self.cfg.geofence_ceiling_limit_hae_m)
+
+    def set_operator(self, *, callsign: str | None = None,
+                     registration: dict | None = None, save: bool = False) -> tuple[bool, str]:
+        """What the operator typed on the page: the pilot's call sign, an aircraft's
+        registration, and `save` to keep them as this laptop's defaults (operator.py).
+        (ok, what happened in words). A registration does not change during a run:
+        it is on every heartbeat RoboCommand relays for Network Remote ID."""
+        with self._lock:
+            frozen = ("a registration cannot change during a run -- it is on every heartbeat "
+                      "RoboCommand relays; end the run first"
+                      if self.machine.state.name == "RUNNING" else None)
+            try:
+                changed = self.operator.set(callsign=callsign, registration=registration,
+                                            save=save, registration_frozen=frozen)
+            except OperatorError as exc:
+                return False, str(exc)
+        for line in changed:
+            self.log("operator: " + line)
+            self.wire.event("operator", line)
+        return True, "; ".join(changed) or "nothing changed"
 
     def declare(self, callsign: str | None = None) -> str:
         """Publish the RunDeclaration. This is what creates the obligations.
 
-        `callsign` is the page's box; None falls back to `[uav] pilot_callsign`.
-        Only a declaration with an aircraft carries it and the ceiling."""
-        callsign = (self.cfg.uav_pilot_callsign if callsign is None else callsign).strip()
+        `callsign` is the page's box: when given it becomes the current call sign
+        first, so what is declared is what the operator sees. A declaration with an
+        aircraft carries what is read off it -- the pilot's polygon and the ceiling --
+        and the call sign."""
+        if callsign is not None:
+            ok, why = self.set_operator(callsign=callsign)
+            if not ok:
+                return "cannot declare -- " + why
         with self._lock:
-            blocked, active = self._check_declare(callsign=callsign)
+            blocked, active, af = self._check_declare()
             if blocked:
                 return blocked
 
@@ -1593,15 +1868,15 @@ class Bridge:
             decl = req.run_declaration
             decl.vehicle_ids.extend(active)
             tier = common_pb2.TaskTier
-            decl.task1_tier = tier.Value(self.cfg.tiers[0])
-            decl.task2_tier = tier.Value(self.cfg.tiers[1])
-            decl.task3_tier = tier.Value(self.cfg.tiers[2])
-            decl.task4_tier = tier.Value(self.cfg.tiers[3])
-            _fill_fence(decl, self._fence.polygon)
-            if self._any_uav(active):
-                # Both checked by _rc_rules above: set, in range, not blank.
-                decl.uav_geofence_max_altitude_hae_m = self.cfg.geofence_ceiling_hae_m
-                decl.uav_pilot_callsign = callsign
+            decl.task1_tier = tier.Value(self._tiers["task1"])
+            decl.task2_tier = tier.Value(self._tiers["task2"])
+            decl.task3_tier = tier.Value(self._tiers["task3"])
+            decl.task4_tier = tier.Value(self._tiers["task4"])
+            if af is not None:
+                # All three checked by _uav_rules above: read, in range, not blank.
+                _fill_fence(decl, af.polygon)
+                decl.uav_geofence_max_altitude_hae_m = af.ceiling_hae_m
+                decl.uav_pilot_callsign = self.operator.callsign
 
             # Nothing in a declaration has an honest UNKNOWN: there are no
             # per-vehicle exemptions to inherit here, only four tiers that must
@@ -1619,6 +1894,7 @@ class Bridge:
             self._all_auto = False
             self._all_auto_since = None
             self._declared = tuple(active)
+            self._declared_tiers = dict(self._tiers)
             self._course_changed_since = None
             self.seqs.save_run(self.machine.state.name,
                                self.machine.declaration_seq, self.machine.run_id)
@@ -1629,18 +1905,29 @@ class Bridge:
             note="RunDeclaration seq=%d [%s]" % (seq, ",".join(active)),
             decoded=lambda: _wire_dict(req),
         )
-        self._run_event("declare", "RunDeclaration seq=%d [%s]"
-                        % (seq, ",".join(active)))
+        self._run_event("declare", "RunDeclaration seq=%d [%s] %s"
+                        % (seq, ",".join(active), _tiers_line(self._declared_tiers)))
+        if af is not None:
+            # Where the aircraft's half came from, for whoever reads the log later.
+            what = ("%s: the %d-vertex polygon and ceiling %g m HAE (%s) read off its "
+                    "autopilot %.0f s before; pilot %s"
+                    % (af.vehicle_id, len(af.polygon) - 1, af.ceiling_hae_m, af.ceiling_from,
+                       af.read_age_s, self.operator.callsign))
+            self.log("declared with " + what)
+            self.wire.event("declare_uav", what)
         # After the declaration is on the wire, not before: the vehicles are
         # being told to stand by for a run we have actually declared.
         self._send_standby_auto(active, seq)
-        # The declared geofence goes to the declared aircraft, as information.
+        # The declared aircraft hears the course and RoboCommand's polygon again,
+        # as information; nothing in it changed.
         self._send_info([vid for vid in active if self.cfg.vehicle(vid).is_uav],
                         "declaration")
+        self._send_run("declaration")
         return "%s; declared %s" % (v.reason, ", ".join(active))
 
     def end(self) -> str:
         with self._lock:
+            seq, run_id = self.machine.declaration_seq, self.machine.run_id
             v = self.machine.on_end()
             if v.ok:
                 self._course_changed_since = None
@@ -1648,6 +1935,12 @@ class Bridge:
                                    self.machine.declaration_seq, self.machine.run_id)
         if v.ok:
             self._run_event("end", v.reason)
+            # Advisory, to the declared vehicles that are not aircraft: the boat clears
+            # its RunStart latch. Then everyone is told the run is ENDED.
+            declared = self._run_audience(self._declared)
+            if declared:
+                self._send_directive("run_end", declared, seq, run_id=run_id)
+            self._send_run("run ended")
         return v.reason
 
     def _run_event(self, kind: str, detail: str) -> None:
@@ -1684,14 +1977,15 @@ class Bridge:
                 # hunting through config files; "DOWN 192.168.65.2:1883" tells
                 # them whether the OCS is even aiming at the right box.
                 "endpoints": {
-                    "robocommand": "%s:%d" % (self.cfg.robocommand.host,
-                                              self.cfg.robocommand.port),
+                    "robocommand": self._rc_endpoint(),
                     "team": "%s:%d" % (self.cfg.team.host, self.cfg.team.port),
                     "tcp": ("%s:%d" % (self.cfg.tcp_host, self.cfg.tcp_port)
                             if self.tcp is not None else "off"),
                 },
                 "tcp_peers": peers,
                 "beacon": self._beacon_view(),
+                # With host = "auto": the search for RoboCommand's broker, round by round.
+                "rc_search": self.rc_find.snapshot() if self.rc_find is not None else None,
                 "link_prefer_s": self.cfg.link_prefer_s,
                 # Whether the evidence log is complete. errors > 0 means a line
                 # (or a decode) failed and the file has a gap -- the page says so.
@@ -1715,34 +2009,40 @@ class Bridge:
                         # manager), so the page counts, it does not time out.
                         "all_auto_since": self._all_auto_since,
                         "declared": list(self._declared)},
-                # What a declaration with an aircraft carries besides the fence. The
-                # call sign here is only the default for the page's box.
+                # What a declaration with each aircraft would carry, judged now, all of
+                # it read off its autopilot (_uav_declaration_view). run.declare_blocker
+                # is the verdict; this is what the page and the /map show.
                 "uav": {"in_declaration": self._any_uav(active_now),
-                        "ceiling_hae_m": self.cfg.geofence_ceiling_hae_m,
                         "ceiling_limit_hae_m": self.cfg.geofence_ceiling_limit_hae_m,
-                        "pilot_callsign": self.cfg.uav_pilot_callsign,
-                        "registration": {v.id: v.registration for v in self.cfg.vehicles
-                                         if v.is_uav}},
+                        "declaration": {v.id: self._uav_declaration_view(v.id, now)
+                                        for v in self.cfg.vehicles if v.is_uav}},
+                # What the operator types: the pilot's call sign and each aircraft's
+                # registration, each with where it came from (operatorstore.view).
+                "operator": self.operator.view(),
                 # Every task report (not heartbeats) and what became of it, newest
                 # first: held / dropped / published / acknowledged by the broker.
                 "task_reports": [dict(e) for e in reversed(self.task_reports)],
                 "course": self.course,
                 "course_findings": list(self.course_findings),
-                # The UAV geofence for the CURRENT course (closed, RunDeclaration's own JSON
-                # shape), or null -- the /map draws it next to the course and to what Ekko's
-                # autopilot actually holds (fleet_link's fence_upload). `uav_geofence_source` says
-                # where it came from ("table: ALPHA", "course boundary inset 2.0 m"); when
-                # there is no fence it is null and `uav_geofence_reason` says why.
+                # RoboCommand's UAV polygon for the CURRENT course (closed, RunDeclaration's
+                # own JSON shape), or null: what the OCS puts on the aircraft for the pilot
+                # to draw inside, never what is declared. `uav_geofence_source` says how it
+                # was made ("course boundary inset 2.0 m"); when there is none it is null
+                # and `uav_geofence_reason` says why.
                 "uav_geofence": self._fence_json,
                 "uav_geofence_source": self._fence.source,
                 "uav_geofence_reason": self._fence.reason,
-                # Each aircraft's latest `ocs_fence`, as received, with its age by our clock
-                # and whether its polygon is the one above: {"UAV1": {..., "age_s",
+                # Each aircraft's latest `ocs_fence`, as received, with the ages of the read
+                # and of RoboCommand's polygon last seen on it, and whether the adapter has
+                # the polygon above: {"UAV1": {..., "age_s", "verified_age_s",
                 # "matches_course_fence"}}. Only vehicles that have sent one appear.
                 "fence_confirm": self._fence_confirm_view(now),
                 "fence_confirm_max_age_s": self.cfg.geofence_confirm_max_age_s,
                 "active": list(self.active_ids(now)),
                 "por_min_vehicles": self.cfg.min_declared,
+                # The tiers the next declaration carries and who set them, those the
+                # current / last declaration carried, and why they cannot change now.
+                "tiers": self._tiers_view(),
                 # The bench dry-run switch. Always present so a page need not
                 # guess: empty `vehicles` means off.
                 "bench_auto": {
@@ -1797,19 +2097,36 @@ class Bridge:
             }
 
     def _fence_confirm_view(self, now: float) -> dict:
-        """vehicle_id -> its latest `ocs_fence` as received, plus `age_s` (seconds since
-        its read-back by OUR clock, None when it carries no readable `verified_at`)
-        and `matches_course_fence`. Config order. Caller holds the lock."""
+        """vehicle_id -> its latest `ocs_fence` as received, plus, by OUR clock, `age_s`
+        (since the adapter last read the autopilot's fence) and `verified_age_s` (since
+        RoboCommand's polygon was last seen on it) -- each None without a readable time
+        -- and `matches_course_fence`. Config order. Caller holds the lock."""
         out = {}
         for vid in self.cfg.vehicle_ids:
             rec = self._fence_confirms.get(vid)
             if rec is None:
                 continue
-            age = geofence.age_s(rec["body"], now)
-            out[vid] = dict(rec["body"],
-                            age_s=None if age is None else round(age, 1),
-                            matches_course_fence=geofence.matches(self._fence, rec["body"]))
+            body = rec["body"]
+            out[vid] = dict(body,
+                            age_s=_round1(geofence.age_s(body, now)),
+                            verified_age_s=_round1(geofence.age_s(body, now, "verified_at")),
+                            matches_course_fence=geofence.matches(self._fence, body))
         return out
+
+    def _uav_declaration_view(self, vid: str, now: float) -> dict:
+        """What a declaration with `vid` would carry now, read off its autopilot: the
+        pilot's polygon (closed, RunDeclaration's own JSON shape, or null), the ceiling
+        and how it was made, the age of the read, what keeps it out (`problems`: its
+        own, then RoboCommand's rule) and what is worth knowing before flight (`notes`).
+        The call sign is not here: it is the operator's (snapshot `operator`).
+        Caller holds the lock."""
+        af = self._aircraft_fence(vid, now)
+        return {"polygon": _fence_json(af.polygon),
+                "ceiling_hae_m": af.ceiling_hae_m,
+                "ceiling_from": af.ceiling_from,
+                "read_age_s": _round1(af.read_age_s),
+                "problems": self._judge(af),
+                "notes": list(af.notes)}
 
 
     def _beacon_view(self) -> dict:
@@ -1911,20 +2228,22 @@ class Bridge:
 
 
     def _fence_line(self, now: float) -> str:
-        """One console line: the course's fence and each aircraft's confirmation.
-        Caller holds the lock."""
+        """One console line: RoboCommand's polygon for the course, then per aircraft its
+        last read and what a declaration with it would carry. Caller holds the lock."""
         f = self._fence
-        head = ("none: %s" % f.reason if f.polygon is None
-                else "%s, %d vertices" % (f.source, f.vertices))
-        views = self._fence_confirm_view(now)
-        for vid, c in views.items():
-            age = "age unknown" if c["age_s"] is None else "%.0f s old" % c["age_s"]
-            what = ("cleared" if c["polygon"] == [] else
-                    "holds the fence" if c["matches_course_fence"] else "holds another polygon")
-            head += "; %s %s, %s, %s" % (
-                vid, "verified" if c["verified"] else "NOT verified (%s)" % (c["state"] or "?"),
-                what, age)
-        return head
+        line = ("RoboCommand's: none (%s)" % f.reason if f.polygon is None
+                else "RoboCommand's %s, %d vertices" % (f.source, f.vertices))
+        for vid, c in self._fence_confirm_view(now).items():
+            af = self._aircraft_fence(vid, now)
+            problems = self._judge(af)
+            line += "; %s %s, %s, %s" % (
+                vid,
+                "never read (%s)" % (c["reason"] or c["state"] or "?") if c["age_s"] is None
+                else "read %.0f s ago" % c["age_s"],
+                "RoboCommand's on it" if c["verified"] else "RoboCommand's not on it",
+                "declares %d vertices to %g m HAE" % (len(af.polygon) - 1, af.ceiling_hae_m)
+                if not problems else "CANNOT declare: %s" % problems[0])
+        return line
 
 
 def _beacon_line(b: dict) -> str:
@@ -2003,6 +2322,11 @@ def _wire_dict(msg) -> dict:
     return json_format.MessageToDict(msg, preserving_proto_field_name=True)
 
 
+def _round1(x: float | None) -> float | None:
+    """A time or a distance for the page: one decimal, None stays None."""
+    return None if x is None else round(x, 1)
+
+
 def _latlons(points) -> list[tuple[float, float]]:
     """[(lat, lon)] from a decoded repeated LatLng; [] when the field is absent."""
     return [(p.get("latitude", 0.0), p.get("longitude", 0.0)) for p in points or ()]
@@ -2038,6 +2362,30 @@ def _fence_json(polygon) -> list | None:
     decl = rx_requests_pb2.RunDeclaration()
     _fill_fence(decl, polygon)
     return _decode(decl)["uav_geofence"]
+
+
+def _rfc3339_s(epoch: float) -> str:
+    """An epoch time as `ocs_run` carries it, to the second."""
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _check_tiers(raw) -> tuple[dict[str, str] | None, str | None]:
+    """(task1..task4 -> TIER_*, None) if `raw` is exactly those four keys, each one of
+    config.TIERS (TIER_UNKNOWN is never legal); else (None, why in words)."""
+    if not isinstance(raw, dict):
+        return None, "tiers must be an object with task1..task4"
+    if set(raw) != set(TASKS):
+        return None, ("tiers must have exactly task1..task4; missing %s, unexpected %s"
+                      % (sorted(set(TASKS) - set(raw)) or "none",
+                         sorted(set(raw) - set(TASKS), key=str) or "none"))
+    for task in TASKS:
+        if raw[task] not in TIERS:
+            return None, "%s = %r is not one of %s" % (task, raw[task], ", ".join(TIERS))
+    return {task: raw[task] for task in TASKS}, None
+
+
+def _tiers_line(tiers: dict[str, str]) -> str:
+    return " ".join("%s=%s" % (t, tiers[t].replace("TIER_", "")) for t in TASKS)
 
 
 def _rfc3339() -> str:

@@ -134,17 +134,20 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
   path.trail.ocs { stroke-width:2 }
   path.trail.stale { stroke-dasharray:3 7; stroke-opacity:.4 }
 
-  /* ---- fences: course boundary (RoboCommand), the UAV geofence declared for this course, and
-     what the autopilot holds (read back by fleet_link). CSS beats Leaflet's SVG attributes. */
+  /* ---- fences: course boundary (RoboCommand), RoboCommand's UAV polygon (the OCS puts it on the
+     aircraft), what the autopilot holds (read back by fleet_link), and the one polygon of those a
+     declaration would carry (the pilot's). CSS beats Leaflet's SVG attributes. */
   path.fence-course { stroke:var(--dim); stroke-width:2; stroke-dasharray:2 6; fill:none }
   path.fence-transit { stroke:var(--dim); stroke-width:1.5; stroke-dasharray:1 4; fill:var(--dim); fill-opacity:.08 }
-  path.fence-declared { stroke:var(--v-drone); stroke-width:2; stroke-dasharray:9 6; fill:none }
+  path.fence-rc { stroke:var(--v-drone); stroke-width:2; stroke-dasharray:9 6; fill:none }
+  path.fence-decl { stroke:var(--ok); stroke-width:3; stroke-dasharray:14 5; fill:none }
   path.fence-fc { stroke:var(--v-drone); stroke-width:4; stroke-opacity:.9; fill:var(--v-drone); fill-opacity:.14 }
   path.fence-fc.excl { stroke:var(--bad); fill:var(--bad) }
   .sw { display:inline-block; width:20px; height:0; vertical-align:middle; margin:0 4px 0 2px }
   .sw.course { border-top:2px dotted var(--dim) }
   .sw.transit { border-top:6px solid var(--dim); opacity:.35 }
-  .sw.decl { border-top:2px dashed var(--v-drone) }
+  .sw.rc { border-top:2px dashed var(--v-drone) }
+  .sw.decl { border-top:3px dashed var(--ok) }
   .sw.fc { border-top:4px solid var(--v-drone) }
 
   /* phone: map on top, panel below, page scrolls vertically only */
@@ -187,8 +190,9 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
       <h2>Geofence</h2>
       <div id="flegend" class="dim"><span class="sw course"></span>course (RoboCommand) ·
         <span class="sw transit"></span>UAV transit area (RoboCommand) ·
-        <span class="sw decl"></span>declared for this course ·
-        <span class="sw fc"></span>on the autopilot (read back)</div>
+        <span class="sw rc"></span>RoboCommand's UAV polygon (put on the aircraft) ·
+        <span class="sw fc"></span>on the autopilot (read back) ·
+        <span class="sw decl"></span>what a declaration carries (the pilot's)</div>
       <div id="fences" class="dim">—</div>
     </section>
     <section>
@@ -437,12 +441,14 @@ function drawAll(recs, nowMs) {
 }
 
 // ---- fences -------------------------------------------------------------------------------
-// Three outlines from three sources, never merged: the COURSE boundary RoboCommand published
-// (/api/state course), the UAV geofence this OCS DECLARES FOR THIS COURSE (/api/state uav_geofence;
-// uav_geofence_source says where it came from), and what each
-// radio vehicle's AUTOPILOT holds as fleet_link last read it back (/api/fleet ...fence_upload).
-// The last is what is enforced; the declared one is what RoboCommand judges. Each is drawn only
-// while its source answers: a fence nobody can vouch for right now is not drawn from memory.
+// Outlines from separate sources, never merged: the COURSE boundary RoboCommand published
+// (/api/state course); RoboCommand's UAV POLYGON this OCS made from it and puts on the aircraft for
+// the pilot to draw inside (/api/state uav_geofence; uav_geofence_source says how); what each radio
+// vehicle's AUTOPILOT holds as fleet_link last read it back (/api/fleet ...fence_upload); and, for
+// each aircraft, the one polygon of those a DECLARATION would carry -- the pilot's, read off it by
+// the OCS (/api/state uav.declaration). The autopilot's is what is enforced; the declared one is
+// what RoboCommand judges. Each is drawn only while its source answers: a fence nobody can vouch
+// for right now is not drawn from memory.
 let fenceLayer = null, fenceKey = '', fenceBounds = null;
 const llOf = p => validFix(p && p.latitude, p && p.longitude);
 
@@ -452,17 +458,22 @@ function fenceData(d) {
   // RxCourse.uav_transit_area (8fc09f2): where the aircraft may fly besides the course itself.
   const transit = st.course && Array.isArray(st.course.uav_transit_area)
     ? st.course.uav_transit_area.map(llOf).filter(Boolean) : [];
-  const declared = Array.isArray(st.uav_geofence) ? st.uav_geofence.map(llOf).filter(Boolean) : [];
+  const rc = Array.isArray(st.uav_geofence) ? st.uav_geofence.map(llOf).filter(Boolean) : [];
   const vs = (d.fleet && d.fleet.ocs && d.fleet.ocs.vehicles) || {};
   const uploads = Object.keys(vs).sort().filter(id => vs[id] && vs[id].fence_upload)
                         .map(id => ({id, f: vs[id].fence_upload}));
-  return {course, transit, declared, uploads, source: st.uav_geofence_source, reason: st.uav_geofence_reason,
-          confirms: st.fence_confirm || {}, maxAge: num(st.fence_confirm_max_age_s) || 180};
+  const decls = (st.uav && st.uav.declaration) || {};
+  const declared = Object.keys(decls).sort().map(id => ({id, d: decls[id] || {},
+    ll: Array.isArray((decls[id] || {}).polygon) ? decls[id].polygon.map(llOf).filter(Boolean) : []}));
+  return {course, transit, rc, uploads, declared, source: st.uav_geofence_source, reason: st.uav_geofence_reason,
+          confirms: st.fence_confirm || {}, maxAge: num(st.fence_confirm_max_age_s) || 180,
+          limit: st.uav && st.uav.ceiling_limit_hae_m};
 }
 
 function drawFences(fd) {
   if (!HAVE_MAP) return;
-  const key = JSON.stringify([fd.course, fd.transit, fd.declared, fd.uploads.map(u => [u.id, u.f.autopilot_shapes])]);
+  const key = JSON.stringify([fd.course, fd.transit, fd.rc, fd.declared.map(x => x.ll),
+                              fd.uploads.map(u => [u.id, u.f.autopilot_shapes])]);
   if (key === fenceKey) return;              // redraw only on change: no flicker, no churn
   fenceKey = key;
   fenceLayer.clearLayers();
@@ -486,8 +497,11 @@ function drawFences(fd) {
     add(L.polygon(fd.course, {className: 'fence-course'}), 'course boundary (RoboCommand)', fd.course);
   if (fd.transit.length >= 3)
     add(L.polygon(fd.transit, {className: 'fence-transit'}), 'UAV transit area (RoboCommand)', fd.transit);
-  if (fd.declared.length >= 3)
-    add(L.polygon(fd.declared, {className: 'fence-declared'}), 'UAV geofence, declared for this course', fd.declared);
+  if (fd.rc.length >= 3)
+    add(L.polygon(fd.rc, {className: 'fence-rc'}), "RoboCommand's UAV polygon (put on the aircraft)", fd.rc);
+  fd.declared.forEach(({id, ll}) => {
+    if (ll.length >= 3) add(L.polygon(ll, {className: 'fence-decl'}), id + ': what a declaration carries', ll);
+  });
   fenceBounds = pts.length ? L.latLngBounds(pts) : null;
   $('fence').disabled = !fenceBounds;
 }
@@ -497,32 +511,34 @@ const FENCE_STATE = {done: ['ok', 'on the autopilot'], held: ['warn', 'held'], b
 
 function fencesHtml(fd, d) {
   const out = [];
-  const n = fd.declared.length;
-  const closed = n > 1 && fd.declared[0][0] === fd.declared[n - 1][0] && fd.declared[0][1] === fd.declared[n - 1][1];
-  // "declared for this course": what RunDeclaration carries and the aircraft is told. Its source
-  // says how it was worked out ("table: ALPHA", "course boundary inset 2.0 m"); with none, why.
-  // With a course held and no fence the pill is red -- the aircraft keeps whatever fence it has.
-  out.push('<div class="lrow">' + field('declared for this course', !d.state ? pill('bad', 'OCS not answering')
+  const n = fd.rc.length;
+  const closed = n > 1 && fd.rc[0][0] === fd.rc[n - 1][0] && fd.rc[0][1] === fd.rc[n - 1][1];
+  // RoboCommand's UAV polygon: what the aircraft is told and fleet_link puts on it, for the pilot to
+  // draw inside. Its source says how it was made ("course boundary inset 2.0 m"); with none, why.
+  // With a course held and none the pill is red -- the pilot has nothing to draw inside.
+  out.push('<div class="lrow">' + field("RoboCommand's polygon", !d.state ? pill('bad', 'OCS not answering')
              : n ? (n - (closed ? 1 : 0)) + ' vertices' + (fd.source ? ' <span class="dim">(' + esc(fd.source) + ')</span>' : '')
                  : pill(fd.course.length ? 'bad' : 'idle', 'none') + (fd.reason ? ' <span class="dim">' + esc(fd.reason) + '</span>' : ''))
            + field('course', !d.state ? '—' : fd.course.length ? fd.course.length + ' corners' : 'not received')
            + field('transit area', !d.state || !fd.course.length ? '—'
                    : fd.transit.length ? fd.transit.length + ' points' : 'none in RxCourse')
            + '</div>');
-  // What the radio adapter told the OCS it read back (`ocs_fence`) -- the evidence the declare gate
-  // judges. Not the same thing as the autopilot row below, which is fleet_link's own read.
-  Object.keys(fd.confirms).sort().forEach(id => {
+  // Per aircraft, what a declaration would carry -- the pilot's polygon and the ceiling, read off the
+  // autopilot by the OCS (`ocs_fence`, how old) -- or what stops it. The bridge's verdict, not the
+  // map's: the same lines as the operator page. Not the autopilot row below, fleet_link's own read.
+  fd.declared.forEach(({id, d: x, ll}) => {
     const c = fd.confirms[id] || {};
-    const age = num(c.age_s);
-    const cleared = c.verified && Array.isArray(c.polygon) && c.polygon.length === 0;
-    const [cls, text] = !c.verified ? ['warn', 'not verified'] : cleared ? ['idle', 'cleared']
-      : !c.matches_course_fence ? ['warn', 'holds another polygon']
-      : (age === null || age > fd.maxAge) ? ['bad', 'stale'] : ['ok', 'confirmed'];
+    const age = num(c.age_s), problems = x.problems || [];
+    const [cls, text] = problems.length ? ['bad', 'cannot declare'] : ['ok', 'declarable'];
     out.push('<div class="vrow"><div class="l1"><b>' + esc(id) + '</b> ' + pill(cls, text) + ' '
-      + field('OCS gate', esc(c.state || '—') + (Array.isArray(c.polygon) && c.polygon.length ? ', ' + c.polygon.length + ' vertices' : ''))
-      + field('read back', age === null ? 'age unknown' : age.toFixed(0) + ' s ago')
+      + field('declares', ll.length ? (ll.length - 1) + ' vertices' : '—')
+      + field('ceiling', x.ceiling_hae_m != null ? esc(x.ceiling_hae_m) + ' m HAE'
+              + ' <span class="dim">(' + esc(x.ceiling_from || '') + '; at most ' + esc(fd.limit) + ')</span>' : '—')
+      + field('read', age === null ? 'never' : age.toFixed(0) + ' s ago')
       + (c.lockout ? ' ' + pill('warn', 'will not arm here') : '') + '</div>'
-      + (!c.verified && c.reason ? '<div class="dim">' + esc(c.reason) + '</div>' : '') + '</div>');
+      + problems.map(p => '<div class="dim">' + pill('bad', 'blocks') + ' ' + esc(p) + '</div>').join('')
+      + (x.notes || []).map(p => '<div class="dim">' + pill('warn', 'note') + ' ' + esc(p) + '</div>').join('')
+      + '</div>');
   });
   if (!d.fleet) out.push('<div class="dim">fleet_link not answering — what the autopilot holds is unknown</div>');
   else if (!fd.uploads.length) out.push('<div class="dim">no radio vehicle reports a fence upload</div>');

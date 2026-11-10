@@ -7,12 +7,17 @@ Laptop, Windows PowerShell, in OCS\\, with ocs_web STOPPED:
     .venv\\Scripts\\python.exe bad_request.py height --callsign <first name + UAPL number>
 
 It exists because the OCS page refuses both of these itself, so through the page they never
-reach RoboCommand. It uses bridge.toml's address and team, and the OCS's own sequence counter
-so a later real declaration still climbs. RoboCommand answers a refused declaration with
-nothing at all: this prints the reason the OCS's own copy of their check gives, publishes,
-then watches for a RunStart. A RunStart means it was wrongly accepted. No RunStart proves
-nothing by itself, because a good request also gets none until the vehicles report AUTO, so
-the refusal has to be confirmed on RoboCommand's side (the test server's log, tonight).
+reach RoboCommand. It finds RoboCommand the way the OCS does -- one search round for the
+broker holding the course, with [robocommand] host = "auto" (rx_bridge/rcfind.py) -- or uses
+the address pinned there; bridge.toml's team; and the OCS's own sequence counter so a later
+real declaration still climbs. The fence is RoboCommand's own polygon for the course (slid
+off it for `fence`); the ceiling is --ceiling (default: the most RoboCommand accepts,
+[geofence] ceiling_limit_hae_m), or 10 m over that limit for `height`. RoboCommand answers a
+refused declaration with nothing at all: this prints the reason the OCS's own copy of their
+check gives, publishes, then watches for a RunStart. A RunStart means it was wrongly
+accepted. No RunStart proves nothing by itself, because a good request also gets none until
+the vehicles report AUTO, so the refusal has to be confirmed on RoboCommand's side (the test
+server's log, tonight).
 """
 from __future__ import annotations
 
@@ -24,7 +29,7 @@ import time
 
 import paho.mqtt.client as mqtt
 
-from rx_bridge import config, geofence
+from rx_bridge import config, geofence, rcfind
 from rx_bridge.proto import common_pb2, rx_commands_pb2, rx_course_pb2, rx_requests_pb2
 from rx_bridge.seqstore import SeqStore
 
@@ -79,6 +84,10 @@ def main() -> int:
     ap.add_argument("what", choices=("fence", "height"))
     ap.add_argument("--callsign", required=True, help="first name + UAPL number")
     ap.add_argument("--config", default="bridge.toml")
+    ap.add_argument("--ceiling", type=float, default=None, metavar="M",
+                    help="uav_geofence_max_altitude_hae_m for `fence` (default: bridge.toml's "
+                         "[geofence] ceiling_limit_hae_m, the most RoboCommand accepts); "
+                         "`height` always sends that limit + %g m" % ABOVE_LIMIT_BY_M)
     ap.add_argument("--wait", type=float, default=10.0, help="seconds to watch for a RunStart")
     args = ap.parse_args()
 
@@ -112,12 +121,25 @@ def main() -> int:
                 held["run_start"] = cmd.run_start
                 got_start.set()
 
+    host = cfg.robocommand.host
+    if cfg.robocommand.auto:
+        print("looking for RoboCommand: a broker with %s on TCP %d ..."
+              % (cfg.rc_course_sub(), cfg.robocommand.port))
+        rnd = rcfind.find_once(cfg.robocommand.port, cfg.rc_course_sub(), cfg.team_id)
+        if rnd.found is None:
+            print("FAILED: RoboCommand not found from %s -- %s"
+                  % (", ".join(rnd.addresses) or "no usable address",
+                     rcfind.said(rnd.tried) or "nothing answered"))
+            return 1
+        host = rnd.found.host
+        print("found at %s (%s)" % (host, rnd.found.why))
+
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                          client_id="ocs-badrequest-" + cfg.team_id)
     client.on_connect, client.on_message = on_connect, on_message
-    print("connecting to RoboCommand at %s:%d as team %s"
-          % (cfg.robocommand.host, cfg.robocommand.port, cfg.team_id))
-    client.connect(cfg.robocommand.host, cfg.robocommand.port, keepalive=30)
+    print("connecting to RoboCommand at %s:%d as team %s" % (host, cfg.robocommand.port,
+                                                            cfg.team_id))
+    client.connect(host, cfg.robocommand.port, keepalive=30)
     client.loop_start()
     try:
         if not got_course.wait(30.0):
@@ -126,13 +148,13 @@ def main() -> int:
         course = held["course"]
         corners = latlons(course.corners)
         transit = latlons(course.uav_transit_area)
-        good = geofence.for_course(course.course_id, corners, cfg.geofence_table,
-                                   cfg.geofence_margin_m, transit)
+        good = geofence.for_course(course.course_id, corners, cfg.geofence_margin_m, transit)
         if good.polygon is None:
             print("FAILED: the OCS has no valid fence for %s: %s" % (course.course_id, good.reason))
             return 1
 
-        ceiling = cfg.geofence_ceiling_hae_m
+        ceiling = (args.ceiling if args.ceiling is not None
+                   else cfg.geofence_ceiling_limit_hae_m)
         fence = good.polygon
         if args.what == "fence":
             fence = moved_north_of_course(fence, corners, transit)

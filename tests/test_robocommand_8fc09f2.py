@@ -24,7 +24,8 @@ import paho.mqtt.client as mqtt                                  # noqa: E402
 from rx_bridge import geofence                                   # noqa: E402
 from rx_bridge.config import ConfigError, load                   # noqa: E402
 
-from tests.harness import BridgeCase, course_bytes, heartbeat, readiness   # noqa: E402
+from tests.harness import (CEILING_HAE_M, BridgeCase, course_bytes, heartbeat,   # noqa: E402
+                           readiness)
 from tests.test_fence_gate import ELSEWHERE, FenceCase           # noqa: E402
 
 #: rc_test/test_server.py at 8fc09f2: Course Alpha and Transit A beside it, closed rings.
@@ -44,7 +45,7 @@ NORTH_10M = 10.0 / 111320.0             # degrees of latitude in ten metres
 
 class TestFenceWithTransit(unittest.TestCase):
     def test_course_and_transit_area_become_one_ring_robocommand_accepts(self):
-        f = geofence.for_course("ALPHA", ALPHA, {}, 2.0, TRANSIT_A)
+        f = geofence.for_course("ALPHA", ALPHA, 2.0, TRANSIT_A)
         self.assertIsNotNone(f.polygon, f.reason)
         self.assertIn("transit", f.source)
         # One convex rectangle: the seam vertices sit ~4 mm off the line and must go.
@@ -55,13 +56,13 @@ class TestFenceWithTransit(unittest.TestCase):
 
     def test_a_transit_area_that_shares_no_edge_leaves_a_course_only_fence_and_says_so(self):
         apart = [(lat + 0.001, lon) for lat, lon in TRANSIT_A]
-        f = geofence.for_course("ALPHA", ALPHA, {}, 2.0, apart)
+        f = geofence.for_course("ALPHA", ALPHA, 2.0, apart)
         self.assertIsNotNone(f.polygon)
         self.assertIn("NOT included", f.source)
         self.assertLessEqual(max(p[0] for p in f.polygon), max(p[0] for p in ALPHA))
 
     def test_no_transit_area_is_the_course_alone(self):
-        f = geofence.for_course("ALPHA", ALPHA, {}, 2.0)
+        f = geofence.for_course("ALPHA", ALPHA, 2.0)
         self.assertIsNotNone(f.polygon)
         self.assertNotIn("transit", f.source)
 
@@ -92,8 +93,7 @@ class TestRoboCommandsRule(unittest.TestCase):
 
     def test_the_ceiling(self):
         judge = lambda c, **kw: geofence.rc_declaration_problems(THEIR_FENCE, ALPHA, TRANSIT_A, c, **kw)
-        self.assertEqual(judge(None), ["uav_geofence_max_altitude_hae_m is not set: [geofence] "
-                                       "max_altitude_hae_m in bridge.toml"])
+        self.assertEqual(judge(None), ["uav_geofence_max_altitude_hae_m is not set"])
         self.assertEqual(judge(0.0), ["uav_geofence_max_altitude_hae_m is 0: it must be above 0 "
                                       "and at most 50"])
         self.assertEqual(judge(50.0), [])
@@ -134,20 +134,19 @@ class TestConfig(unittest.TestCase):
                                            geofence=geofence), encoding="utf-8")
             return load(path)
 
-    def test_no_ceiling_is_none_and_the_limit_is_theirs(self):
+    def test_the_limit_is_theirs_and_the_call_sign_starts_blank(self):
         cfg = self.load()
-        self.assertIsNone(cfg.geofence_ceiling_hae_m)
         self.assertEqual(cfg.geofence_ceiling_limit_hae_m, 50.0)
         self.assertEqual(cfg.uav_pilot_callsign, "")
 
-    def test_a_ceiling_robocommand_would_refuse_is_a_config_error(self):
-        for bad in ("55.0", "0", "-3", "\"40\""):
-            with self.subTest(ceiling=bad), self.assertRaises(ConfigError):
-                self.load(geofence="[geofence]\nmax_altitude_hae_m = %s" % bad)
+    def test_the_ceiling_is_the_aircrafts_not_the_configs(self):
+        with self.assertRaises(ConfigError) as cm:
+            self.load(geofence="[geofence]\nmax_altitude_hae_m = 40.0")
+        self.assertIn("FENCE_ALT_MAX", str(cm.exception))
 
-    def test_a_raised_limit_admits_a_higher_ceiling(self):
-        cfg = self.load(geofence="[geofence]\nmax_altitude_hae_m = 55.0\nceiling_limit_hae_m = 60.0")
-        self.assertEqual(cfg.geofence_ceiling_hae_m, 55.0)
+    def test_the_limit_can_be_raised(self):
+        cfg = self.load(geofence="[geofence]\nceiling_limit_hae_m = 60.0")
+        self.assertEqual(cfg.geofence_ceiling_limit_hae_m, 60.0)
 
     def test_registration_is_for_aircraft_only(self):
         self.assertEqual(self.load(uav='registration = " 53551 "').vehicle("UAV1").registration,
@@ -168,7 +167,7 @@ class TestDeclarationFields(FenceCase):
     def test_an_aircraft_declaration_carries_the_ceiling_and_the_call_sign(self):
         self.declared()
         d = self.sent_declaration()
-        self.assertEqual(d["uav_geofence_max_altitude_hae_m"], 40.0)
+        self.assertEqual(d["uav_geofence_max_altitude_hae_m"], CEILING_HAE_M)
         self.assertEqual(d["uav_pilot_callsign"], "Test UA0000")
 
     def test_the_pages_box_wins_over_the_default(self):
@@ -194,37 +193,32 @@ class TestDeclarationFields(FenceCase):
     def test_the_snapshot_says_what_the_page_needs(self):
         self.course()
         self.only("USV1", "UAV1")
-        u = self.snap()["uav"]
-        self.assertEqual((u["in_declaration"], u["ceiling_hae_m"], u["ceiling_limit_hae_m"],
-                          u["pilot_callsign"]), (True, 40.0, 50.0, "Test UA0000"))
-        self.assertEqual(u["registration"], {"UAV1": ""})
+        s = self.snap()
+        u = s["uav"]
+        self.assertEqual((u["in_declaration"], u["ceiling_limit_hae_m"]), (True, 50.0))
+        self.assertIsNone(u["declaration"]["UAV1"]["ceiling_hae_m"], "nothing read yet")
+        self.confirm_fence()
+        self.assertEqual(self.snap()["uav"]["declaration"]["UAV1"]["ceiling_hae_m"], CEILING_HAE_M)
+        self.assertEqual(s["operator"]["callsign"], {"value": "Test UA0000", "from": "config",
+                                                     "saved": None, "config": "Test UA0000"})
+        self.assertEqual(s["operator"]["registration"],
+                         {"UAV1": {"value": "", "from": None, "saved": None, "config": ""}})
 
 
 class TestNoCallSignConfigured(FenceCase):
     callsign = ""
 
-    def test_the_button_verdict_leaves_the_call_sign_to_the_page(self):
+    def test_the_button_verdict_includes_the_call_sign(self):
         self.course()
         self.only("USV1", "UAV1")
         self.confirm_fence()
+        self.assertIn("call sign is blank", self.snap()["run"]["declare_blocker"])
+        self.assertIn("call sign is blank", self.bridge.declare())
+        self.assertEqual(self.requests_sent(), 0)
+        self.assertTrue(self.bridge.set_operator(callsign="Chase UA0001")[0])
         self.assertIsNone(self.snap()["run"]["declare_blocker"])
-        self.assertIn("call sign is blank", self.bridge.declare())     # the default: blank
-        self.assertEqual(self.requests_sent(), 0)
-
-
-class TestNoCeilingConfigured(FenceCase):
-    ceiling = None
-
-    def test_an_aircraft_is_refused_in_robocommands_words(self):
-        self.course()
-        self.only("USV1", "UAV1")
-        self.confirm_fence()
-        self.assertIn("uav_geofence_max_altitude_hae_m is not set", self.bridge.declare_blocker())
-        self.bridge.declare()
-        self.assertEqual(self.requests_sent(), 0)
-
-    def test_a_surface_only_declaration_does_not_need_one(self):
-        self.declared(active=("USV1",))
+        self.assertIn("declared", self.bridge.declare())
+        self.assertEqual(self.sent_declaration()["uav_pilot_callsign"], "Chase UA0001")
 
 
 class TestTransitCourseThroughTheBridge(FenceCase):
@@ -235,10 +229,12 @@ class TestTransitCourseThroughTheBridge(FenceCase):
         self.assertEqual(len(s["course"]["uav_transit_area"]), 5)
         self.assertIn("transit", s["uav_geofence_source"])
         self.only("USV1", "UAV1")
-        self.confirm_fence()
+        # The pilot uses the whole course and transit area: the fence their test_client declares.
+        self.confirm_fence(held=[self.rc_open(), THEIR_FENCE[:-1]])
         self.assertIn("declared", self.bridge.declare())
         d = self.sent_declaration()
         fence = [(p["latitude"], p["longitude"]) for p in d["uav_geofence"]]
+        self.assertEqual(fence, THEIR_FENCE)
         self.assertEqual(geofence.rc_declaration_problems(
             fence, ALPHA, TRANSIT_A, d["uav_geofence_max_altitude_hae_m"]), [])
 
@@ -270,8 +266,30 @@ class TestRegistration(BridgeCase):
         self.feed(uav_hb("99999"))
         self.assertEqual(self.reports_to_rc("UAV1"), [])
         self.assertEqual(self.bridge.counters.dropped_misregistered, 1)
-        self.assertTrue(any("misregistered" in str(line) or "uav_registration" in str(line)
-                            for line in self.logs))
+        self.assertTrue(any("sent uav_registration '99999' but the OCS has '53551'" in line
+                            for line in self.logs), self.logs)
+
+    def test_one_typed_on_the_page_wins_over_bridge_toml(self):
+        self.assertTrue(self.bridge.set_operator(registration={"UAV1": "ASTA-1"})[0])
+        self.declared()
+        self.feed(uav_hb())
+        self.assertEqual(self.reports_to_rc("UAV1")[-1].heartbeat.uav_registration, "ASTA-1")
+        self.feed(uav_hb("53551"), key="again")
+        self.assertEqual(self.bridge.counters.dropped_misregistered, 1,
+                         "bridge.toml's is no longer the OCS's")
+
+    def test_it_cannot_change_during_a_run(self):
+        self.declared()
+        self.bridge.machine.on_run_start(self.bridge.machine.declaration_seq, 7)
+        self.assertEqual(self.bridge.machine.state.name, "RUNNING")
+        ok, why = self.bridge.set_operator(registration={"UAV1": "ASTA-2"})
+        self.assertFalse(ok)
+        self.assertIn("cannot change during a run", why)
+        self.assertEqual(self.bridge.operator.registration("UAV1"), "53551")
+        self.assertTrue(self.bridge.set_operator(registration={"UAV1": "53551"})[0],
+                        "the same one again is not a change")
+        self.assertTrue(self.bridge.set_operator(callsign="Chase UA1")[0],
+                        "the call sign is only in the declaration: it may change")
 
 
 class TestNoRegistration(BridgeCase):

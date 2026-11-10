@@ -164,28 +164,32 @@ Two hub observers, both outside the routing path. Everything below is also visib
   `ocs.vehicles.<id>.heartbeat.flight_state_request`; why no heartbeat is going out:
   `...heartbeat.reason`; commands the radio could not carry (a `run_id` above 65535 ...):
   `...downlink.refusals_by_reason` plus a WARNING in the console.
-  The second, only with `fence_upload = true` on the radio vehicle (on for UAV1 in the shipped
-  `fleet.toml`), is **the declared geofence as an ArduPilot inclusion fence** (`fence_upload.py`):
-  when `ocs_info.uav_geofence` arrives from the bridge, the adapter reads FENCE_TYPE / FENCE_ENABLE /
-  FENCE_AUTOENABLE (PARAM_REQUEST_READ — never a PARAM_SET), downloads the autopilot's fence, and if
-  it differs saves it to `run/fence/UAV1-fence-<UTC>.json` and writes the polygon over the mission
-  protocol (type FENCE), then reads it back and compares within 1 m. Only while the autopilot
-  reports disarmed; held while polygon fencing can engage and the aircraft is outside the polygon
-  (it would block arming, or breach on takeoff). Once per polygon per run; a fence changed later in
-  QGC is not fought. QGC shows it after **Plan view > Download**. State: `ocs.vehicles.<id>.fence_upload`
-  (it also carries the declared `polygon` and the `autopilot_shapes` last read back, which the OCS `/map` draws).
+  The second is **the aircraft's fence: READ all of it, WRITE only RoboCommand's polygon**
+  (`fence_upload.py`). The workflow (Chase, 7 Nov 2026): the bridge turns RoboCommand's course into
+  RoboCommand's polygon -- the course joined with its transit area, inset -- and sends it in
+  `ocs_info.uav_geofence`; with `fence_upload = true` on the radio vehicle (on for UAV1 in the shipped
+  `fleet.toml`) the adapter puts it on the autopilot as an inclusion polygon, so QGC shows it after
+  **Plan view > Download**; the pilot draws Ekko's OWN fence inside it in QGC and uploads both; the
+  bridge declares the pilot's polygon as read back from here, and FENCE_ALT_MAX above home as the
+  ceiling. ArduPilot holds the aircraft to the intersection of two inclusion polygons (unless
+  FENCE_OPTIONS asks for their union), so with the pilot's inside, to the pilot's.
+  READ, always, every 30 s while the aircraft is disarmed and heard: FENCE_TYPE / FENCE_ENABLE /
+  FENCE_AUTOENABLE / FENCE_ALT_MAX / FENCE_OPTIONS (PARAM_REQUEST_READ — never a PARAM_SET) and every
+  fence item over the mission protocol (type FENCE). WRITE, once per polygon per run and never over
+  the pilot's fence: nothing is written when the autopilot already holds RoboCommand's polygon, or an
+  inclusion polygon inside it (the pilot's); otherwise the old fence is saved to
+  `run/fence/UAV1-fence-<UTC>.json`, replaced by RoboCommand's polygon, and read back within 1 m.
+  Only while the autopilot reports disarmed; held while polygon fencing can engage and the aircraft
+  is outside the polygon (it would block arming, or breach on takeoff).
   `fence_may_block_arming = true` (on for UAV1) writes it even over FENCE_ENABLE 1 with the aircraft outside:
   the operator accepts that it will not arm there (`lockout` in the status says so). It never covers
   FENCE_ENABLE 0 with auto-enable on, where the aircraft could still arm and meet the fence after takeoff.
-  Per course: the bridge sends the CURRENT course's fence, so a new course's fence replaces the old
-  one automatically; nothing is cleared when a run ends. With `fence_clear_without_course = true` (on
-  for UAV1), an `ocs_info` with `"course": null` (the bridge has heard no course since it started:
-  a bench without RoboCommand) clears the autopilot's fence after a 20 s grace -- disarmed only, the
-  old fence saved first, read back empty. A course whose fence the bridge refused leaves the old
-  fence in place. Once done, the fence is read back every 60 s while disarmed; a fence changed
-  behind the OCS's back is saved and the declared one put back. The adapter reports each result to
-  the bridge as an `ocs_fence` frame (docs/VEHICLE_LINK.md) -- the bridge declares no UAV run
-  without a fresh confirmation that the autopilot holds the declared fence.
+  A new course's polygon starts over; the bridge withdrawing its polygon (no course, or a course it
+  could not make one for) leaves the autopilot's fence exactly as it is -- the OCS never clears a
+  fence (`fence_clear_without_course` was removed). State: `ocs.vehicles.<id>.fence_upload` (with
+  RoboCommand's `polygon` and the `autopilot_shapes` last read, which the OCS `/map` draws). Every
+  read goes to the bridge as an `ocs_fence` frame (docs/VEHICLE_LINK.md) -- every shape, the FENCE_*
+  parameters and home HAE -- and the bridge declares no UAV run without a fresh one.
 * **The tunnel log** (`tunnel_log.py`): every TUNNEL and every robotx-dialect (42xxx) frame, both
   directions — received, transmitted (by an output or by the adapter, `origin` says which) and refused —
   one JSON line each in `run/tunnel/<UTC>.jsonl`, one file per start, with the RXL fields decoded where
@@ -391,7 +395,7 @@ against a real ArduCopter 4.7 over the RFD (tested against a fake ArduPilot only
 | `endpoints.py` | the transports: UDP link, serial link (one owner thread), output sockets |
 | `fleet_link.py` | config, CLI, `/fleet` server, console summary |
 | `ocs_adapter.py`, `ocs_translate.py`, `ocs_heartbeat.py`, `rxl_codec.py` | the OCS adapter: bridge connection and per-message repeat/ACK policy, JSON <-> RXL translation, the stand-in heartbeat, the RXL wire codec |
-| `fence_upload.py` | the declared geofence onto the autopilot: FENCE_* reads, download, backup, upload, read-back, the arming rules — a state machine, no threads |
+| `fence_upload.py` | the aircraft's fence: every read of it, and RoboCommand's polygon onto it — FENCE_* reads, download, backup, upload, read-back, the arming rules — a state machine, no threads |
 | `tunnel_log.py` | the TUNNEL / robotx-dialect JSONL log (writer thread) |
 | `wsl_ip.py` | prints the WSL VM's eth0 IPv4, the HOST for `--sim-boat` (stdlib only, not used by fleet_link) |
 | `fleet.toml` | the default configuration |

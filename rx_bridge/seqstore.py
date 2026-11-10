@@ -26,6 +26,25 @@ import tempfile
 from pathlib import Path
 
 
+def write_atomic(path: Path, payload: str) -> None:
+    """Replace `path` with `payload`: atomic replace + fsync. Both halves matter.
+
+    os.replace alone leaves a window where the rename is in the directory
+    cache but the bytes are not on the platter; a power cut there resurrects
+    the OLD file -- for the counters, the bug this module exists to prevent.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 class SeqStore:
     """Durable monotonic counters. One file, rewritten atomically."""
 
@@ -51,27 +70,12 @@ class SeqStore:
         self._run = raw.get("run", {})
 
     def _flush(self) -> None:
-        """Atomic replace + fsync. Both halves matter.
-
-        os.replace alone leaves a window where the rename is in the directory
-        cache but the bytes are not on the platter; a power cut there resurrects
-        the OLD counters, which is the bug this file exists to prevent.
-        """
-        payload = json.dumps(
+        """Durable before it is used: see write_atomic."""
+        write_atomic(self.path, json.dumps(
             {"epoch": self._epoch, "request": self._request,
              "reports": self._reports, "run": self._run},
             indent=2,
-        )
-        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        ))
 
     # ---- the counters -----------------------------------------------------
 

@@ -74,7 +74,7 @@ class WhatItSends(unittest.TestCase):
         self.assertEqual(hb["current_task"], "TASK_NONE")
         self.assertEqual(hbm.CURRENT_TASK, "TASK_NONE")
         self.assertIn("heartbeat_core", hbm.__doc__)
-        self.assertIn("heartbeat_core.py:138", hbm.__doc__)
+        self.assertIn("heartbeat_core.py:145", hbm.__doc__)
 
     def test_flight_phase_follows_the_autopilots_landed_state(self):
         for landed, phase in ((1, "FLIGHT_PHASE_GROUNDED"), (2, "FLIGHT_PHASE_AIRBORNE"),

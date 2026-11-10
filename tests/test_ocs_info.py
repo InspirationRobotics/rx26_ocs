@@ -1,6 +1,7 @@
-"""`ocs_info`: the course (every vehicle) and the declared UAV geofence (aircraft only),
-sent as information to each connected vehicle -- on connect, when RoboCommand's course
-arrives or changes, and (the geofence) after a declaration.
+"""`ocs_info`: the course (every vehicle) and RoboCommand's UAV polygon for it (aircraft
+only, for fleet_link to put on the autopilot for the pilot to draw inside), sent as
+information to each connected vehicle -- on connect, when RoboCommand's course arrives or
+changes, and (the polygon) after a declaration.
 
 Nothing in the frame is a command; the OCS does not control a vehicle in autonomous
 mode (handbook 5.3) and these tests include the check that it does not even try.
@@ -59,9 +60,10 @@ class TestOcsInfo(BridgeCase):
         self.assertEqual(fence[0], fence[-1], "closed, as RunDeclaration needs it")
         self.assertNotIn("uav_geofence", infos(usv)[-1])
 
-    def test_the_fence_is_in_the_shape_runDeclaration_carries_it(self):
-        """Compared against the declaration RoboCommand is actually sent, not a copy of
-        the config: what a vehicle is told cannot drift from what was declared."""
+    def test_robocommands_polygon_has_runDeclarations_shape_but_is_not_what_is_declared(self):
+        """The shape of RunDeclaration.uav_geofence -- compared against a declaration
+        RoboCommand is actually sent -- but never its content: that is the pilot's polygon,
+        read off the aircraft."""
         uav = self.connect("UAV1", "radio")
         self.assertTrue(wait_for(lambda: infos(uav)))
         self.declared(("UAV1",))
@@ -70,9 +72,13 @@ class TestOcsInfo(BridgeCase):
         req.ParseFromString(next(p for t, p, _ in self.bridge.rc.published if t.endswith("/request")))
         decl = json_format.MessageToDict(req.run_declaration, preserving_proto_field_name=True,
                                          always_print_fields_with_no_presence=True)
-        self.assertEqual(infos(uav)[-1]["uav_geofence"], decl["uav_geofence"])
-        self.assertEqual(infos(uav)[1]["uav_geofence"], decl["uav_geofence"])
-        self.assertEqual(set(infos(uav)[-1]["uav_geofence"][0]), {"latitude", "longitude"})
+        told = infos(uav)[-1]["uav_geofence"]
+        self.assertEqual(told, infos(uav)[1]["uav_geofence"], "the declaration changed nothing in it")
+        self.assertEqual(set(told[0]), set(decl["uav_geofence"][0]))
+        self.assertEqual(set(told[0]), {"latitude", "longitude"})
+        self.assertEqual([(p["latitude"], p["longitude"]) for p in told],
+                         list(self.bridge._fence.polygon))
+        self.assertNotEqual(told, decl["uav_geofence"])
 
     def test_a_received_course_goes_to_every_connected_vehicle(self):
         usv = self.informed("USV1", None)

@@ -83,20 +83,40 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
 <div class="row">
   <div class="card">
     <table>
-      <tr><th>RoboCommand</th><td id="link-rc">—</td></tr>
+      <tr><th>RoboCommand</th>
+          <td id="link-rc" style="white-space:normal; max-width:46ch">—</td></tr>
       <tr><th>Team broker</th><td id="link-team">—</td></tr>
       <tr><th title="UDP broadcast that tells the vehicles where this OCS is">Beacon</th>
           <td id="link-beacon" style="white-space:normal; max-width:46ch">—</td></tr>
       <tr><th>Run</th><td id="run">—</td></tr>
       <tr><th>Course</th><td id="course">—</td></tr>
-      <tr><th title="the UAV geofence for this course, and whether each aircraft's autopilot was read back holding it">UAV fence</th>
+      <tr><th title="RoboCommand's UAV polygon for this course (put on the aircraft for the pilot to draw inside), each aircraft's last read, and what a declaration with it would carry">UAV fence</th>
           <td id="uavfence" style="white-space:normal; max-width:46ch">—</td></tr>
     </table>
     <div style="margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap">
-      <button class="go" onclick="post('/api/declare', {callsign: $('callsign').value})">Declare run</button>
+      <button class="go" onclick="declareRun()">Declare run</button>
       <button class="stop" onclick="post('/api/end')">End run</button>
-      <input id="callsign" placeholder="UAV pilot call sign" size="18" style="display:none"
+    </div>
+    <!-- The four tiers Declare carries. Set here, or by a vehicle's ocs_tiers (its source is shown);
+         fixed from declaring until the run is ended. -->
+    <div id="tiers" style="margin-top:8px; white-space:normal; max-width:46ch">
+      <span title="RunDeclaration task1_tier..task4_tier, the tiers the next Declare carries">tiers</span>
+      <span id="tier-sel"></span>
+      <button id="tier-set" onclick="setTiers()">Set</button>
+      <div id="tier-from" class="muted"></div>
+      <div id="tier-note"></div>
+    </div>
+    <!-- What RoboCommand needs that no vehicle reports. Each box goes to the bridge as it is
+         typed; "save as default" also keeps it on this laptop (run/operator.json). -->
+    <div id="operator" style="margin-top:8px; display:none">
+      <div>pilot <input id="callsign" list="callsigns" placeholder="UAV pilot call sign" size="20"
+             oninput="typed('callsign')"
              title="RunDeclaration.uav_pilot_callsign: the pilot's MyDroneFleets call sign for this run, first name + UAPL number">
+        <button onclick="saveDefault('callsign')" title="keep it as this laptop's default (run/operator.json)">save as default</button>
+        <span id="callsign-from" class="muted"></span></div>
+      <div id="regs"></div>
+      <div id="operator-error"></div>
+      <datalist id="callsigns"></datalist><datalist id="registrations"></datalist>
     </div>
     <div id="activecount" class="muted" style="margin-top:6px"></div>
     <div id="declblock" style="margin-top:6px; white-space:normal; max-width:46ch"></div>
@@ -106,7 +126,7 @@ try { if (localStorage.getItem('ocs-theme') === 'day')
   <div class="card grow">
     <table>
       <tr><th>forwarded</th><th>rate</th><th>invalid</th><th>mistyped</th>
-          <th title="aircraft heartbeats carrying a uav_registration other than bridge.toml's">misreg.</th>
+          <th title="aircraft heartbeats carrying a uav_registration other than the OCS's">misreg.</th>
           <th title="a copy another link had already delivered">not pref.</th>
           <th>stale</th><th>cmds</th><th>undeliv.</th></tr>
       <tr id="counters"><td colspan="9" class="muted">—</td></tr>
@@ -287,6 +307,30 @@ function fmt(x) { return (x === undefined || x === null) ? '—' : Number(x).toF
 // The discovery beacon: which of this laptop's addresses the vehicles are being
 // told about. The skipped list matters as much as the sending one -- the course
 // network showing up there with its reason is the proof it is not being spoken on.
+// The RoboCommand row: the link and where it is pointed -- and, with [robocommand] host = "auto",
+// the search for the broker by its course topic (rcfind.py) while there is no link.
+function rcCell(s) {
+  const ep = esc((s.endpoints || {}).robocommand || '');
+  const f = s.rc_search;
+  if (s.links.robocommand) return pill('ok', 'connected') + ` <span class="muted">${ep}</span>`;
+  if (!f) return pill('bad', 'DOWN') + ` <span class="muted">${ep}</span>`;
+  const again = f.search_in_s === null || f.search_in_s === undefined ? ''
+    : `; ${f.state === 'dialling' ? 'searching again' : 'again'} in ${Math.round(f.search_in_s)} s`;
+  const head = f.state === 'dialling'
+    ? pill('bad', 'DOWN') + ` <span class="muted">dialling ${esc(f.host)}:${f.port}, found by its course topic${again}</span>`
+    : pill('warn', f.state === 'searching' ? 'SEARCHING' : 'NOT FOUND')
+      + ` <span class="muted">a broker with ${esc(f.topic)} on TCP ${f.port}${again}</span>`;
+  const r = f.last_round;
+  if (!r) return head;
+  const tried = r.tried || [];
+  const heard = tried.filter(t => !t.verdict.startsWith('no answer'));
+  return head + `<div class="muted">last round, from ${(r.addresses || []).map(esc).join(', ') || 'no usable address'}: `
+    + (heard.length ? heard.map(t => `${esc(t.host)} (${esc(t.why)}): ${esc(t.verdict)}`).join('; ')
+                    : 'nothing answered')
+    + (tried.length > heard.length ? `; ${tried.length - heard.length} more gave no answer` : '')
+    + ((r.swept || []).length ? `; swept ${r.swept.map(esc).join(', ')}` : '') + '</div>';
+}
+
 function beaconCell(b) {
   if (!b || !b.enabled)
     return pill('idle', 'off') + ` <span class="muted">${esc((b && b.why) || '')}</span>`;
@@ -302,52 +346,52 @@ function beaconCell(b) {
   return out;
 }
 
-// One aircraft's confirmation (`ocs_fence`, as the radio adapter sent it) against the fence
-// this OCS holds for the course. The gate that decides whether Ekko can be declared is in the
-// bridge (the reason is shown under the buttons); this line is the evidence it is judging.
-// "cleared" is a verified EMPTY polygon: the autopilot's fence was removed and read back
-// empty, which is what the adapter does when this OCS has no course at all.
-function confirmLine(v, c, maxAge) {
+// One aircraft's last read (`ocs_fence`, as the radio adapter sent it): how old it is, and whether
+// RoboCommand's polygon is on the autopilot beside the pilot's. Evidence only -- whether Ekko can be
+// declared is the bridge's call (declLine below, and the reason under the buttons).
+function readLine(v, c, maxAge) {
   const name = `<b>${esc(v.id)}</b> `;
-  if (!c) return name + pill('idle', 'no confirmation yet');
+  if (!c) return name + pill('idle', 'never read') + ' <span class="muted">no ocs_fence yet: is fleet_link running?</span>';
   const age = (c.age_s === null || c.age_s === undefined) ? null : c.age_s;
-  let tag;
-  if (!c.verified) tag = pill('warn', 'not verified');
-  else if (Array.isArray(c.polygon) && c.polygon.length === 0) tag = pill('idle', 'cleared');
-  else if (!c.matches_course_fence) tag = pill('warn', 'holds another polygon');
-  else if (age === null || age > maxAge) tag = pill('bad', 'stale');
-  else tag = pill('ok', 'confirmed');
-  const n = Array.isArray(c.polygon) && c.polygon.length ? `, ${c.polygon.length} vertices` : '';
-  return name + tag + ` <span class="muted">${esc(c.state || '—')}${n}, `
-    + (age === null ? 'age unknown' : Math.round(age) + ' s ago') + `</span>`
+  const tag = age === null ? pill('warn', 'not read yet')
+    : pill(age > maxAge ? 'bad' : 'ok', 'read ' + Math.round(age) + ' s ago');
+  const rc = !c.polygon ? 'no RoboCommand polygon to put on it'
+    : !c.matches_course_fence ? "the adapter has an older RoboCommand polygon"
+    : c.verified ? "RoboCommand's polygon on it" : "RoboCommand's polygon not on it";
+  return name + tag + ` <span class="muted">${esc(c.state || '—')}; ${rc}</span>`
     + (c.lockout ? ` ${pill('warn', 'will not arm here')}<div class="muted">${esc(c.lockout)}</div>` : '')
-    + (!c.verified && c.reason ? `<div class="muted">${esc(c.reason)}</div>` : '');
+    + (age === null && c.reason ? `<div class="muted">${esc(c.reason)}</div>` : '');
 }
 
-// The UAV geofence for the CURRENT course: where it came from and how many vertices -- or, when
-// there is none, why. With a course held and no fence the badge is red: the aircraft keeps whatever
-// fence it already has, so that case must not read as quiet.
+// What a declaration with this aircraft would carry, as the bridge judged it just now: the polygon
+// the pilot drew in QGC and the ceiling the aircraft enforces (home HAE + FENCE_ALT_MAX), both read
+// off its autopilot -- and what stops it, and what is worth knowing before flight.
+function declLine(d, limit) {
+  if (!d) return '';
+  let out = '<div>declares ' + (d.polygon ? `<b>${d.polygon.length - 1} vertices</b>` : pill('bad', 'no polygon'))
+    + ' · ' + (d.ceiling_hae_m != null
+      ? `<b>${d.ceiling_hae_m} m HAE</b> <span class="muted">(${esc(d.ceiling_from || '')}; at most ${limit})</span>`
+      : pill('bad', 'no ceiling')) + '</div>';
+  (d.problems || []).forEach(x => { out += `<div>${pill('bad', 'blocks')} <span class="muted">${esc(x)}</span></div>`; });
+  (d.notes || []).forEach(x => { out += `<div>${pill('warn', 'note')} <span class="muted">${esc(x)}</span></div>`; });
+  return out;
+}
+
+// RoboCommand's UAV polygon for the CURRENT course: how it was made and how many vertices -- or, when
+// there is none, why (red with a course held: the pilot has nothing to draw inside). Then each
+// aircraft: its last read and what a declaration with it would carry.
 function fenceCell(s) {
   const f = s.uav_geofence;
   const held = !!(s.course && s.course.course_id);
-  let out = (f && f.length)
+  let out = "RoboCommand's " + ((f && f.length)
     ? `<b>${esc(s.uav_geofence_source || '?')}</b> <span class="muted">${f.length - 1} vertices</span>`
-    : pill(held ? 'bad' : 'idle', 'none') + ` <span class="muted">${esc(s.uav_geofence_reason || '')}</span>`;
+    : pill(held ? 'bad' : 'idle', 'none') + ` <span class="muted">${esc(s.uav_geofence_reason || '')}</span>`);
   const max = s.fence_confirm_max_age_s || 180;
-  const uavs = (s.vehicles || []).filter(v => v.type === 'TYPE_UAV');
-  uavs.forEach(v => {
-    out += `<div>${confirmLine(v, (s.fence_confirm || {})[v.id], max)}</div>`;
-  });
-  // What a declaration with an aircraft carries besides the polygon. No ceiling: RoboCommand
-  // refuses the declaration and says nothing, so the bridge will not declare an aircraft.
   const u = s.uav || {};
-  if (uavs.length) {
-    out += `<div>ceiling ` + (u.ceiling_hae_m != null
-      ? `<b>${u.ceiling_hae_m} m HAE</b> <span class="muted">(at most ${u.ceiling_limit_hae_m})</span>`
-      : pill('bad', 'not set') + ` <span class="muted">[geofence] max_altitude_hae_m in bridge.toml</span>`)
-      + ` <span class="muted">· registration ${uavs.map(v => esc(v.id) + ' '
-          + esc((u.registration || {})[v.id] || 'none')).join(', ')}</span></div>`;
-  }
+  (s.vehicles || []).filter(v => v.type === 'TYPE_UAV').forEach(v => {
+    out += `<div style="margin-top:4px">${readLine(v, (s.fence_confirm || {})[v.id], max)}</div>`
+      + declLine((u.declaration || {})[v.id], u.ceiling_limit_hae_m);
+  });
   return out;
 }
 
@@ -373,7 +417,135 @@ function commandDetail(k) {
   if (b.keep_out_zone && b.keep_out_zone.radius_m != null) return `radius ${b.keep_out_zone.radius_m} m`;
   return '';
 }
-let callsignSeeded = false;
+// ---- what the operator types: the pilot's call sign and each aircraft's registration ----
+// Each box is sent to the bridge as it is typed (after a pause), so what the bridge judges and
+// declares is what the box shows. A box being typed in, or with a send outstanding, is never
+// overwritten from the bridge; otherwise it follows the bridge (another tab, a refused change).
+const OP_FROM = {typed: 'typed here', saved: 'saved on this laptop', config: 'bridge.toml'};
+const opTimers = {}, opPending = {};
+let regsBuilt = false, lastLists = '';
+
+function opBody(key, save) {
+  const el = $(key === 'callsign' ? 'callsign' : 'reg-' + key);
+  const v = (el && el.value) || '';
+  const body = key === 'callsign' ? {callsign: v} : {registration: {[key]: v}};
+  if (save) body.save = true;
+  return body;
+}
+async function sendOp(key, save) {
+  clearTimeout(opTimers[key]);
+  opPending[key] = true;
+  try {
+    const r = await fetch('/api/operator', {method: 'POST', body: JSON.stringify(opBody(key, save))});
+    const j = await r.json().catch(() => ({result: '(no response)'}));
+    $('action').textContent = j.result || '';
+  } catch (e) { $('action').textContent = 'OCS unreachable: not sent'; }
+  opPending[key] = false;
+  refresh();
+}
+function typed(key) {
+  opPending[key] = true;
+  clearTimeout(opTimers[key]);
+  opTimers[key] = setTimeout(() => sendOp(key, false), 600);
+}
+function saveDefault(key) { sendOp(key, true); }
+
+// The box shows the bridge's value unless the operator is in it; `from` says where the value came
+// from, and the saved default beside it when the value is not that.
+function followBridge(key, el, f) {
+  if (el && document.activeElement !== el && !opPending[key]) el.value = (f && f.value) || '';
+}
+function fromText(f) {
+  if (!f) return '';
+  const from = f.value ? (OP_FROM[f.from] || f.from) : 'blank';
+  return from + (f.saved && f.saved !== f.value ? ` · saved: ${esc(f.saved)}` : '');
+}
+
+function operatorCell(op, running) {
+  const regs = op.registration || {}, ids = Object.keys(regs);
+  $('operator').style.display = ids.length ? '' : 'none';
+  followBridge('callsign', $('callsign'), op.callsign);
+  $('callsign-from').innerHTML = fromText(op.callsign);
+  if (!regsBuilt && ids.length) {
+    // Built once: rebuilding every poll would take the box out from under the operator's fingers.
+    $('regs').innerHTML = ids.map(id => `<div>${esc(id)} registration
+      <input id="reg-${esc(id)}" list="registrations" size="14" oninput="typed('${esc(id)}')"
+             title="Heartbeat.uav_registration on every ${esc(id)} heartbeat: its CAAS registration">
+      <button onclick="saveDefault('${esc(id)}')" title="keep it as this laptop's default (run/operator.json)">save as default</button>
+      <span id="regfrom-${esc(id)}" class="muted"></span></div>`).join('');
+    regsBuilt = true;
+  }
+  ids.forEach(id => {
+    const el = $('reg-' + id), f = regs[id];
+    followBridge(id, el, f);
+    if (el) {
+      el.disabled = running;
+      el.title = running ? 'a registration cannot change during a run'
+        : 'Heartbeat.uav_registration on every ' + id + ' heartbeat: its CAAS registration';
+    }
+    const why = $('regfrom-' + id);
+    if (why) why.innerHTML = fromText(f) + (f && f.value ? '' : ' ' + pill('warn', 'blank')
+      + ' <span class="muted">RoboCommand needs it only when the team has more than one UAV registered</span>');
+  });
+  $('operator-error').innerHTML = op.load_error
+    ? `${pill('bad', 'operator.json')} <span class="muted">${esc(op.load_error)}</span>` : '';
+  // Offered in the boxes' lists: saved values, newest first, then bridge.toml's.
+  const lists = JSON.stringify([op.callsigns || [], op.registrations || []]);
+  if (lists !== lastLists) {
+    lastLists = lists;
+    const opts = xs => xs.map(x => `<option value="${esc(x)}">`).join('');
+    $('callsigns').innerHTML = opts(op.callsigns || []);
+    $('registrations').innerHTML = opts(op.registrations || []);
+  }
+}
+
+// The call sign goes with the declaration, so what is declared is what the box shows -- but only
+// with an aircraft in it: without one the box is not part of the run.
+let lastState = null;
+function declareRun() {
+  const withUav = lastState && lastState.uav && lastState.uav.in_declaration;
+  post('/api/declare', withUav ? {callsign: $('callsign').value || ''} : {});
+}
+
+// ---- the tiers Declare carries ----
+// Four dropdowns, built once. They show the bridge's tiers unless the operator has changed one and
+// not yet pressed Set; a run that is DECLARED or RUNNING disables them, with the bridge's reason.
+const TIER_WORDS = ['TIER_NONE', 'TIER_CORE', 'TIER_ADVANCED', 'TIER_DISRUPTIVE'];
+const TASKS = ['task1', 'task2', 'task3', 'task4'];
+let tiersBuilt = false, tiersDirty = false;
+const tierName = w => w.replace('TIER_', '').toLowerCase();
+
+function tiersCell(t) {
+  if (!t) return;
+  if (!tiersBuilt) {
+    $('tier-sel').innerHTML = TASKS.map((k, i) => `<label>T${i + 1}
+      <select id="tier-${k}" onchange="tiersDirty = true">${TIER_WORDS.map(
+        w => `<option value="${w}">${tierName(w)}</option>`).join('')}</select></label>`).join(' ');
+    tiersBuilt = true;
+  }
+  TASKS.forEach(k => {
+    const el = $('tier-' + k);
+    if (!tiersDirty && document.activeElement !== el) el.value = t.current[k];
+    el.disabled = !!t.blocker;
+  });
+  $('tier-set').disabled = !!t.blocker;
+  $('tier-set').title = t.blocker || 'use these tiers for the next declaration';
+  $('tier-from').innerHTML = 'set by <b>' + esc(t.source) + '</b> at '
+    + new Date(t.set_at * 1000).toLocaleTimeString()
+    + (t.declared ? ' · declared: ' + TASKS.map(k => tierName(t.declared[k])).join('/') : '');
+  $('tier-note').innerHTML = t.blocker ? `${pill('warn', 'tiers fixed')} <span class="muted">${esc(t.blocker)}</span>` : '';
+}
+async function setTiers() {
+  const body = {};
+  TASKS.forEach(k => { body[k] = $('tier-' + k).value; });
+  try {
+    const r = await fetch('/api/tiers', {method: 'POST', body: JSON.stringify(body)});
+    const j = await r.json().catch(() => ({result: '(no response)'}));
+    $('action').textContent = j.result || '';
+    if (j.ok) tiersDirty = false;
+  } catch (e) { $('action').textContent = 'OCS unreachable: not sent'; }
+  refresh();
+}
 
 // A page whose OCS has died or hung keeps whatever it last drew -- a vehicle
 // "connected" an hour after the OCS went away. Say so, and dim it all.
@@ -395,8 +567,7 @@ async function refresh() {
 
   $('team').textContent = s.team_id;
   const ep = s.endpoints || {};
-  $('link-rc').innerHTML   = (s.links.robocommand ? pill('ok','connected') : pill('bad','DOWN'))
-    + ` <span class="muted">${ep.robocommand||''}</span>`;
+  $('link-rc').innerHTML   = rcCell(s);
   $('link-team').innerHTML = (s.links.team ? pill('ok','connected') : pill('bad','DOWN'))
     + ` <span class="muted">${ep.team||''}</span>`;
   $('link-beacon').innerHTML = beaconCell(s.beacon);
@@ -431,19 +602,17 @@ async function refresh() {
   // fence gate) and says why in words (run.declare_blocker). The endpoint refuses on its own,
   // so this is the operator's explanation, not the safeguard.
   const blocked = s.run.declare_blocker;
-  // The call sign is the one input the page holds: the bridge's verdict is everything else,
-  // and the endpoint judges the box's value again when Declare is pressed.
-  const u = s.uav || {}, cs = $('callsign');
-  if (!callsignSeeded && u.pilot_callsign !== undefined) { cs.value = u.pilot_callsign; callsignSeeded = true; }
-  cs.style.display = u.in_declaration ? '' : 'none';
-  const needSign = u.in_declaration && !cs.value.trim();
+  // The call sign and registrations are typed here but held by the bridge, so its verdict
+  // covers them too (a blank call sign with an aircraft in the declaration blocks).
+  lastState = s;
+  operatorCell(s.operator || {}, r.state === 'RUNNING');
+  tiersCell(s.tiers);
   const decl = document.querySelector('button.go');
   if (decl) {
-    const ok = act.length >= need && (s.run.may_declare !== false) && !needSign;
+    const ok = act.length >= need && (s.run.may_declare !== false);
     decl.disabled = !ok;
     decl.title = blocked ? blocked
       : act.length < need ? `need at least ${need} active vehicles, have ${act.length}`
-      : needSign ? 'type the UAV pilot call sign first'
       : `declare ${act.join(', ')}`;
   }
   $('activecount').innerHTML = act.length

@@ -109,12 +109,13 @@ type = "TYPE_UAV"
 companion_sysid = 200        # sends the RXL TUNNELs, receives ours (mav_source_system in uav_params.yaml)
 autopilot_sysid = 1          # its MAVLink on the radio is what the stand-in heartbeat is built from
 link = "rfd"                 # the only link the adapter ever transmits on for this vehicle
-# Write the declared geofence (bridge.toml uav_geofence, arriving in ocs_info) to the autopilot as
-# an inclusion polygon, so QGC shows it and the autopilot enforces what was declared. Disarmed
-# only; FENCE_* params are read, never written; the autopilot's previous fence is saved to
-# run/fence/ first; held while polygon fencing can engage and the aircraft is outside the polygon
-# (it would block arming). It REPLACES whatever fence the autopilot holds -- set false to keep a
-# local test fence on Ekko. See fleet/fence_upload.py.
+# The autopilot's fence is READ whatever this says (every 30 s while disarmed): the polygon the
+# pilot draws in QGC is what the bridge declares, and FENCE_ALT_MAX above home its ceiling.
+# true = also WRITE RoboCommand's polygon (its course + UAV transit area, inset; arriving in
+# ocs_info) as an inclusion polygon, so QGC shows it and the pilot draws Ekko's own fence inside
+# it -- Chase, 7 Nov 2026. Once per course, disarmed only, FENCE_* params never written, and only
+# when Ekko holds neither that polygon nor a polygon inside it (the pilot's): then whatever it
+# holds is saved to run/fence/ and replaced. See fleet/fence_upload.py.
 fence_upload = true
 # Write it EVEN when Ekko is outside the polygon with FENCE_ENABLE 1, i.e. accept that Ekko will
 # NOT ARM there (pre-arm "Vehicle breaching") -- Chase, 2026-10-10: the Singapore fence must show
@@ -123,11 +124,8 @@ fence_upload = true
 # AT THE COMPETITION set this false: there a fence that excludes the launch platform should stop
 # the run being declared (it is never confirmed), not be written and leave Ekko unable to arm.
 fence_may_block_arming = true
-# The bridge has heard NO course from RoboCommand since it started (ocs_info "course": null): clear
-# Ekko's fence (after 20 s, disarmed, old fence saved) so the team can fly on the bench without a
-# RoboCommand server -- Chase, 2026-10-10. A course whose fence the bridge REFUSED leaves the old
-# fence in place instead (a leftover fence stops arming on the wrong course; a cleared one would not).
-fence_clear_without_course = true
+# (fence_clear_without_course was removed 7 Nov 2026: the OCS never clears Ekko's fence. Without
+# a course nothing is written, and the fence drawn in QGC stays the pilot's.)
 # HAE = AMSL + this. COPIED from the aircraft's own ocs_client (uav_params.yaml:
 # geoid_separation_m), which says: -24.6 is SARASOTA, Singapore is different, check it
 # against the actual course before the competition. Keep it equal to the aircraft's. Left
