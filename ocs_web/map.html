@@ -304,6 +304,8 @@ function recFromOcs(v) {
     label: v.id + ' (OCS)', kind: KIND_OF_TYPE[v.type] || 'other', src: 'OCS',
     mode: fresh && hb.state ? String(hb.state).replace(/^STATE_/, '') : null,
     armed: null,
+    ipConnected: !!(v.links && v.links.wifi && v.links.wifi.connected),
+    ipPeer: v.links?.wifi?.peer || null,
     hbAge: silent,
     // a report that has a position carries it in the same frame it arrived in
     posAge: pos ? silent : null, posSrc: pos ? 'OCS report' : null,
@@ -575,6 +577,7 @@ function rowHtml(r) {
     + '<b>' + esc(r.name) + '</b>' + (r.sysid != null ? ' · ' + esc(r.sysid) : '')
     + ' ' + pill('idle', esc(r.src || '—')) + ' '
     + field('mode', r.mode ? esc(r.mode) : '—') + field('armed', armed)
+    + (r.ocs ? field('IP link', pill(r.ipConnected?'ok':'idle',r.ipConnected?'CONNECTED · tether / WiFi':'not connected')+(r.ipConnected&&r.ipPeer?' '+esc(r.ipPeer):'')) : '')
     + field('hb', ageText(r.hbAge)) + '</div>'
     + '<div>' + field('pos', ageText(r.posAge) + (r.posSrc ? ' ' + esc(r.posSrc) : ''))
     + field('lat/lon', fix ? fix[0].toFixed(5) + ', ' + fix[1].toFixed(5)

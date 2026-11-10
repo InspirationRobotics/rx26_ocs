@@ -225,6 +225,7 @@ function linkState(l) {
 function linkLine(v, name) {
   const l = (v.links || {})[name];
   const tags = [];
+  if(name==='wifi'&&l?.connected)tags.push(pill('ok','IP connected · tether / WiFi'));
   if (v.prefer === name) tags.push(pill('idle', 'preferred'));
   if (l && v.active_link === name) tags.push(pill('ok', 'active'));
   if (!l) return `<div><b>${name}</b> <span class="muted">not connected</span> ${tags.join(' ')}</div>`;

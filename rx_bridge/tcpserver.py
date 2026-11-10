@@ -196,6 +196,16 @@ class TcpServer:
 
     def _serve(self, sock: socket.socket, addr) -> None:
         who = "%s:%d" % addr[:2]
+        # A tether unplug may leave a quiet TCP socket half-open. Probe transport
+        # liveness without fabricating vehicle heartbeats or navigation fields.
+        try:
+            sock.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+            if hasattr(socket,'SIO_KEEPALIVE_VALS'):
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS,(1,5000,2000))
+            else:
+                for name,value in [('TCP_KEEPIDLE',5),('TCP_KEEPINTVL',2),('TCP_KEEPCNT',3)]:
+                    if hasattr(socket,name):sock.setsockopt(socket.IPPROTO_TCP,getattr(socket,name),value)
+        except OSError as exc:self.log('vehicle link keepalive unavailable: %s'%exc)
         conn = Conn(sock, who)
         self.log("vehicle link: %s connected" % who)
         reader = FrameReader()
