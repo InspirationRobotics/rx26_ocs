@@ -28,3 +28,9 @@ grpcio-tools==1.83.0
 # explicitly in the `plugins` config; the refusal looks like a client that just
 # never connects. See bench_stage1.start_broker().
 amqtt==0.12.0
+
+# fleet_link owns the laptop RFD serial port and supplies MAVLink to QGC and the
+# vehicle GUIs. Keep it in this same reproducible laptop environment; requiring
+# a separately configured global Python made OCS.cmd fail on a clean Windows PC.
+pymavlink==2.4.50
+pyserial==3.5

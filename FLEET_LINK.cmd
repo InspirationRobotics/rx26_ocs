@@ -16,8 +16,8 @@ rem 8098, so if you start it with --status-port run python -m fleet.fleet_link y
 rem The check is curl.exe, which ships with Windows 10 and later. Keep this file plain cmd:
 rem this PC's antivirus deletes .cmd files that call out to a script host or launch hidden
 rem processes, so the only launcher here is cmd's own `start`, in a visible window.
-rem Needs the SYSTEM python (pymavlink and pyserial are installed there, not in .venv);
-rem the check below says so in this window instead of letting the new one flash shut.
+rem Uses the OCS .venv, the same reproducible laptop environment OCS.cmd uses.
+rem A historical sibling .deps folder remains a development fallback for this checkout.
 setlocal
 curl.exe -s -f -m 2 -o NUL http://127.0.0.1:8098/fleet
 if not errorlevel 1 (
@@ -25,17 +25,22 @@ if not errorlevel 1 (
     if not "%~1"=="" echo The options you gave were NOT applied. Stop it with ctrl-C in its window, then run this again.
     exit /b 0
 )
-python -c "import pymavlink, serial" >NUL 2>&1
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=python"
+if exist "%~dp0..\competition-comms\.deps\pymavlink" set "PYTHONPATH=%~dp0..\competition-comms\.deps;%PYTHONPATH%"
+"%PY%" -c "import pymavlink, serial" >NUL 2>&1
 if errorlevel 1 (
     echo.
-    echo The python on PATH cannot import pymavlink and pyserial, so fleet_link cannot run.
-    echo It needs the SYSTEM python - not OCS\.venv, and not a python that is not installed.
+    echo The OCS Python cannot import pymavlink and pyserial, so fleet_link cannot run.
+    echo Create/update this repo's environment once:
+    echo   python -m venv .venv
+    echo   .venv\Scripts\python.exe -m pip install -r requirements.txt
     echo.
     pause
     exit /b 1
 )
 pushd "%~dp0"
 set FLEET_LINK_PAUSE=1
-start "Fleet link" python -m fleet.fleet_link --config fleet\fleet.toml %*
+start "Fleet link" "%PY%" -m fleet.fleet_link --config fleet\fleet.toml %*
 popd
 exit /b 0

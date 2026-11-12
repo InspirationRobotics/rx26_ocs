@@ -37,3 +37,17 @@ ArduPilot AUTO mission.
 See the GRAEY repository document
 `docs/rfd-mission-relay-2026-11-11.md` for the complete ownership, validation,
 and hardware-acceptance record.
+
+## Laptop startup
+
+Create/update the repository environment with
+`.venv\Scripts\python.exe -m pip install -r requirements.txt`. The requirements
+pin the OCS/MQTT stack plus `pymavlink` and `pyserial`; `OCS.cmd` starts
+`FLEET_LINK.cmd` with that same environment. No separately configured global
+Python is required.
+
+`fleet/fleet.toml` currently names `COM8`. This is a configuration value, not a
+claim about the connected radio. If Windows assigns another port, start
+`FLEET_LINK.cmd --serial COMx` or change the reviewed configuration before the
+test. The historical GRAEY radio was once observed on COM3; it must be detected
+again rather than assumed.

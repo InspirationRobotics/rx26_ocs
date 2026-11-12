@@ -4,7 +4,7 @@ rem  OCS.cmd -- double-click: the Operator Control Station on THIS
 rem  laptop, with the fleet map opened in the default browser.
 rem
 rem  Runs in: Windows. Two servers, each in its own visible window:
-rem    "Fleet link"     FLEET_LINK.cmd - system python, owns UDP 14550
+rem    "Fleet link"     FLEET_LINK.cmd - OCS .venv, owns UDP 14550
 rem                     and COM8, feeds the map (127.0.0.1:8098/fleet)
 rem    "OCS (ocs_web)"  python -m ocs_web from .venv - the RoboCommand
 rem                     bridge and its pages on http://127.0.0.1:8099
