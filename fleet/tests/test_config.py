@@ -28,16 +28,20 @@ class Shipped(unittest.TestCase):
         self.assertEqual((wifi.type, wifi.bind, wifi.port), ("udp", "0.0.0.0", 14550))
         self.assertEqual((rfd.type, rfd.device, rfd.baud, rfd.reopen_s), ("serial", "COM8", 115200, 5.0))
         by_name = {o.name: o for o in cfg.outputs}
-        self.assertEqual(list(by_name), ["qgc", "boat_gui", "drone_gui", "drone_diag"])
-        q, b, g, d = (by_name[n] for n in ("qgc", "boat_gui", "drone_gui", "drone_diag"))
+        self.assertEqual(list(by_name), ["qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"])
+        q, b, g, u, d = (by_name[n] for n in ("qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"))
         self.assertEqual((q.port, q.links, q.sysids, q.transmit), (14570, ("wifi", "rfd"), None, True))
         self.assertEqual((b.port, b.links, b.sysids, b.transmit), (14554, ("wifi",), frozenset({2}), False))
         self.assertEqual((g.port, g.links, g.sysids, g.transmit), (14543, ("rfd",), None, True))
+        self.assertEqual((u.port, u.links, u.sysids, u.transmit),
+                         (14572, ("rfd",), frozenset({43}), True))
         self.assertEqual((d.port, d.links, d.sysids, d.transmit), (14544, ("rfd",), None, False))
-        self.assertEqual(cfg.vehicles, {"boat": [2, 42], "drone": [1, 200], "radio": [51]})
-        self.assertEqual(cfg.names, {"boat": "Crusader", "drone": "Ekko", "radio": "RFD900ux"})
-        self.assertEqual([cfg.vehicle_names().display_of(i) for i in (1, 2, 42, 200, 51, 7)],
-                         ["Ekko", "Crusader", "Crusader", "Ekko", "RFD900ux", "sysid 7"])
+        self.assertEqual(cfg.vehicles, {"boat": [2, 42], "drone": [1, 200],
+                                        "graey": [3, 43], "radio": [51]})
+        self.assertEqual(cfg.names, {"boat": "Crusader", "drone": "Ekko",
+                                     "graey": "GRAEY", "radio": "RFD900ux"})
+        self.assertEqual([cfg.vehicle_names().display_of(i) for i in (1, 2, 42, 200, 3, 43, 51, 7)],
+                         ["Ekko", "Crusader", "Crusader", "Ekko", "GRAEY", "GRAEY", "RFD900ux", "sysid 7"])
 
     def test_aircraft_and_boat_port_discipline(self):
         # outputs on 1454x are the aircraft's tooling; 14554 is the boat's; qgc is neither

@@ -2324,7 +2324,10 @@ def _wire_dict(msg) -> dict:
 
 def _round1(x: float | None) -> float | None:
     """A time or a distance for the page: one decimal, None stays None."""
-    return None if x is None else round(x, 1)
+    if x is None:
+        return None
+    value = round(x, 1)
+    return 0.0 if value == 0 else value       # never display IEEE negative zero as "-0 s ago"
 
 
 def _latlons(points) -> list[tuple[float, float]]:

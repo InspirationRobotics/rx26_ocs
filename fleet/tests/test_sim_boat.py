@@ -79,7 +79,8 @@ class Parsing(unittest.TestCase):
         self.assertEqual(default_cfg(sim_boat=SIM, sim_boat_rx_only=True).sim_boat,
                          SimBoatCfg(WSL_HOST, 14555, rx_only=True))
         self.assertIsNone(default_cfg().sim_boat)
-        self.assertEqual([o.name for o in cfg.outputs], ["qgc", "boat_gui", "drone_gui", "drone_diag"])
+        self.assertEqual([o.name for o in cfg.outputs],
+                         ["qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"])
 
 
 class NotAConfigKey(unittest.TestCase):
@@ -240,7 +241,8 @@ class Routing(unittest.TestCase):
         r.hub.link_rx("rfd", heartbeat(1))
         snap = r.hub.snapshot()
         json.dumps(snap, allow_nan=False)
-        self.assertEqual(set(snap["outputs"]), {"qgc", "boat_gui", "drone_gui", "drone_diag", SIM_BOAT})
+        self.assertEqual(set(snap["outputs"]),
+                         {"qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag", SIM_BOAT})
         st = snap["outputs"][SIM_BOAT]
         self.assertEqual((st["host"], st["port"], st["links"], st["sysids"], st["transmit"]),
                          (WSL_HOST, 14555, ["rfd"], None, True))
@@ -258,14 +260,15 @@ class Routing(unittest.TestCase):
 
     def test_build_hub_wires_the_same_output(self):
         hub = build_hub(default_cfg(sim_boat=SIM))
-        self.assertEqual(list(hub.outputs), ["qgc", "boat_gui", "drone_gui", "drone_diag", SIM_BOAT])
+        self.assertEqual(list(hub.outputs),
+                         ["qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag", SIM_BOAT])
         sim = hub.outputs[SIM_BOAT]
         self.assertEqual((sim.cfg, type(sim.io), sim.io.host, sim.io.port),
                          (sim_boat_output_cfg(SimBoatCfg(WSL_HOST, 14555)), UdpOutputIO, WSL_HOST, 14555))
-        for name in ("qgc", "boat_gui", "drone_gui", "drone_diag"):
+        for name in ("qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"):
             self.assertEqual(hub.outputs[name].io.host, LOOPBACK, name)
         self.assertEqual(list(build_hub(default_cfg()).outputs),
-                         ["qgc", "boat_gui", "drone_gui", "drone_diag"])
+                         ["qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"])
 
 
 # ------------------------------------------------------------------ the output socket

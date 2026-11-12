@@ -284,8 +284,10 @@ class Vehicle:
         return r
 
     def report(self, body: str, fields: dict) -> None:
-        self.link.send_report({"team_id": TEAM, "vehicle_id": self.vid,
-                               "sent_at": rfc3339(), body: fields})
+        # Current Crusader exposes one public queue entry point for heartbeats
+        # and task reports.  Keep the harness on that exact production API.
+        self.link.publish({"team_id": TEAM, "vehicle_id": self.vid,
+                           "sent_at": rfc3339(), body: fields})
 
     def _run(self) -> None:
         while not self._stop.is_set():

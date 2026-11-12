@@ -210,7 +210,7 @@ host = "192.168.65.2"
     def test_the_shipped_config_prefers_ekkos_radio_and_the_boat_has_no_preference(self):
         cfg = load(Path(__file__).resolve().parents[1] / "bridge.toml")
         self.assertEqual({v.id: v.prefer for v in cfg.vehicles},
-                         {"USV1": None, "UUV1": None, "UAV1": "radio"})
+                         {"USV1": None, "UUV1": "radio", "UAV1": "radio"})
         self.assertTrue(all(v.send_info for v in cfg.vehicles))
 
 

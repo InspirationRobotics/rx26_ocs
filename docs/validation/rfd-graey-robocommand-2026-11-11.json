@@ -1,0 +1,33 @@
+{
+  "date": "2026-11-11",
+  "scope": "isolated shared OCS against unchanged RoboNation RoboCommand test server",
+  "robocommand_revision": "8fc09f295fe266ad8106cc0344a3e4d57f844359",
+  "summary": "13/13 passed",
+  "regressions": {
+    "graey": "504 passed, 5 skipped",
+    "shared_ocs": "1145 passed, 1 skipped"
+  },
+  "checks": {
+    "course_and_fence": "pass",
+    "pilot_callsign_refusal": "pass",
+    "declaration_and_run_start": "pass",
+    "usv_uav_uuv_heartbeats_2hz": "pass",
+    "task_report_puback": "pass",
+    "command_fanout": "pass",
+    "uuv_submerged_retention": "pass",
+    "uuv_reconnect_surface_delivery": "pass",
+    "uuv_end_run": "pass"
+  },
+  "final_uuv_outbox": {
+    "acknowledged": 1,
+    "pending": 0,
+    "connections": 2,
+    "telemetry_error": null
+  },
+  "limitations": [
+    "loopback and local MQTT only",
+    "no physical RFD or Cube route",
+    "no hardware mode change or propulsion",
+    "PUBACK is broker delivery, not a scoring verdict"
+  ]
+}

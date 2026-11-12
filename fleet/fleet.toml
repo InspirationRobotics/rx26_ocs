@@ -52,6 +52,12 @@ port = 14543                # gcs_radio.py (udpin:127.0.0.1:14543) -- it DOES tr
 links = ["rfd"]
 transmit = true
 
+[outputs.graey_gui]
+port = 14572                # GRAEY_GUI.cmd mission application channel
+links = ["rfd"]
+sysids = [43]
+transmit = true
+
 [outputs.drone_diag]
 port = 14544                # ad-hoc diagnostics, listen-only, kept last on purpose
 links = ["rfd"]
@@ -64,6 +70,7 @@ transmit = false
 [vehicles]
 boat = [2, 42]              # autopilot, companion (rxl_link_node)
 drone = [1, 200]            # autopilot, companion
+graey = [3, 43]             # planned unique Cube id, Jetson radio_mission_node
 radio = [51]                # RFD900ux RADIO_STATUS
 
 # What a map should print for each group above ("name" in /fleet). A group left out is
@@ -71,6 +78,7 @@ radio = [51]                # RFD900ux RADIO_STATUS
 [names]
 boat = "Crusader"
 drone = "Ekko"
+graey = "GRAEY"
 radio = "RFD900ux"
 
 # ---------------------------------------------------------- the tunnel log
@@ -151,3 +159,12 @@ geoid_separation_m = 5.9      # Singapore, measured 6 Nov 2026 from GPS2_RAW on 
 # attitude_timeout_s = 1.0
 # status_timeout_s = 2.5     # the autopilot HEARTBEAT is 1 Hz on the radio
 # flight_timeout_s = 2.5     # EXTENDED_SYS_STATE, if something asked for it
+
+[[ocs.radio_vehicle]]
+vehicle_id = "UUV1"
+type = "TYPE_UUV"
+companion_sysid = 43          # GRAEY Jetson radio_mission_node
+autopilot_sysid = 3           # required unique field identity; verify/apply on the Cube before field use
+link = "rfd"
+# GRAEY supplies its own RXL heartbeat, including POSHOLD mission_claimed as STATE_AUTO.
+# No fence or geoid adaptation applies to the UUV.

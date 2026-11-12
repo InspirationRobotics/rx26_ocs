@@ -78,11 +78,12 @@ class Rig:
         self.hub.route_age_s = 1e9                  # long scenarios: a route never ages out unless a test says
         vk = dict(vehicle_id="UAV1", geoid_separation_m=-24.6)
         vk.update(vehicle or {})
+        self.vehicle_id = vk['vehicle_id']
         self.cfg = OcsCfg(vehicles=(RadioVehicleCfg(**vk),), **ocs)
         self.bridge = None
         self.adapter = OcsAdapter(self.cfg, self.hub, clock=self.clock,
                                   wall=lambda: WALL0 + (self.clock.t - T0), bridge_factory=self._bridge)
-        self.v = self.adapter.vehicles["UAV1"]
+        self.v = self.adapter.vehicles[self.vehicle_id]
         self.log = []                               # every Tx, stamped with the time it was seen
         self._n = 0
         self._cursor = 0
@@ -100,7 +101,8 @@ class Rig:
         self.hub.link_rx("rfd", raw)
 
     def companion(self, cid, data, *, target=250):
-        self.hear(tunnel_frame(rx.payload_type(cid), data, sysid=200, target=target, seq=self.seq()))
+        self.hear(tunnel_frame(rx.payload_type(cid), data, sysid=self.v.cfg.companion_sysid,
+                               target=target, seq=self.seq()))
         return self._n & 0xFF
 
     def autopilot_heartbeat(self):
@@ -167,7 +169,7 @@ class Rig:
     def status(self):
         st = self.adapter.status()
         json.dumps(st, allow_nan=False)             # whatever /fleet shows must be plain JSON
-        return st["vehicles"]["UAV1"]
+        return st["vehicles"][self.vehicle_id]
 
 
 def heartbeat_body(**kw):
@@ -230,7 +232,8 @@ class Config(unittest.TestCase):
 
     def test_the_shipped_fleet_toml(self):
         ocs = load_config(DEFAULT_CONFIG).ocs
-        (v,) = ocs.vehicles
+        self.assertEqual([v.vehicle_id for v in ocs.vehicles],["UAV1","UUV1"])
+        v,u = ocs.vehicles
         self.assertEqual((v.vehicle_id, v.companion_sysid, v.autopilot_sysid, v.link, ocs.sysid, ocs.compid),
                          ("UAV1", 200, 1, "rfd", 250, 190))
         self.assertFalse(v.phase_fallback)                    # off by default: a heuristic is opt-in
@@ -238,6 +241,10 @@ class Config(unittest.TestCase):
         self.assertTrue(v.fence_upload)                       # RoboCommand's polygon goes onto the autopilot
         self.assertTrue(v.fence_may_block_arming)             # Chase: even if Ekko then cannot arm at home
         self.assertFalse(hasattr(v, "fence_clear_without_course"))   # removed 7 Nov 2026: never cleared
+        self.assertEqual((u.vehicle_type,u.node,u.companion_sysid,u.autopilot_sysid,u.link),
+                         ("TYPE_UUV",rx.NODE_UUV,43,3,"rfd"))
+        self.assertIsNone(u.geoid_separation_m)
+        self.assertFalse(u.fence_upload)
         self.assertEqual(Path(ocs.fence_backup_dir), Path(oa.OCS_DIR) / "run" / "fence")
 
     def test_refusals(self):
@@ -286,6 +293,22 @@ class Uplink(unittest.TestCase):
         self.assertEqual(rep["vehicle_id"], "UAV1")
         self.assertEqual(rep["heartbeat"]["position"], {"latitude": 1.28, "longitude": 103.85})
         self.assertEqual(r.status()["heartbeat"]["source"], "companion")
+
+    def test_graey_uuv_auto_heartbeat_uses_its_shipped_identity_at_two_hz(self):
+        r = Rig(vehicle=dict(vehicle_id="UUV1", vehicle_type="TYPE_UUV", node=rx.NODE_UUV,
+                             companion_sysid=43, autopilot_sysid=3, geoid_separation_m=None))
+        body = heartbeat_body(vehicle=rx.NODE_UUV, flight_phase=0,
+                              robot_state=rx.STATE_AUTO, task=3)
+        for _ in range(5):
+            r.companion(rx.HEARTBEAT, body)
+            r.step(0.5)
+        reports = r.bridge.reports("heartbeat")
+        self.assertEqual(len(reports), 5)
+        self.assertEqual({x["vehicle_id"] for x in reports},{"UUV1"})
+        self.assertEqual({x["heartbeat"]["vehicle_type"] for x in reports},{"TYPE_UUV"})
+        self.assertEqual({x["heartbeat"]["state"] for x in reports},{"STATE_AUTO"})
+        self.assertEqual({x["heartbeat"]["current_task"] for x in reports},
+                         {"TASK_INFRA_SURVEY_REPAIR"})
 
     def test_every_report_carries_the_adapters_own_seq_counting_up_from_one(self):
         r = Rig()

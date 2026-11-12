@@ -26,7 +26,8 @@ class Snapshot(unittest.TestCase):
         self.assertEqual(snap["decode_errors"], 0)
         self.assertEqual(snap["schema"], 1)
         self.assertEqual(set(snap["links"]), {"wifi", "rfd"})
-        self.assertEqual(set(snap["outputs"]), {"qgc", "boat_gui", "drone_gui", "drone_diag"})
+        self.assertEqual(set(snap["outputs"]),
+                         {"qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"})
         self.assertEqual(snap["sysids"], {})
         json.dumps(snap, allow_nan=False)
 

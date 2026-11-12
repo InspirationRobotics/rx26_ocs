@@ -84,3 +84,19 @@ Shared OCS regressions: 611 tests run, OK with one skipped. An initial run
 concurrent with E2E hit the existing declaration-snapshot timing race in
 `test_a_refused_run_start_sends_nothing`; its 27-test module and the full
 sequential rerun passed without changing that test or production code.
+
+## Final radio-mission validation — November 11, 2026
+
+The current working trees were rerun against RoboNation's unchanged pinned
+server revision `8fc09f295fe266ad8106cc0344a3e4d57f844359`. The first run exposed
+that current Crusader now uses `OcsLink.publish` for both heartbeats and task
+reports; the harness's obsolete `send_report` call was replaced with that exact
+current public API. The complete rerun passed **13/13**.
+
+RoboCommand observed UUV1 in the declaration and at the nominal 2 Hz heartbeat
+rate, accepted the run, issued matching RunStart, acknowledged the Task 2
+pipeline report, and delivered run end. The shared OCS showed zero protocol
+failure in this workflow. The GRAEY durable outbox retained the report while
+submerged, delivered it after reconnect/surface, received PUBACK, and ended with
+zero pending reports. This is isolated loopback/MQTT evidence; physical RFD,
+Cube routing and propulsion remain separate acceptance work.
