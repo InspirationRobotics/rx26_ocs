@@ -62,7 +62,7 @@ gets `14570`.
 
 | Output | Loopback port | Gets | May transmit | Consumer |
 |---|---|---|---|---|
-| `qgc` | 14570 | `wifi` + `rfd`, all sysids | yes | QGroundControl, a UDP link listening on 14570 |
+| `qgc` | 14570 | `wifi` + `rfd`, all sysids | yes, except stream-rate controls on `rfd` | QGroundControl, a UDP link listening on 14570 |
 | `boat_gui` | 14554 | `wifi`, sysid 2 only | **no** (listen-only) | `Boat/rx26_asv/tools/scripts/gcs_laptop.py` (its default `--mav` is `udpin:127.0.0.1:14554`) |
 | `drone_gui` | 14543 | `rfd`, all sysids | yes | `Drone/.../gcs_radio.py` (its default `--from` is `udpin:127.0.0.1:14543`) |
 | `drone_diag` | 14544 | `rfd`, all sysids | **no** (listen-only) | ad-hoc probes. Kept last on purpose |
@@ -138,6 +138,11 @@ with the boat's telemetry and make loops possible.
   counted as `no_route`.
 * `target_system` of 0, no such field (HEARTBEAT, ...), or an unknown msgid → sent to
   **every** link of that output.
+* An output may list `block_stream_control_links`. The shipped QGC output lists
+  `rfd`, so `REQUEST_DATA_STREAM` and `MAV_CMD_SET_MESSAGE_INTERVAL` are refused
+  only on the shared radio leg and counted as `dropped_stream_control`. Normal
+  pilot/mission commands remain bidirectional. A broadcast stream request can
+  still reach Crusader through the QGC output's `wifi` leg.
 * To `rfd`: queued; only the one thread that owns the port writes (a stale command is
   never held over a reopen: while the port is down the send is refused and counted
   as `tx_dropped`). To `wifi`: sent from the 14550 socket to the address the target

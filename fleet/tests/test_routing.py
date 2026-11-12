@@ -2,13 +2,20 @@ import unittest
 
 from fleet import mavframe as mf
 from fleet.hub import Dedup, Hub, OutputCfg
-from fleet.tests.helpers import (DIALECT, FakeLink, FakeOutput, Rig, build_frame, command_long,
-                                 frames_of, gcs_heartbeat, heartbeat, mission_request_list)
+from fleet.tests.helpers import (DIALECT, FakeLink, FakeOutput, Rig, build_frame,
+                                 command_long as raw_command_long,
+                                 frames_of, gcs_heartbeat, heartbeat, mission_request_list,
+                                 request_data_stream)
 from fleet.vehicles import VehicleNames
 
 BOAT_A = ("192.168.100.5", 51001)         # the boat's MAVProxy unicast socket
 BOAT_B = ("192.168.100.5", 51002)         # ...and its broadcast socket
 BOAT_COMPANION = ("192.168.100.6", 40000)
+
+
+def command_long(target, *, source=255, seq=0, command=176):
+    """A normal pilot command for routing tests; stream-control tests ask for 511 explicitly."""
+    return raw_command_long(target, source=source, seq=seq, command=command)
 
 
 class Fanout(unittest.TestCase):
@@ -29,6 +36,14 @@ class Fanout(unittest.TestCase):
         for name in ("qgc", "drone_gui", "drone_diag"):
             self.assertEqual(r.got_sysids(name), [1, 42, 51, 200], name)
         self.assertEqual(r.got("boat_gui"), [])
+
+    def test_crusader_and_graey_stream_to_the_ground_station_together(self):
+        r = Rig()
+        r.heard("rfd", heartbeat(42, compid=191, seq=1))
+        r.heard("rfd", heartbeat(43, compid=201, seq=2))
+        self.assertEqual(r.got_sysids("qgc"), [42, 43])
+        self.assertEqual(r.got_sysids("graey_gui"), [43])
+        self.assertEqual(r.got_sysids("drone_gui"), [42, 43])
 
     def test_forwarded_frames_are_bit_identical(self):
         r = Rig()
@@ -177,6 +192,22 @@ class ReverseRouting(unittest.TestCase):
         r.from_consumer("qgc", command_long(1, seq=1))
         self.assertEqual(r.wifi.sent, [])
         self.assertEqual([d for d, _ in r.rfd.sent], [command_long(1, seq=1)])
+
+    def test_qgc_pilot_commands_pass_but_stream_escalation_to_graey_is_blocked(self):
+        r = self.r
+        r.heard("rfd", heartbeat(3, seq=9))
+        pilot = command_long(1, command=176)
+        r.from_consumer("qgc", pilot)
+        self.assertEqual([d for d, _ in r.rfd.sent], [pilot])
+        r.rfd.sent.clear()
+        r.from_consumer("qgc", command_long(1, seq=1, command=511))
+        r.from_consumer("qgc", command_long(3, seq=2, command=511))
+        r.from_consumer("qgc", request_data_stream(1, seq=3))
+        r.from_consumer("qgc", request_data_stream(0, seq=4))
+        self.assertEqual(r.rfd.sent, [])
+        # Broadcast stream control is still delivered to Crusader's IP path.
+        self.assertEqual(len(r.wifi.sent), 1)
+        self.assertEqual(self.out_counts()["dropped_stream_control"], 4)
 
     def test_sent_bytes_are_the_consumers_bytes_unchanged(self):
         raw = mission_request_list(1)

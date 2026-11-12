@@ -87,6 +87,11 @@ def command_long(target: int, *, source=255, seq=0, command=511) -> bytes:
                   sysid=source, compid=190, seq=seq)
 
 
+def request_data_stream(target: int, *, source=255, seq=0) -> bytes:
+    return encode("request_data_stream", target, 1, 0, 10, 1,
+                  sysid=source, compid=190, seq=seq)
+
+
 def mission_request_list(target: int, *, source=254, seq=0) -> bytes:
     return encode("mission_request_list", target, 1, sysid=source, compid=190, seq=seq)
 

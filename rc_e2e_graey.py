@@ -39,6 +39,7 @@ class GraeyVehicle:
     def _run(self):
         from robotx_graey_2026.api.comms.competition_wifi import CompetitionSender, WifiLink
         from robotx_graey_2026.api.comms.competition_telemetry import CompetitionTelemetry
+        from robotx_graey_2026.api.pixhawk.identity import FCU_COMPONENT, FCU_SYSTEM
         sender = link = None
         try:
             sender = CompetitionSender(self.outbox, team_id=self.team)
@@ -68,7 +69,8 @@ class GraeyVehicle:
                 now = time.monotonic()
                 # Synthetic Cube/bridge/control samples enter the production builder.
                 # No mission frame, GPS HAE or local-velocity stream is fabricated.
-                source = dict(get_srcSystem=lambda: 1, get_srcComponent=lambda: 1)
+                source = dict(get_srcSystem=lambda: FCU_SYSTEM,
+                              get_srcComponent=lambda: FCU_COMPONENT)
                 telemetry.consume('GLOBAL_POSITION_INT', SimpleNamespace(**source,
                     time_boot_ms=int(now * 1000), lat=round(self.where[0] * 1e7),
                     lon=round(self.where[1] * 1e7), alt=0, vx=0, vy=0, vz=0, hdg=9000))

@@ -40,6 +40,10 @@ reopen_s = 5                # retry this often while the port is missing or busy
 port = 14570                # QGroundControl: a UDP link listening on 14570
 links = ["wifi", "rfd"]
 transmit = true
+# Preserve QGC/RadioMaster pilot commands over RFD, but never let a targeted or
+# broadcast QGC stream request turn a Cube radio port up. Crusader's WiFi path
+# still receives those frames; only the shared radio write is suppressed.
+block_stream_control_links = ["rfd"]
 
 [outputs.boat_gui]
 port = 14554                # the boat laptop GUI
@@ -70,7 +74,7 @@ transmit = false
 [vehicles]
 boat = [2, 42]              # autopilot, companion (rxl_link_node)
 drone = [1, 200]            # autopilot, companion
-graey = [3, 43]             # planned unique Cube id, Jetson radio_mission_node
+graey = [3, 43]             # approved Cube id, Jetson radio_mission_node
 radio = [51]                # RFD900ux RADIO_STATUS
 
 # What a map should print for each group above ("name" in /fleet). A group left out is
@@ -164,7 +168,7 @@ geoid_separation_m = 5.9      # Singapore, measured 6 Nov 2026 from GPS2_RAW on 
 vehicle_id = "UUV1"
 type = "TYPE_UUV"
 companion_sysid = 43          # GRAEY Jetson radio_mission_node
-autopilot_sysid = 3           # required unique field identity; verify/apply on the Cube before field use
+autopilot_sysid = 3           # approved GRAEY Cube identity; apply with the matching vehicle release
 link = "rfd"
 # GRAEY supplies its own RXL heartbeat, including POSHOLD mission_claimed as STATE_AUTO.
 # No fence or geoid adaptation applies to the UUV.

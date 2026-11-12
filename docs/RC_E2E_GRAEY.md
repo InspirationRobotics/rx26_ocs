@@ -100,3 +100,15 @@ failure in this workflow. The GRAEY durable outbox retained the report while
 submerged, delivered it after reconnect/surface, received PUBACK, and ended with
 zero pending reports. This is isolated loopback/MQTT evidence; physical RFD,
 Cube routing and propulsion remain separate acceptance work.
+
+## System-3 migration validation — November 12, 2026
+
+After the operator approved GRAEY Cube system ID 3, the unchanged E1-E13
+workflow was rerun against the pinned RoboNation server. Its first run exposed
+that the harness still generated synthetic Cube telemetry as system 1: the
+production telemetry filter correctly withheld the UUV1 heartbeat. The fixture
+was migrated to GRAEY's shared identity constants and the complete rerun passed
+**13/13**. UUV1 reported at the required nominal 2 Hz, participated in the
+three-vehicle declaration, received RunStart, retained its survey while
+submerged, reconnected, delivered after surfacing, cleared the report on PUBACK
+and observed run end. Physical RFD coexistence remains a field acceptance test.

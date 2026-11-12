@@ -31,6 +31,7 @@ class Shipped(unittest.TestCase):
         self.assertEqual(list(by_name), ["qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"])
         q, b, g, u, d = (by_name[n] for n in ("qgc", "boat_gui", "drone_gui", "graey_gui", "drone_diag"))
         self.assertEqual((q.port, q.links, q.sysids, q.transmit), (14570, ("wifi", "rfd"), None, True))
+        self.assertEqual(q.block_stream_control_links, ("rfd",))
         self.assertEqual((b.port, b.links, b.sysids, b.transmit), (14554, ("wifi",), frozenset({2}), False))
         self.assertEqual((g.port, g.links, g.sysids, g.transmit), (14543, ("rfd",), None, True))
         self.assertEqual((u.port, u.links, u.sysids, u.transmit),
@@ -80,6 +81,13 @@ class Validation(unittest.TestCase):
     def test_transmit_defaults_to_listen_only(self):
         cfg = cfg_with(outputs={"a": {"port": 14570, "links": ["wifi"]}})
         self.assertFalse(cfg.outputs[0].transmit)
+
+    def test_stream_control_block_must_name_an_output_link(self):
+        for bad in ("rfd", ["lte"], [1]):
+            with self.assertRaisesRegex(ConfigError, "block_stream_control_links",
+                                        msg=repr(bad)):
+                cfg_with(outputs={"a": {"port": 14570, "links": ["wifi", "rfd"],
+                                         "block_stream_control_links": bad}})
 
     def test_sysid_under_two_vehicles(self):
         with self.assertRaisesRegex(ConfigError, "sysid 2"):

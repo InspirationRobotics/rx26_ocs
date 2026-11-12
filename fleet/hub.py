@@ -66,6 +66,7 @@ class OutputCfg:
     links: Tuple[str, ...]
     sysids: Optional[FrozenSet[int]]     # None = all sysids
     transmit: bool                       # False = listen-only
+    block_stream_control_links: Tuple[str, ...] = ()
 
 
 class Endpoint:
@@ -230,6 +231,7 @@ class OutputPort:
         self.send_errors = 0
         self.frames_in_from_consumer = 0
         self.dropped_listen_only = 0
+        self.dropped_stream_control = 0
         self.no_route = 0
 
     def wants(self, link: str, sysid: int) -> bool:
@@ -250,6 +252,7 @@ class OutputPort:
             "send_errors": self.send_errors,
             "frames_in_from_consumer": self.frames_in_from_consumer,
             "dropped_listen_only": self.dropped_listen_only,
+            "dropped_stream_control": self.dropped_stream_control,
             "no_route": self.no_route,
             "bad_crc_in": self.parse.bad_crc,
             "garbage_bytes_in": self.parse.garbage_bytes,
@@ -405,6 +408,14 @@ class Hub:
                     continue
                 self._route_reverse(out, f, now)
 
+    @staticmethod
+    def _is_stream_control(frame: Frame) -> bool:
+        """The two MAVLink mechanisms a GCS uses to expand autopilot output rates."""
+        is_control = frame.msgid == 66       # REQUEST_DATA_STREAM
+        if frame.msgid == 76 and len(frame.payload) >= 30:  # COMMAND_LONG
+            is_control = int.from_bytes(frame.payload[28:30], "little") == 511
+        return is_control
+
     def _route_reverse(self, out: OutputPort, frame: Frame, now: float) -> None:
         target = self.dialect.target_system(frame)
         if target:                                    # a specific vehicle
@@ -413,9 +424,17 @@ class Hub:
         else:                                         # no target, target 0, or unknown id
             sends = [(self.links[n], self.links[n].last_addr) for n in out.cfg.links]
         sent = False
+        blocked = False
         for port, addr in sends:
             if not port.io.enabled:
                 continue                              # switched off with --serial NONE etc.
+            if self._is_stream_control(frame) and port.name in out.cfg.block_stream_control_links:
+                blocked = True
+                out.dropped_stream_control += 1
+                if self._observers:
+                    self._notify("refused", out.name, frame, now,
+                                 reason="stream_control_blocked", link=port.name)
+                continue
             if port.io.needs_addr and addr is None:
                 continue                              # a UDP link nobody has spoken on yet
             sent = True
@@ -425,7 +444,7 @@ class Hub:
             if self._observers:
                 self._notify("tx", port.name, frame, now, origin="output:" + out.name,
                              sent=accepted)
-        if not sent:
+        if not sent and not blocked:
             out.no_route += 1
             if self._observers:
                 self._notify("refused", out.name, frame, now, reason="no_route")

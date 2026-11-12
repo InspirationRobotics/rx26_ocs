@@ -173,10 +173,14 @@ def parse_config(raw: dict) -> Config:
             raise ConfigError("%s: 'host' is not a key -- every output is loopback (the one remote "
                               "output is --sim-boat, command line only)" % where)
         sysids = _sysid_list(t["sysids"], where + " sysids") if "sysids" in t else None
+        blocked = t.get("block_stream_control_links", [])
+        if not isinstance(blocked, list) or any(x not in out_links for x in blocked):
+            raise ConfigError("%s: block_stream_control_links must list only this output's links"
+                              % where)
         outputs.append(OutputCfg(name, _port(_need(t, "port", where), where),
                                  tuple(out_links),
                                  None if sysids is None else frozenset(sysids),
-                                 bool(t.get("transmit", False))))
+                                 bool(t.get("transmit", False)), tuple(blocked)))
 
     vehicles = {name: _sysid_list(ids, "[vehicles] %s" % name)
                 for name, ids in raw.get("vehicles", {}).items()}
