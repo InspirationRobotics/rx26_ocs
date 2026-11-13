@@ -170,5 +170,7 @@ type = "TYPE_UUV"
 companion_sysid = 43          # GRAEY Jetson radio_mission_node
 autopilot_sysid = 3           # approved GRAEY Cube identity; apply with the matching vehicle release
 link = "rfd"
+run_id_ignored = true         # GRAEY's SE dive does not use the run ID: a RunStart whose run_id is
+                              # above 65535 goes out as its low 16 bits rather than not at all
 # GRAEY supplies its own RXL heartbeat, including POSHOLD mission_claimed as STATE_AUTO.
 # No fence or geoid adaptation applies to the UUV.

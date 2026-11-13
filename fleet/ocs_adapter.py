@@ -91,6 +91,10 @@ DEFAULT_FENCE_BACKUP_DIR = "run/fence"
 INBOX_MAX = 2048
 POLL_S = 0.05
 DEDUP_HORIZON_S = 30.0                  # catalogue 4.5: the (msg, content) seen-set horizon
+#: Reports RXL never ACKs, so a sender repeats them to get one through (GRAEY repeats its colour
+#: report after surfacing, inside this horizon). An identical one seen within the horizon is
+#: forwarded once: RoboCommand would otherwise get the same report several times.
+REPEATED_REPORTS = frozenset({rx.RESOURCE_DELIVERY, rx.PIPELINE_SURVEY})
 ATTEMPT_SEQS_KEPT = 16
 READINESS_SEQS_KEPT = 256               # relayed READINESS reports a ReadinessConfirm may still name
 MAX_REFUSAL_REASONS = 32                # distinct reasons counted in /fleet before the rest share one bucket
@@ -123,6 +127,10 @@ class RadioVehicleCfg:
     timeouts: Timeouts = Timeouts()
     fence_upload: bool = False               # write RoboCommand's polygon (ocs_info) to the autopilot (fence_upload.py)
     fence_may_block_arming: bool = False     # ...even when that leaves it unable to arm where it is
+    # The vehicle does not use RunStart's run_id (GRAEY's SE dive, 13 Nov 2026): one that does not
+    # fit RXL's u16 goes out as its low 16 bits instead of being refused, so RunStart still
+    # reaches it. Off for every other vehicle: there a run_id is never truncated.
+    run_id_ignored: bool = False
 
 
 @dataclass(frozen=True)
@@ -181,7 +189,7 @@ def parse_radio_vehicle(t: dict, index: int) -> RadioVehicleCfg:
         raise OcsConfigError("%s: fence_clear_without_course was removed (7 Nov 2026): the OCS never clears the "
                              "autopilot's fence -- the fence drawn in QGC is the pilot's. Delete the line" % where)
     flags = {}
-    for key in ("fence_upload", "fence_may_block_arming"):
+    for key in ("fence_upload", "fence_may_block_arming", "run_id_ignored"):
         flags[key] = t.get(key, False)
         if not isinstance(flags[key], bool):
             raise OcsConfigError("%s: %s must be true or false, not %r" % (where, key, flags[key]))
@@ -626,13 +634,15 @@ class RadioVehicle:
             return
         if name not in tr.UPLINK_BODIES:
             return                               # a downlink id heard back (our own echo, another OCS)
-        duplicate = self._seen_recently(cid, t.data, now) if cid in rx.RECEIVER_ACKS else False
+        duplicate = (self._seen_recently(cid, t.data, now)
+                     if cid in rx.RECEIVER_ACKS or cid in REPEATED_REPORTS else False)
         if cid == rx.HEARTBEAT:
             self._companion_heartbeat(name, msg, now)
             return
         if duplicate:
             self.duplicates_in += 1
-            self._ack(cid, frame.seq, now)       # the first ACK may be what was lost
+            if cid in rx.RECEIVER_ACKS:
+                self._ack(cid, frame.seq, now)   # the first ACK may be what was lost
             return
         try:
             report = tr.report_from_rxl(name, msg, self.ctx, now_to_wall(self.wall, self.clock, now))
@@ -644,8 +654,9 @@ class RadioVehicle:
             return                               # not ACKed: the sender's retry is the net
         if cid == rx.INCIDENT_ACK:
             self._answered(msg["cmd_seq"])
-        if cid in rx.RECEIVER_ACKS:
+        if cid in rx.RECEIVER_ACKS or cid in REPEATED_REPORTS:
             self._seen[(cid, t.data)] = now      # only now: a report the bridge refused is not "already seen"
+        if cid in rx.RECEIVER_ACKS:
             self._ack(cid, frame.seq, now)
 
     def _seen_recently(self, cid: int, data: bytes, now: float) -> bool:
@@ -794,6 +805,8 @@ class RadioVehicle:
                 log.info("ocs %s: directive %r has no RXL message and is not sent on the radio (the "
                          "vehicle holds until RUN_START)", self.cfg.vehicle_id, action)
             self.directives[action] += 1
+            if action in ("run_end", "standby_auto"):
+                self._drop_run_start(action)
             return
         if "ocs_info" in obj:
             return self._info(obj["ocs_info"], now)
@@ -807,6 +820,8 @@ class RadioVehicle:
             self._command(obj, now)
 
     def _command(self, obj: dict, now: float) -> None:
+        if self.cfg.run_id_ignored:
+            obj = self._low16_run_id(obj)
         out = tr.command_to_outgoing(obj, default_vehicle_id=self.cfg.vehicle_id,
                                      report_seq_of=self._readiness.get)
         if not self._applies(out):
@@ -862,6 +877,34 @@ class RadioVehicle:
         if out.msg_id not in DOMAIN_COMMANDS:
             return True
         return types_overlap(out.info.get("affected", []), [rx.VEHICLE_TYPE_BY_NAME[self.cfg.vehicle_type]])
+
+    def _drop_run_start(self, why: str) -> None:
+        """The run ended, or a new one was declared: a RunStart still being resent (the vehicle
+        never ACKed it) belongs to a run that is over, and must not start the next attempt."""
+        gone = [k for k, p in self.pending.items() if p.out.msg_id == rx.RUN_START]
+        for k in gone:
+            del self.pending[k]
+        self.cancelled += len(gone)
+        if gone:
+            log.info("ocs %s: %s: dropped a RunStart the vehicle never acknowledged",
+                     self.cfg.vehicle_id, why)
+
+    def _low16_run_id(self, obj: dict) -> dict:
+        """run_id_ignored: a RunStart whose run_id does not fit u16, with its low 16 bits.
+        Only the copy sent on the radio changes; the bridge keeps RoboCommand's run_id."""
+        name, body = tr.command_body(obj) or (None, None)
+        if name != "run_start":
+            return obj
+        key = next((k for k in ("run_id", "runId") if k in body), None)
+        if key is None:
+            return obj
+        run_id = tr.integer(body[key], "run_start.run_id")
+        if run_id <= 0xFFFF:
+            return obj
+        log.info("ocs %s: RunStart run_id %d does not fit the radio's u16; sending %d (this "
+                 "vehicle ignores the run_id)", self.cfg.vehicle_id, run_id, run_id & 0xFFFF)
+        body_key = next(k for k in ("run_start", "runStart") if k in obj)
+        return dict(obj, **{body_key: dict(body, **{key: run_id & 0xFFFF})})
 
     def _on_run_start(self, run_id: int) -> None:
         if self.run_id is not None and run_id != self.run_id:

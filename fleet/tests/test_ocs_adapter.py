@@ -1375,5 +1375,93 @@ class FenceUploadOverTheRadio(unittest.TestCase):
         self.assertGreater(len(r.bridge.reports("ocs_fence")), n)   # the next reads refreshed read_at
 
 
+
+# ================================================================ GRAEY's SE dive (13 Nov 2026)
+
+GRAEY = dict(vehicle_id="UUV1", vehicle_type="TYPE_UUV", node=rx.NODE_UUV, companion_sysid=43,
+             autopilot_sysid=3, geoid_separation_m=None)
+
+
+class GraeyDive(unittest.TestCase):
+    def colours(self, tin=4, circle=3):
+        return rx.pack_resource_delivery(task=3, resource_color=tin, delivery_circle_color=circle)
+
+    def test_repeated_colour_report_reaches_the_bridge_once_and_is_never_acked(self):
+        r = Rig(vehicle=GRAEY)
+        for _ in range(8):                                  # Graey's ResourceRadio: 8 sends, 2 s apart
+            r.companion(rx.RESOURCE_DELIVERY, self.colours())
+            r.step(2.0)
+        (rep,) = r.bridge.reports("resource_delivery")
+        self.assertEqual((rep["vehicle_id"], rep["resource_delivery"]["resource_color"],
+                          rep["resource_delivery"]["delivery_circle_color"]),
+                         ("UUV1", "COLOR_ANY", "COLOR_BLUE"))
+        self.assertEqual(r.status()["uplink"]["duplicates"], 7)
+        self.assertEqual(r.of("ACK"), [])                   # RXL has no ACK for it
+
+    def test_a_different_report_or_one_after_the_horizon_goes_through(self):
+        r = Rig(vehicle=GRAEY)
+        r.companion(rx.RESOURCE_DELIVERY, self.colours());r.poll()
+        r.companion(rx.RESOURCE_DELIVERY, self.colours(circle=1));r.poll()
+        r.step(31.0)
+        r.companion(rx.RESOURCE_DELIVERY, self.colours());r.poll()
+        self.assertEqual(len(r.bridge.reports("resource_delivery")), 3)
+
+    def test_a_report_the_bridge_did_not_take_is_not_held_as_seen(self):
+        r = Rig(vehicle=GRAEY)
+        r.bridge.connected = False
+        r.companion(rx.RESOURCE_DELIVERY, self.colours());r.poll()
+        r.bridge.connected = True
+        r.companion(rx.RESOURCE_DELIVERY, self.colours());r.poll()
+        self.assertEqual(len(r.bridge.reports("resource_delivery")), 1)
+
+    def test_run_id_ignored_sends_the_low_16_bits_instead_of_refusing(self):
+        r = Rig(vehicle=dict(GRAEY, run_id_ignored=True))
+        r.companion(rx.HEARTBEAT, heartbeat_body(vehicle=rx.NODE_UUV, flight_phase=0));r.poll()
+        r.log.clear()
+        r.command({"seq": 1, "run_start": {"run_id": 70000}})
+        self.assertEqual(r.of("RUN_START")[0].msg, {"run_id": 70000 & 0xFFFF, "flags": 0})
+        self.assertEqual(r.status()["downlink"]["refusals_by_reason"], {})
+        r.command({"seq": 2, "runStart": {"runId": 7}})     # a small one is unchanged, camelCase too
+        self.assertEqual(r.of("RUN_START")[-1].msg["run_id"], 7)
+
+    def test_without_the_setting_a_large_run_id_is_still_refused(self):
+        r = Rig(vehicle=GRAEY)
+        r.companion(rx.HEARTBEAT, heartbeat_body(vehicle=rx.NODE_UUV, flight_phase=0));r.poll()
+        with self.assertLogs("fleet", "WARNING"):
+            r.command({"seq": 1, "run_start": {"run_id": 70000}})
+        self.assertEqual(r.of("RUN_START"), [])
+
+    def test_run_end_or_a_new_declaration_drops_an_unacknowledged_run_start(self):
+        for action in ("run_end", "standby_auto"):
+            r = Rig(vehicle=dict(GRAEY, run_id_ignored=True))
+            r.companion(rx.HEARTBEAT, heartbeat_body(vehicle=rx.NODE_UUV, flight_phase=0));r.poll()
+            r.command({"seq": 1, "run_start": {"run_id": 7}})
+            r.run(3)
+            sent = len(r.of("RUN_START"))
+            self.assertGreaterEqual(sent, 5)                # still being resent: no ACK came
+            r.command({"ocs_directive": {"action": action, "run_id": 7}})
+            r.run(60)
+            self.assertEqual(len(r.of("RUN_START")), sent, action)
+            self.assertEqual(r.status()["downlink"]["queue_depth"], 0)
+
+    def test_an_acknowledged_run_start_is_sent_once(self):
+        r = Rig(vehicle=dict(GRAEY, run_id_ignored=True))
+        r.companion(rx.HEARTBEAT, heartbeat_body(vehicle=rx.NODE_UUV, flight_phase=0));r.poll()
+        r.command({"seq": 1, "run_start": {"run_id": 7}})
+        tx = r.of("RUN_START")[0]
+        r.companion(rx.ACK, rx.pack_ack(msg_id=rx.RUN_START, seq=tx.seq, src=rx.NODE_OCS));r.poll()
+        r.run(60)
+        self.assertEqual(len(r.of("RUN_START")), 1)
+        self.assertEqual(r.status()["downlink"]["acks_matched"], 1)
+
+    def test_shipped_configs_set_it_for_uuv1_only(self):
+        from fleet.fleet_link import load_config
+        for name in ("fleet.toml", "fleet_graey_relay.toml"):
+            vehicles = {v.vehicle_id: v for v in load_config(Path(oa.__file__).parent / name).ocs.vehicles}
+            self.assertTrue(vehicles["UUV1"].run_id_ignored, name)
+            self.assertFalse(vehicles["UAV1"].run_id_ignored, name)
+        self.assertEqual(vehicles["UUV1"].link, "graey_relay")
+
+
 if __name__ == "__main__":
     unittest.main()
